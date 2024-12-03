@@ -599,7 +599,13 @@ pub struct Device {
     null_rtv_handle: descriptor::Handle,
     mem_allocator: Mutex<suballocation::GpuAllocatorWrapper>,
     dxc_container: Option<Arc<shader_compilation::DxcContainer>>,
-    counters: wgt::HalCounters,
+    counters: Arc<wgt::HalCounters>,
+}
+
+impl Drop for Device {
+    fn drop(&mut self) {
+        self.rtv_pool.lock().free_handle(self.null_rtv_handle);
+    }
 }
 
 unsafe impl Send for Device {}
@@ -716,6 +722,8 @@ pub struct CommandEncoder {
     /// If set, the end of the next render/compute pass will write a timestamp at
     /// the given pool & location.
     end_of_pass_timer_query: Option<(Direct3D12::ID3D12QueryHeap, u32)>,
+
+    counters: Arc<wgt::HalCounters>,
 }
 
 unsafe impl Send for CommandEncoder {}
@@ -775,6 +783,12 @@ pub struct Texture {
     mip_level_count: u32,
     sample_count: u32,
     allocation: Option<suballocation::AllocationWrapper>,
+}
+
+impl Texture {
+    pub unsafe fn raw_resource(&self) -> &Direct3D12::ID3D12Resource {
+        &self.resource
+    }
 }
 
 impl crate::DynTexture for Texture {}
