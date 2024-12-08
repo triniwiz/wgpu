@@ -5557,7 +5557,7 @@ impl Default for SurfaceCapabilities {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct SurfaceConfiguration<V> {
-    /// The usage of the swap chain. The only supported usage is `RENDER_ATTACHMENT`.
+    /// The usage of the swap chain. The only usage guaranteed to be supported is `RENDER_ATTACHMENT`.
     pub usage: TextureUsages,
     /// The texture format of the swap chain. The only formats that are guaranteed are
     /// `Bgra8Unorm` and `Bgra8UnormSrgb`
@@ -5642,6 +5642,8 @@ pub enum SurfaceStatus {
     Outdated,
     /// The surface under the swap chain is lost.
     Lost,
+    /// The surface status is not known since `get_current_texture` previously failed.
+    Unknown,
 }
 
 /// Nanosecond timestamp used by the presentation engine.
