@@ -1,4 +1,5 @@
-use std::{error, fmt, thread};
+use core::{error, fmt};
+use std::thread;
 
 use crate::*;
 
@@ -8,7 +9,7 @@ use crate::*;
 /// This type is unique to the Rust API of `wgpu`. In the WebGPU specification,
 /// the [`GPUCanvasContext`](https://gpuweb.github.io/gpuweb/#canvas-context) provides
 /// a texture without any additional information.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SurfaceTexture {
     /// Accessible view of the frame.
     pub texture: Texture,
@@ -36,6 +37,12 @@ impl SurfaceTexture {
     pub fn present(mut self) {
         self.presented = true;
         self.detail.present();
+    }
+
+    #[cfg(custom)]
+    /// Returns custom implementation of SurfaceTexture (if custom backend and is internally T)
+    pub fn as_custom<T: crate::custom::SurfaceOutputDetailInterface>(&self) -> Option<&T> {
+        self.detail.as_custom()
     }
 }
 

@@ -11,7 +11,7 @@ use crate::*;
 ///
 /// Corresponds to [WebGPU `GPUBindGroupLayout`](
 /// https://gpuweb.github.io/gpuweb/#gpubindgrouplayout).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BindGroupLayout {
     pub(crate) inner: dispatch::DispatchBindGroupLayout,
 }
@@ -19,6 +19,14 @@ pub struct BindGroupLayout {
 static_assertions::assert_impl_all!(BindGroupLayout: Send, Sync);
 
 crate::cmp::impl_eq_ord_hash_proxy!(BindGroupLayout => .inner);
+
+impl BindGroupLayout {
+    #[cfg(custom)]
+    /// Returns custom implementation of BindGroupLayout (if custom backend and is internally T)
+    pub fn as_custom<T: custom::BindGroupLayoutInterface>(&self) -> Option<&T> {
+        self.inner.as_custom()
+    }
+}
 
 /// Describes a [`BindGroupLayout`].
 ///

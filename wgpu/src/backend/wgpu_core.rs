@@ -1,20 +1,27 @@
-use crate::{
-    api,
-    dispatch::{self, BufferMappedRangeInterface, InterfaceTypes},
-    BindingResource, BufferBinding, BufferDescriptor, CompilationInfo, CompilationMessage,
-    CompilationMessageType, ErrorSource, Features, Label, LoadOp, MapMode, Operations,
-    ShaderSource, StoreOp, SurfaceTargetUnsafe, TextureDescriptor,
+use alloc::{
+    borrow::Cow::{self, Borrowed},
+    boxed::Box,
+    format,
+    string::{String, ToString as _},
+    sync::Arc,
+    vec,
+    vec::Vec,
 };
+use core::{error::Error, fmt, future::ready, ops::Range, pin::Pin, ptr::NonNull, slice};
 
 use arrayvec::ArrayVec;
 use parking_lot::Mutex;
 use smallvec::SmallVec;
-use std::{
-    borrow::Cow::Borrowed, error::Error, fmt, future::ready, ops::Range, pin::Pin, ptr::NonNull,
-    slice, sync::Arc,
-};
 use wgc::{command::bundle_ffi::*, error::ContextErrorSource, pipeline::CreateShaderModuleError};
 use wgt::WasmNotSendSync;
+
+use crate::{
+    api,
+    dispatch::{self, BufferMappedRangeInterface},
+    BindingResource, Blas, BufferBinding, BufferDescriptor, CompilationInfo, CompilationMessage,
+    CompilationMessageType, ErrorSource, Features, Label, LoadOp, MapMode, Operations,
+    ShaderSource, SurfaceTargetUnsafe, TextureDescriptor, Tlas,
+};
 
 #[derive(Clone)]
 pub struct ContextWgpuCore(Arc<wgc::global::Global>);
@@ -54,7 +61,7 @@ impl ContextWgpuCore {
         Self(unsafe { Arc::new(wgc::global::Global::from_instance(core_instance)) })
     }
 
-    #[cfg(native)]
+    #[cfg(wgpu_core)]
     pub fn enumerate_adapters(&self, backends: wgt::Backends) -> Vec<wgc::id::AdapterId> {
         self.0.enumerate_adapters(backends)
     }
@@ -97,17 +104,21 @@ impl ContextWgpuCore {
         adapter: &CoreAdapter,
         hal_device: hal::OpenDevice<A>,
         desc: &crate::DeviceDescriptor<'_>,
-        trace_dir: Option<&std::path::Path>,
     ) -> Result<(CoreDevice, CoreQueue), crate::RequestDeviceError> {
-        if trace_dir.is_some() {
-            log::error!("Feature 'trace' has been removed temporarily, see https://github.com/gfx-rs/wgpu/issues/5974");
+        if !matches!(desc.trace, wgt::Trace::Off) {
+            log::error!(
+                "
+                Feature 'trace' has been removed temporarily; \
+                see https://github.com/gfx-rs/wgpu/issues/5974. \
+                The `trace` parameter will have no effect."
+            );
         }
+
         let (device_id, queue_id) = unsafe {
             self.0.create_device_from_hal(
                 adapter.id,
                 hal_device.into(),
                 &desc.map_label(|l| l.map(Borrowed)),
-                None,
                 None,
                 None,
             )
@@ -256,6 +267,30 @@ impl ContextWgpuCore {
         }
     }
 
+    pub unsafe fn blas_as_hal<
+        A: wgc::hal_api::HalApi,
+        F: FnOnce(Option<&A::AccelerationStructure>) -> R,
+        R,
+    >(
+        &self,
+        blas: &CoreBlas,
+        hal_blas_callback: F,
+    ) -> R {
+        unsafe { self.0.blas_as_hal::<A, F, R>(blas.id, hal_blas_callback) }
+    }
+
+    pub unsafe fn tlas_as_hal<
+        A: wgc::hal_api::HalApi,
+        F: FnOnce(Option<&A::AccelerationStructure>) -> R,
+        R,
+    >(
+        &self,
+        tlas: &CoreTlas,
+        hal_tlas_callback: F,
+    ) -> R {
+        unsafe { self.0.tlas_as_hal::<A, F, R>(tlas.id, hal_tlas_callback) }
+    }
+
     pub fn generate_report(&self) -> wgc::global::GlobalReport {
         self.0.generate_report()
     }
@@ -282,6 +317,35 @@ impl ContextWgpuCore {
                 if let Some(wgc::device::DeviceError::OutOfMemory) =
                     source.downcast_ref::<wgc::device::DeviceError>()
                 {
+                    break crate::Error::OutOfMemory {
+                        source: source_error,
+                    };
+                }
+                let device_error =
+                    if let Some(wgc::resource::CreateTextureError::Device(device_error)) =
+                        source.downcast_ref::<wgc::resource::CreateTextureError>()
+                    {
+                        Some(device_error)
+                    } else if let Some(wgc::resource::CreateBufferError::Device(device_error)) =
+                        source.downcast_ref::<wgc::resource::CreateBufferError>()
+                    {
+                        Some(device_error)
+                    } else if let Some(wgc::resource::CreateQuerySetError::Device(device_error)) =
+                        source.downcast_ref::<wgc::resource::CreateQuerySetError>()
+                    {
+                        Some(device_error)
+                    } else if let Some(wgc::ray_tracing::CreateBlasError::Device(device_error)) =
+                        source.downcast_ref::<wgc::ray_tracing::CreateBlasError>()
+                    {
+                        Some(device_error)
+                    } else if let Some(wgc::ray_tracing::CreateTlasError::Device(device_error)) =
+                        source.downcast_ref::<wgc::ray_tracing::CreateTlasError>()
+                    {
+                        Some(device_error)
+                    } else {
+                        None
+                    };
+                if let Some(wgc::device::DeviceError::OutOfMemory) = device_error {
                     break crate::Error::OutOfMemory {
                         source: source_error,
                     };
@@ -338,7 +402,7 @@ impl ContextWgpuCore {
 
         fn print_tree(output: &mut String, level: &mut usize, e: &(dyn Error + 'static)) {
             let mut print = |e: &(dyn Error + 'static)| {
-                use std::fmt::Write;
+                use core::fmt::Write;
                 writeln!(output, "{}{}", " ".repeat(*level * 2), e).unwrap();
 
                 if let Some(e) = e.source() {
@@ -360,6 +424,14 @@ impl ContextWgpuCore {
 
         format!("Validation Error\n\nCaused by:\n{output}")
     }
+
+    pub unsafe fn queue_as_hal<A: wgc::hal_api::HalApi, F: FnOnce(Option<&A::Queue>) -> R, R>(
+        &self,
+        queue: &CoreQueue,
+        hal_queue_callback: F,
+    ) -> R {
+        unsafe { self.0.queue_as_hal::<A, F, R>(queue.id, hal_queue_callback) }
+    }
 }
 
 fn map_buffer_copy_view(view: crate::TexelCopyBufferInfo<'_>) -> wgc::command::TexelCopyBufferInfo {
@@ -380,12 +452,9 @@ fn map_texture_copy_view(
     }
 }
 
-#[cfg_attr(
-    any(not(target_arch = "wasm32"), target_os = "emscripten"),
-    allow(unused)
-)]
+#[cfg_attr(not(webgl), expect(unused))]
 fn map_texture_tagged_copy_view(
-    view: wgt::CopyExternalImageDestInfo<&api::Texture>,
+    view: crate::CopyExternalImageDestInfo<&api::Texture>,
 ) -> wgc::command::CopyExternalImageDestInfo {
     wgc::command::CopyExternalImageDestInfo {
         texture: view.texture.inner.as_core().id,
@@ -397,39 +466,23 @@ fn map_texture_tagged_copy_view(
     }
 }
 
-fn map_store_op(op: StoreOp) -> wgc::command::StoreOp {
-    match op {
-        StoreOp::Store => wgc::command::StoreOp::Store,
-        StoreOp::Discard => wgc::command::StoreOp::Discard,
+fn map_load_op<V: Copy>(load: &LoadOp<V>) -> LoadOp<Option<V>> {
+    match load {
+        LoadOp::Clear(clear_value) => LoadOp::Clear(Some(*clear_value)),
+        LoadOp::Load => LoadOp::Load,
     }
 }
 
-fn map_pass_channel<V: Copy + Default>(
-    ops: Option<&Operations<V>>,
-) -> wgc::command::PassChannel<V> {
+fn map_pass_channel<V: Copy>(ops: Option<&Operations<V>>) -> wgc::command::PassChannel<Option<V>> {
     match ops {
-        Some(&Operations {
-            load: LoadOp::Clear(clear_value),
-            store,
-        }) => wgc::command::PassChannel {
-            load_op: wgc::command::LoadOp::Clear,
-            store_op: map_store_op(store),
-            clear_value,
-            read_only: false,
-        },
-        Some(&Operations {
-            load: LoadOp::Load,
-            store,
-        }) => wgc::command::PassChannel {
-            load_op: wgc::command::LoadOp::Load,
-            store_op: map_store_op(store),
-            clear_value: V::default(),
+        Some(&Operations { load, store }) => wgc::command::PassChannel {
+            load_op: Some(map_load_op(&load)),
+            store_op: Some(store),
             read_only: false,
         },
         None => wgc::command::PassChannel {
-            load_op: wgc::command::LoadOp::Load,
-            store_op: wgc::command::StoreOp::Store,
-            clear_value: V::default(),
+            load_op: None,
+            store_op: None,
             read_only: true,
         },
     }
@@ -658,7 +711,7 @@ impl ErrorSinkRaw {
 }
 
 impl fmt::Debug for ErrorSinkRaw {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "ErrorSink")
     }
 }
@@ -751,39 +804,8 @@ crate::cmp::impl_eq_ord_hash_proxy!(CoreSurfaceOutputDetail => .surface_id);
 crate::cmp::impl_eq_ord_hash_proxy!(CoreQueueWriteBuffer => .mapping.ptr);
 crate::cmp::impl_eq_ord_hash_proxy!(CoreBufferMappedRange => .ptr);
 
-impl InterfaceTypes for ContextWgpuCore {
-    type Instance = ContextWgpuCore;
-    type Adapter = CoreAdapter;
-    type Device = CoreDevice;
-    type Queue = CoreQueue;
-    type ShaderModule = CoreShaderModule;
-    type BindGroupLayout = CoreBindGroupLayout;
-    type BindGroup = CoreBindGroup;
-    type TextureView = CoreTextureView;
-    type Sampler = CoreSampler;
-    type Buffer = CoreBuffer;
-    type Texture = CoreTexture;
-    type Blas = CoreBlas;
-    type Tlas = CoreTlas;
-    type QuerySet = CoreQuerySet;
-    type PipelineLayout = CorePipelineLayout;
-    type RenderPipeline = CoreRenderPipeline;
-    type ComputePipeline = CoreComputePipeline;
-    type PipelineCache = CorePipelineCache;
-    type CommandEncoder = CoreCommandEncoder;
-    type ComputePass = CoreComputePass;
-    type RenderPass = CoreRenderPass;
-    type CommandBuffer = CoreCommandBuffer;
-    type RenderBundleEncoder = CoreRenderBundleEncoder;
-    type RenderBundle = CoreRenderBundle;
-    type Surface = CoreSurface;
-    type SurfaceOutputDetail = CoreSurfaceOutputDetail;
-    type QueueWriteBuffer = CoreQueueWriteBuffer;
-    type BufferMappedRange = CoreBufferMappedRange;
-}
-
 impl dispatch::InstanceInterface for ContextWgpuCore {
-    fn new(desc: wgt::InstanceDescriptor) -> Self
+    fn new(desc: &wgt::InstanceDescriptor) -> Self
     where
         Self: Sized,
     {
@@ -801,6 +823,26 @@ impl dispatch::InstanceInterface for ContextWgpuCore {
             } => unsafe {
                 self.0
                     .instance_create_surface(raw_display_handle, raw_window_handle, None)
+            },
+
+            #[cfg(all(unix, not(target_vendor = "apple"), not(target_family = "wasm")))]
+            SurfaceTargetUnsafe::Drm {
+                fd,
+                plane,
+                connector_id,
+                width,
+                height,
+                refresh_rate,
+            } => unsafe {
+                self.0.instance_create_surface_from_drm(
+                    fd,
+                    plane,
+                    connector_id,
+                    width,
+                    height,
+                    refresh_rate,
+                    None,
+                )
             },
 
             #[cfg(metal)]
@@ -826,12 +868,13 @@ impl dispatch::InstanceInterface for ContextWgpuCore {
             },
         }?;
 
-        Ok(dispatch::DispatchSurface::Core(CoreSurface {
+        Ok(CoreSurface {
             context: self.clone(),
             id,
             configured_device: Mutex::default(),
             error_sink: Mutex::default(),
-        }))
+        }
+        .into())
     }
 
     fn request_adapter(
@@ -857,7 +900,7 @@ impl dispatch::InstanceInterface for ContextWgpuCore {
             let generic: dispatch::DispatchAdapter = core.into();
             generic
         });
-        Box::pin(ready(adapter.ok()))
+        Box::pin(ready(adapter))
     }
 
     fn poll_all_devices(&self, force_wait: bool) -> bool {
@@ -866,21 +909,46 @@ impl dispatch::InstanceInterface for ContextWgpuCore {
             Err(err) => self.handle_error_fatal(err, "Instance::poll_all_devices"),
         }
     }
+
+    #[cfg(feature = "wgsl")]
+    fn wgsl_language_features(&self) -> crate::WgslLanguageFeatures {
+        use wgc::naga::front::wgsl::ImplementedLanguageExtension;
+        ImplementedLanguageExtension::all().iter().copied().fold(
+            crate::WgslLanguageFeatures::empty(),
+            |acc, wle| {
+                acc | match wle {
+                    ImplementedLanguageExtension::ReadOnlyAndReadWriteStorageTextures => {
+                        crate::WgslLanguageFeatures::ReadOnlyAndReadWriteStorageTextures
+                    }
+                    ImplementedLanguageExtension::Packed4x8IntegerDotProduct => {
+                        crate::WgslLanguageFeatures::Packed4x8IntegerDotProduct
+                    }
+                    ImplementedLanguageExtension::PointerCompositeAccess => {
+                        crate::WgslLanguageFeatures::PointerCompositeAccess
+                    }
+                }
+            },
+        )
+    }
 }
 
 impl dispatch::AdapterInterface for CoreAdapter {
     fn request_device(
         &self,
         desc: &crate::DeviceDescriptor<'_>,
-        trace_dir: Option<&std::path::Path>,
     ) -> Pin<Box<dyn dispatch::RequestDeviceFuture>> {
-        if trace_dir.is_some() {
-            log::error!("Feature 'trace' has been removed temporarily, see https://github.com/gfx-rs/wgpu/issues/5974");
+        if !matches!(desc.trace, wgt::Trace::Off) {
+            log::error!(
+                "
+                Feature 'trace' has been removed temporarily; \
+                see https://github.com/gfx-rs/wgpu/issues/5974. \
+                The `trace` parameter will have no effect."
+            );
         }
+
         let res = self.context.0.adapter_request_device(
             self.id,
             &desc.map_label(|l| l.map(Borrowed)),
-            None,
             None,
             None,
         );
@@ -966,16 +1034,16 @@ impl dispatch::DeviceInterface for CoreDevice {
             feature = "wgsl",
             feature = "naga-ir"
         )),
-        allow(unreachable_code, unused)
+        expect(unused)
     )]
     fn create_shader_module(
         &self,
         desc: crate::ShaderModuleDescriptor<'_>,
-        shader_bound_checks: wgt::ShaderBoundChecks,
+        shader_bound_checks: wgt::ShaderRuntimeChecks,
     ) -> dispatch::DispatchShaderModule {
         let descriptor = wgc::pipeline::ShaderModuleDescriptor {
             label: desc.label.map(Borrowed),
-            shader_bound_checks,
+            runtime_checks: shader_bound_checks,
         };
         let source = match desc.source {
             #[cfg(feature = "spirv")]
@@ -994,7 +1062,13 @@ impl dispatch::DeviceInterface for CoreDevice {
                 stage,
                 defines,
             } => {
-                let options = naga::front::glsl::Options { stage, defines };
+                let options = naga::front::glsl::Options {
+                    stage,
+                    defines: defines
+                        .iter()
+                        .map(|&(key, value)| (String::from(key), String::from(value)))
+                        .collect(),
+                };
                 wgc::pipeline::ShaderModuleSource::Glsl(Borrowed(shader), options)
             }
             #[cfg(feature = "wgsl")]
@@ -1028,36 +1102,30 @@ impl dispatch::DeviceInterface for CoreDevice {
         .into()
     }
 
-    unsafe fn create_shader_module_spirv(
+    unsafe fn create_shader_module_passthrough(
         &self,
-        desc: &crate::ShaderModuleDescriptorSpirV<'_>,
+        desc: &crate::ShaderModuleDescriptorPassthrough<'_>,
     ) -> dispatch::DispatchShaderModule {
-        let descriptor = wgc::pipeline::ShaderModuleDescriptor {
-            label: desc.label.map(Borrowed),
-            // Doesn't matter the value since spirv shaders aren't mutated to include
-            // runtime checks
-            shader_bound_checks: unsafe { wgt::ShaderBoundChecks::unchecked() },
-        };
+        let desc = desc.map_label(|l| l.map(Cow::from));
         let (id, error) = unsafe {
-            self.context.0.device_create_shader_module_spirv(
-                self.id,
-                &descriptor,
-                Borrowed(&desc.source),
-                None,
-            )
+            self.context
+                .0
+                .device_create_shader_module_passthrough(self.id, &desc, None)
         };
+
         let compilation_info = match error {
             Some(cause) => {
                 self.context.handle_error(
                     &self.error_sink,
                     cause.clone(),
-                    desc.label,
-                    "Device::create_shader_module_spirv",
+                    desc.label().as_deref(),
+                    "Device::create_shader_module_passthrough",
                 );
                 CompilationInfo::from(cause)
             }
             None => CompilationInfo { messages: vec![] },
         };
+
         CoreShaderModule {
             context: self.context.clone(),
             id,
@@ -1121,7 +1189,7 @@ impl dispatch::DeviceInterface for CoreDevice {
             for entry in desc.entries.iter() {
                 if let BindingResource::BufferArray(array) = entry.resource {
                     arrayed_buffer_bindings.extend(array.iter().map(|binding| bm::BufferBinding {
-                        buffer_id: binding.buffer.inner.as_core().id,
+                        buffer: binding.buffer.inner.as_core().id,
                         offset: binding.offset,
                         size: binding.size,
                     }));
@@ -1141,7 +1209,7 @@ impl dispatch::DeviceInterface for CoreDevice {
                         offset,
                         size,
                     }) => bm::BindingResource::Buffer(bm::BufferBinding {
-                        buffer_id: buffer.inner.as_core().id,
+                        buffer: buffer.inner.as_core().id,
                         offset,
                         size,
                     }),
@@ -1170,7 +1238,7 @@ impl dispatch::DeviceInterface for CoreDevice {
                     }
                     BindingResource::AccelerationStructure(acceleration_structure) => {
                         bm::BindingResource::AccelerationStructure(
-                            acceleration_structure.inner.as_core().id,
+                            acceleration_structure.shared.inner.as_core().id,
                         )
                     }
                 },
@@ -1261,6 +1329,14 @@ impl dispatch::DeviceInterface for CoreDevice {
             })
             .collect();
 
+        let vert_constants = desc
+            .vertex
+            .compilation_options
+            .constants
+            .iter()
+            .map(|&(key, value)| (String::from(key), value))
+            .collect();
+
         let descriptor = pipe::RenderPipelineDescriptor {
             label: desc.label.map(Borrowed),
             layout: desc.layout.map(|layout| layout.inner.as_core().id),
@@ -1268,7 +1344,7 @@ impl dispatch::DeviceInterface for CoreDevice {
                 stage: pipe::ProgrammableStageDescriptor {
                     module: desc.vertex.module.inner.as_core().id,
                     entry_point: desc.vertex.entry_point.map(Borrowed),
-                    constants: Borrowed(desc.vertex.compilation_options.constants),
+                    constants: vert_constants,
                     zero_initialize_workgroup_memory: desc
                         .vertex
                         .compilation_options
@@ -1279,16 +1355,24 @@ impl dispatch::DeviceInterface for CoreDevice {
             primitive: desc.primitive,
             depth_stencil: desc.depth_stencil.clone(),
             multisample: desc.multisample,
-            fragment: desc.fragment.as_ref().map(|frag| pipe::FragmentState {
-                stage: pipe::ProgrammableStageDescriptor {
-                    module: frag.module.inner.as_core().id,
-                    entry_point: frag.entry_point.map(Borrowed),
-                    constants: Borrowed(frag.compilation_options.constants),
-                    zero_initialize_workgroup_memory: frag
-                        .compilation_options
-                        .zero_initialize_workgroup_memory,
-                },
-                targets: Borrowed(frag.targets),
+            fragment: desc.fragment.as_ref().map(|frag| {
+                let frag_constants = frag
+                    .compilation_options
+                    .constants
+                    .iter()
+                    .map(|&(key, value)| (String::from(key), value))
+                    .collect();
+                pipe::FragmentState {
+                    stage: pipe::ProgrammableStageDescriptor {
+                        module: frag.module.inner.as_core().id,
+                        entry_point: frag.entry_point.map(Borrowed),
+                        constants: frag_constants,
+                        zero_initialize_workgroup_memory: frag
+                            .compilation_options
+                            .zero_initialize_workgroup_memory,
+                    },
+                    targets: Borrowed(frag.targets),
+                }
             }),
             multiview: desc.multiview,
             cache: desc.cache.map(|cache| cache.inner.as_core().id),
@@ -1324,13 +1408,20 @@ impl dispatch::DeviceInterface for CoreDevice {
     ) -> dispatch::DispatchComputePipeline {
         use wgc::pipeline as pipe;
 
+        let constants = desc
+            .compilation_options
+            .constants
+            .iter()
+            .map(|&(key, value)| (String::from(key), value))
+            .collect();
+
         let descriptor = pipe::ComputePipelineDescriptor {
             label: desc.label.map(Borrowed),
             layout: desc.layout.map(|pll| pll.inner.as_core().id),
             stage: pipe::ProgrammableStageDescriptor {
                 module: desc.module.inner.as_core().id,
                 entry_point: desc.entry_point.map(Borrowed),
-                constants: Borrowed(desc.compilation_options.constants),
+                constants,
                 zero_initialize_workgroup_memory: desc
                     .compilation_options
                     .zero_initialize_workgroup_memory,
@@ -1468,7 +1559,7 @@ impl dispatch::DeviceInterface for CoreDevice {
             global.device_create_tlas(self.id, &desc.map_label(|l| l.map(Borrowed)), None);
         if let Some(cause) = error {
             self.context
-                .handle_error(&self.error_sink, cause, desc.label, "Device::create_blas");
+                .handle_error(&self.error_sink, cause, desc.label, "Device::create_tlas");
         }
         CoreTlas {
             context: self.context.clone(),
@@ -1608,22 +1699,32 @@ impl dispatch::DeviceInterface for CoreDevice {
         Box::pin(ready(scope.error))
     }
 
-    fn start_capture(&self) {
-        self.context.0.device_start_capture(self.id);
+    unsafe fn start_graphics_debugger_capture(&self) {
+        unsafe {
+            self.context
+                .0
+                .device_start_graphics_debugger_capture(self.id)
+        };
     }
 
-    fn stop_capture(&self) {
-        self.context.0.device_stop_capture(self.id);
+    unsafe fn stop_graphics_debugger_capture(&self) {
+        unsafe {
+            self.context
+                .0
+                .device_stop_graphics_debugger_capture(self.id)
+        };
     }
 
-    fn poll(&self, maintain: crate::Maintain) -> crate::MaintainResult {
-        let maintain_inner = maintain.map_index(|i| i.index);
-        match self.context.0.device_poll(self.id, maintain_inner) {
-            Ok(done) => match done {
-                true => wgt::MaintainResult::SubmissionQueueEmpty,
-                false => wgt::MaintainResult::Ok,
-            },
-            Err(err) => self.context.handle_error_fatal(err, "Device::poll"),
+    fn poll(&self, poll_type: wgt::PollType<u64>) -> Result<crate::PollStatus, crate::PollError> {
+        match self.context.0.device_poll(self.id, poll_type) {
+            Ok(status) => Ok(status),
+            Err(err) => {
+                if let Some(poll_error) = err.to_poll_error() {
+                    return Err(poll_error);
+                }
+
+                self.context.handle_error_fatal(err, "Device::poll")
+            }
         }
     }
 
@@ -1771,13 +1872,17 @@ impl dispatch::QueueInterface for CoreQueue {
         }
     }
 
+    // This method needs to exist if either webgpu or webgl is enabled,
+    // but we only actually have an implementation if webgl is enabled.
     #[cfg(any(webgpu, webgl))]
+    #[cfg_attr(not(webgl), expect(unused_variables))]
     fn copy_external_image_to_texture(
         &self,
-        source: &wgt::CopyExternalImageSourceInfo,
-        dest: wgt::CopyExternalImageDestInfo<&crate::api::Texture>,
+        source: &crate::CopyExternalImageSourceInfo,
+        dest: crate::CopyExternalImageDestInfo<&crate::api::Texture>,
         size: crate::Extent3d,
     ) {
+        #[cfg(webgl)]
         match self.context.0.queue_copy_external_image_to_texture(
             self.id,
             source,
@@ -1971,6 +2076,7 @@ impl dispatch::TextureInterface for CoreTexture {
             label: desc.label.map(Borrowed),
             format: desc.format,
             dimension: desc.dimension,
+            usage: desc.usage,
             range: wgt::ImageSubresourceRange {
                 aspect: desc.aspect,
                 base_mip_level: desc.base_mip_level,
@@ -2006,12 +2112,7 @@ impl Drop for CoreTexture {
     }
 }
 
-impl dispatch::BlasInterface for CoreBlas {
-    fn destroy(&self) {
-        // Per spec, no error to report. Even calling destroy multiple times is valid.
-        let _ = self.context.0.blas_destroy(self.id);
-    }
-}
+impl dispatch::BlasInterface for CoreBlas {}
 
 impl Drop for CoreBlas {
     fn drop(&mut self) {
@@ -2019,12 +2120,7 @@ impl Drop for CoreBlas {
     }
 }
 
-impl dispatch::TlasInterface for CoreTlas {
-    fn destroy(&self) {
-        // Per spec, no error to report. Even calling destroy multiple times is valid.
-        let _ = self.context.0.tlas_destroy(self.id);
-    }
-}
+impl dispatch::TlasInterface for CoreTlas {}
 
 impl Drop for CoreTlas {
     fn drop(&mut self) {
@@ -2215,11 +2311,11 @@ impl dispatch::CommandEncoderInterface for CoreCommandEncoder {
                     end_of_pass_write_index: tw.end_of_pass_write_index,
                 });
 
-        let (pass, err) = self.context.0.command_encoder_create_compute_pass(
+        let (pass, err) = self.context.0.command_encoder_begin_compute_pass(
             self.id,
             &wgc::command::ComputePassDescriptor {
                 label: desc.label.map(Borrowed),
-                timestamp_writes: timestamp_writes.as_ref(),
+                timestamp_writes,
             },
         );
 
@@ -2252,8 +2348,10 @@ impl dispatch::CommandEncoderInterface for CoreCommandEncoder {
                 ca.as_ref()
                     .map(|at| wgc::command::RenderPassColorAttachment {
                         view: at.view.inner.as_core().id,
+                        depth_slice: at.depth_slice,
                         resolve_target: at.resolve_target.map(|view| view.inner.as_core().id),
-                        channel: map_pass_channel(Some(&at.ops)),
+                        load_op: at.ops.load,
+                        store_op: at.ops.store,
                     })
             })
             .collect::<Vec<_>>();
@@ -2275,12 +2373,12 @@ impl dispatch::CommandEncoderInterface for CoreCommandEncoder {
                     end_of_pass_write_index: tw.end_of_pass_write_index,
                 });
 
-        let (pass, err) = self.context.0.command_encoder_create_render_pass(
+        let (pass, err) = self.context.0.command_encoder_begin_render_pass(
             self.id,
             &wgc::command::RenderPassDescriptor {
                 label: desc.label.map(Borrowed),
                 timestamp_writes: timestamp_writes.as_ref(),
-                color_attachments: std::borrow::Cow::Borrowed(&colors),
+                color_attachments: Borrowed(&colors),
                 depth_stencil_attachment: depth_stencil.as_ref(),
                 occlusion_query_set: desc.occlusion_query_set.map(|qs| qs.inner.as_core().id),
             },
@@ -2441,6 +2539,30 @@ impl dispatch::CommandEncoderInterface for CoreCommandEncoder {
         }
     }
 
+    fn mark_acceleration_structures_built<'a>(
+        &self,
+        blas: &mut dyn Iterator<Item = &'a Blas>,
+        tlas: &mut dyn Iterator<Item = &'a Tlas>,
+    ) {
+        let blas = blas
+            .map(|b| b.inner.as_core().id)
+            .collect::<SmallVec<[_; 4]>>();
+        let tlas = tlas
+            .map(|t| t.shared.inner.as_core().id)
+            .collect::<SmallVec<[_; 4]>>();
+        if let Err(cause) = self
+            .context
+            .0
+            .command_encoder_mark_acceleration_structures_built(self.id, &blas, &tlas)
+        {
+            self.context.handle_error_nolabel(
+                &self.error_sink,
+                cause,
+                "CommandEncoder::build_acceleration_structures_unsafe_tlas",
+            );
+        }
+    }
+
     fn build_acceleration_structures_unsafe_tlas<'a>(
         &self,
         blas: &mut dyn Iterator<Item = &'a crate::BlasBuildEntry<'a>>,
@@ -2458,21 +2580,21 @@ impl dispatch::CommandEncoderInterface for CoreCommandEncoder {
                             transform_buffer_offset: tg.transform_buffer_offset,
                             first_vertex: tg.first_vertex,
                             vertex_stride: tg.vertex_stride,
-                            index_buffer_offset: tg.index_buffer_offset,
+                            first_index: tg.first_index,
                         }
                     });
                     wgc::ray_tracing::BlasGeometries::TriangleGeometries(Box::new(iter))
                 }
             };
             wgc::ray_tracing::BlasBuildEntry {
-                blas_id: e.blas.shared.inner.as_core().id,
+                blas_id: e.blas.inner.as_core().id,
                 geometries,
             }
         });
 
         let tlas = tlas.into_iter().map(|e: &crate::TlasBuildEntry<'a>| {
             wgc::ray_tracing::TlasBuildEntry {
-                tlas_id: e.tlas.inner.as_core().id,
+                tlas_id: e.tlas.shared.inner.as_core().id,
                 instance_buffer_id: e.instance_buffer.inner.as_core().id,
                 instance_count: e.instance_count,
             }
@@ -2508,14 +2630,14 @@ impl dispatch::CommandEncoderInterface for CoreCommandEncoder {
                             transform_buffer_offset: tg.transform_buffer_offset,
                             first_vertex: tg.first_vertex,
                             vertex_stride: tg.vertex_stride,
-                            index_buffer_offset: tg.index_buffer_offset,
+                            first_index: tg.first_index,
                         }
                     });
                     wgc::ray_tracing::BlasGeometries::TriangleGeometries(Box::new(iter))
                 }
             };
             wgc::ray_tracing::BlasBuildEntry {
-                blas_id: e.blas.shared.inner.as_core().id,
+                blas_id: e.blas.inner.as_core().id,
                 geometries,
             }
         });
@@ -2528,14 +2650,14 @@ impl dispatch::CommandEncoderInterface for CoreCommandEncoder {
                     instance
                         .as_ref()
                         .map(|instance| wgc::ray_tracing::TlasInstance {
-                            blas_id: instance.blas.inner.as_core().id,
+                            blas_id: instance.blas.as_core().id,
                             transform: &instance.transform,
-                            custom_index: instance.custom_index,
+                            custom_data: instance.custom_data,
                             mask: instance.mask,
                         })
                 });
             wgc::ray_tracing::TlasPackage {
-                tlas_id: e.tlas.inner.as_core().id,
+                tlas_id: e.tlas.shared.inner.as_core().id,
                 instances: Box::new(instances),
                 lowest_unmodified: e.lowest_unmodified,
             }
@@ -2550,6 +2672,37 @@ impl dispatch::CommandEncoderInterface for CoreCommandEncoder {
                 &self.error_sink,
                 cause,
                 "CommandEncoder::build_acceleration_structures_unsafe_tlas",
+            );
+        }
+    }
+
+    fn transition_resources<'a>(
+        &mut self,
+        buffer_transitions: &mut dyn Iterator<
+            Item = wgt::BufferTransition<&'a dispatch::DispatchBuffer>,
+        >,
+        texture_transitions: &mut dyn Iterator<
+            Item = wgt::TextureTransition<&'a dispatch::DispatchTexture>,
+        >,
+    ) {
+        let result = self.context.0.command_encoder_transition_resources(
+            self.id,
+            buffer_transitions.map(|t| wgt::BufferTransition {
+                buffer: t.buffer.as_core().id,
+                state: t.state,
+            }),
+            texture_transitions.map(|t| wgt::TextureTransition {
+                texture: t.texture.as_core().id,
+                selector: t.selector.clone(),
+                state: t.state,
+            }),
+        );
+
+        if let Err(cause) = result {
+            self.context.handle_error_nolabel(
+                &self.error_sink,
+                cause,
+                "CommandEncoder::transition_resources",
             );
         }
     }
@@ -3461,7 +3614,10 @@ impl dispatch::SurfaceInterface for CoreSurface {
         .into();
 
         match self.context.0.surface_get_current_texture(self.id, None) {
-            Ok(wgc::present::SurfaceOutput { status, texture_id }) => {
+            Ok(wgc::present::SurfaceOutput {
+                status,
+                texture: texture_id,
+            }) => {
                 let data = texture_id
                     .map(|id| CoreTexture {
                         context: self.context.clone(),

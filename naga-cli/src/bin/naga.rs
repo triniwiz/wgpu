@@ -52,7 +52,7 @@ struct Args {
 
     /// the shader model to use if targeting HLSL
     ///
-    /// May be `50`, 51`, or `60`
+    /// May be `50`, `51`, or `60`
     #[argh(option)]
     shader_model: Option<ShaderModelArg>,
 
@@ -446,6 +446,10 @@ fn run() -> anyhow::Result<()> {
         naga::back::spv::WriterFlags::ADJUST_COORDINATE_SPACE,
         !params.keep_coordinate_space,
     );
+    params.glsl.writer_flags.set(
+        naga::back::glsl::WriterFlags::ADJUST_COORDINATE_SPACE,
+        !params.keep_coordinate_space,
+    );
 
     if args.bulk_validate {
         return bulk_validate(args, &params);
@@ -820,7 +824,8 @@ fn write_output(
                     .unwrap_pretty();
 
             let mut buffer = String::new();
-            let mut writer = hlsl::Writer::new(&mut buffer, &params.hlsl);
+            let pipeline_options = Default::default();
+            let mut writer = hlsl::Writer::new(&mut buffer, &params.hlsl, &pipeline_options);
             writer.write(&module, &info, None).unwrap_pretty();
             fs::write(output_path, buffer)?;
         }

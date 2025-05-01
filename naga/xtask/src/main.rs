@@ -1,3 +1,6 @@
+#![cfg_attr(target_arch = "wasm32", no_main)]
+#![cfg(not(target_arch = "wasm32"))]
+
 use std::process::ExitCode;
 
 use anyhow::Context;
@@ -16,7 +19,6 @@ mod glob;
 mod jobserver;
 mod path;
 mod process;
-mod result;
 mod validate;
 
 fn main() -> ExitCode {

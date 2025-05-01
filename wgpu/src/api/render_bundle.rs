@@ -9,7 +9,7 @@ use crate::*;
 /// using [`RenderPass::execute_bundles`].
 ///
 /// Corresponds to [WebGPU `GPURenderBundle`](https://gpuweb.github.io/gpuweb/#render-bundle).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RenderBundle {
     pub(crate) inner: dispatch::DispatchRenderBundle,
 }
@@ -17,6 +17,14 @@ pub struct RenderBundle {
 static_assertions::assert_impl_all!(RenderBundle: Send, Sync);
 
 crate::cmp::impl_eq_ord_hash_proxy!(RenderBundle => .inner);
+
+impl RenderBundle {
+    #[cfg(custom)]
+    /// Returns custom implementation of RenderBundle (if custom backend and is internally T)
+    pub fn as_custom<T: custom::RenderBundleInterface>(&self) -> Option<&T> {
+        self.inner.as_custom()
+    }
+}
 
 /// Describes a [`RenderBundle`].
 ///

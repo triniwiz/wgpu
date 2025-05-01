@@ -9,9 +9,15 @@ use crate::*;
 /// Corresponds to [WebGPU `GPUCommandBuffer`](https://gpuweb.github.io/gpuweb/#command-buffer).
 #[derive(Debug)]
 pub struct CommandBuffer {
-    pub(crate) inner: Option<dispatch::DispatchCommandBuffer>,
+    pub(crate) buffer: dispatch::DispatchCommandBuffer,
 }
 #[cfg(send_sync)]
 static_assertions::assert_impl_all!(CommandBuffer: Send, Sync);
 
-crate::cmp::impl_eq_ord_hash_proxy!(CommandBuffer => .inner);
+impl CommandBuffer {
+    #[cfg(custom)]
+    /// Returns custom implementation of CommandBuffer (if custom backend and is internally T)
+    pub fn as_custom<T: custom::CommandBufferInterface>(&self) -> Option<&T> {
+        self.buffer.as_custom()
+    }
+}

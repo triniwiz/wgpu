@@ -8,6 +8,7 @@ homepage.workspace = true
 repository.workspace = true
 keywords.workspace = true
 license.workspace = true
+rust-version.workspace = true
 exclude = ["Cargo.lock"]
 publish = false
 
@@ -15,6 +16,6 @@ publish = false
 proc-macro = true
 
 [dependencies]
-heck = "0.5"
-quote = "1"
-syn = { version = "2", features = ["full"] }
+heck.workspace = true
+quote.workspace = true
+syn = { workspace = true, features = ["full"] }

@@ -1,4 +1,5 @@
-use std::{ops::Range, sync::Arc};
+use alloc::{sync::Arc, vec::Vec};
+use core::ops::Range;
 
 #[cfg(feature = "trace")]
 use crate::device::trace::Command as TraceCommand;
@@ -15,11 +16,14 @@ use crate::{
         ParentDevice, ResourceErrorIdent, Texture, TextureClearMode,
     },
     snatch::SnatchGuard,
-    track::{TextureSelector, TextureTrackerSetSingle},
+    track::TextureTrackerSetSingle,
 };
 
 use thiserror::Error;
-use wgt::{math::align_to, BufferAddress, BufferUsages, ImageSubresourceRange, TextureAspect};
+use wgt::{
+    math::align_to, BufferAddress, BufferUsages, ImageSubresourceRange, TextureAspect,
+    TextureSelector,
+};
 
 /// Error encountered while attempting a clear.
 #[derive(Clone, Debug, Error)]
@@ -107,7 +111,7 @@ impl Global {
         let dst_pending = cmd_buf_data
             .trackers
             .buffers
-            .set_single(&dst_buffer, hal::BufferUses::COPY_DST);
+            .set_single(&dst_buffer, wgt::BufferUses::COPY_DST);
 
         let snatch_guard = dst_buffer.device.snatchable_lock.read();
         let dst_raw = dst_buffer.try_raw(&snatch_guard)?;
@@ -155,7 +159,7 @@ impl Global {
 
         // actual hal barrier & operation
         let dst_barrier = dst_pending.map(|pending| pending.into_hal(&dst_buffer, &snatch_guard));
-        let cmd_buf_raw = cmd_buf_data.encoder.open(&cmd_buf.device)?;
+        let cmd_buf_raw = cmd_buf_data.encoder.open()?;
         unsafe {
             cmd_buf_raw.transition_buffers(dst_barrier.as_slice());
             cmd_buf_raw.clear_buffer(dst_raw, offset..end_offset);
@@ -235,7 +239,7 @@ impl Global {
 
         let device = &cmd_buf.device;
         device.check_is_valid()?;
-        let (encoder, tracker) = cmd_buf_data.open_encoder_and_tracker(&cmd_buf.device)?;
+        let (encoder, tracker) = cmd_buf_data.open_encoder_and_tracker()?;
 
         let snatch_guard = device.snatchable_lock.read();
         clear_texture(
@@ -269,12 +273,12 @@ pub(crate) fn clear_texture<T: TextureTrackerSetSingle>(
 
     // Issue the right barrier.
     let clear_usage = match dst_texture.clear_mode {
-        TextureClearMode::BufferCopy => hal::TextureUses::COPY_DST,
+        TextureClearMode::BufferCopy => wgt::TextureUses::COPY_DST,
         TextureClearMode::RenderPass {
             is_color: false, ..
-        } => hal::TextureUses::DEPTH_STENCIL_WRITE,
+        } => wgt::TextureUses::DEPTH_STENCIL_WRITE,
         TextureClearMode::Surface { .. } | TextureClearMode::RenderPass { is_color: true, .. } => {
-            hal::TextureUses::COLOR_TARGET
+            wgt::TextureUses::COLOR_TARGET
         }
         TextureClearMode::None => {
             return Err(ClearError::NoValidTextureClearMode(
@@ -320,10 +324,10 @@ pub(crate) fn clear_texture<T: TextureTrackerSetSingle>(
             dst_raw,
         ),
         TextureClearMode::Surface { .. } => {
-            clear_texture_via_render_passes(dst_texture, range, true, encoder)
+            clear_texture_via_render_passes(dst_texture, range, true, encoder)?
         }
         TextureClearMode::RenderPass { is_color, .. } => {
-            clear_texture_via_render_passes(dst_texture, range, is_color, encoder)
+            clear_texture_via_render_passes(dst_texture, range, is_color, encoder)?
         }
         TextureClearMode::None => {
             return Err(ClearError::NoValidTextureClearMode(
@@ -433,7 +437,7 @@ fn clear_texture_via_render_passes(
     range: TextureInitRange,
     is_color: bool,
     encoder: &mut dyn hal::DynCommandEncoder,
-) {
+) -> Result<(), ClearError> {
     assert_eq!(dst_texture.desc.dimension, wgt::TextureDimension::D2);
 
     let extent_base = wgt::Extent3d {
@@ -455,8 +459,9 @@ fn clear_texture_via_render_passes(
                             mip_level,
                             depth_or_layer,
                         ),
-                        usage: hal::TextureUses::COLOR_TARGET,
+                        usage: wgt::TextureUses::COLOR_TARGET,
                     },
+                    depth_slice: None,
                     resolve_target: None,
                     ops: hal::AttachmentOps::STORE,
                     clear_value: wgt::Color::TRANSPARENT,
@@ -473,7 +478,7 @@ fn clear_texture_via_render_passes(
                                 mip_level,
                                 depth_or_layer,
                             ),
-                            usage: hal::TextureUses::DEPTH_STENCIL_WRITE,
+                            usage: wgt::TextureUses::DEPTH_STENCIL_WRITE,
                         },
                         depth_ops: hal::AttachmentOps::STORE,
                         stencil_ops: hal::AttachmentOps::STORE,
@@ -482,18 +487,22 @@ fn clear_texture_via_render_passes(
                 )
             };
             unsafe {
-                encoder.begin_render_pass(&hal::RenderPassDescriptor {
-                    label: Some("(wgpu internal) clear_texture clear pass"),
-                    extent,
-                    sample_count: dst_texture.desc.sample_count,
-                    color_attachments,
-                    depth_stencil_attachment,
-                    multiview: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                });
+                encoder
+                    .begin_render_pass(&hal::RenderPassDescriptor {
+                        label: Some("(wgpu internal) clear_texture clear pass"),
+                        extent,
+                        sample_count: dst_texture.desc.sample_count,
+                        color_attachments,
+                        depth_stencil_attachment,
+                        multiview: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    })
+                    .map_err(|e| dst_texture.device.handle_hal_error(e))?;
                 encoder.end_render_pass();
             }
         }
     }
+
+    Ok(())
 }

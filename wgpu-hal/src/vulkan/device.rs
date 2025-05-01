@@ -1,19 +1,24 @@
-use super::{conv, RawTlasInstance};
+use alloc::{
+    borrow::{Cow, ToOwned as _},
+    collections::BTreeMap,
+    ffi::CString,
+    sync::Arc,
+    vec::Vec,
+};
+use core::{
+    ffi::CStr,
+    mem::{self, MaybeUninit},
+    num::NonZeroU32,
+    ptr,
+};
 
 use arrayvec::ArrayVec;
-use ash::{khr, vk};
+use ash::{ext, khr, vk};
+use hashbrown::hash_map::Entry;
 use parking_lot::Mutex;
 
+use super::{conv, RawTlasInstance};
 use crate::TlasInstance;
-use std::{
-    borrow::Cow,
-    collections::{hash_map::Entry, BTreeMap},
-    ffi::{CStr, CString},
-    mem::{self, size_of, MaybeUninit},
-    num::NonZeroU32,
-    ptr, slice,
-    sync::Arc,
-};
 
 impl super::DeviceShared {
     /// Set the name of `object` to `name`.
@@ -47,7 +52,7 @@ impl super::DeviceShared {
                 .as_bytes()
                 .iter()
                 .cloned()
-                .chain(std::iter::once(0))
+                .chain(core::iter::once(0))
                 .collect();
             &buffer_vec
         };
@@ -70,76 +75,106 @@ impl super::DeviceShared {
         Ok(match self.render_passes.lock().entry(key) {
             Entry::Occupied(e) => *e.get(),
             Entry::Vacant(e) => {
+                let super::RenderPassKey {
+                    ref colors,
+                    ref depth_stencil,
+                    sample_count,
+                    multiview,
+                } = *e.key();
+
                 let mut vk_attachments = Vec::new();
-                let mut color_refs = Vec::with_capacity(e.key().colors.len());
+                let mut color_refs = Vec::with_capacity(colors.len());
                 let mut resolve_refs = Vec::with_capacity(color_refs.capacity());
                 let mut ds_ref = None;
-                let samples = vk::SampleCountFlags::from_raw(e.key().sample_count);
+                let samples = vk::SampleCountFlags::from_raw(sample_count);
                 let unused = vk::AttachmentReference {
                     attachment: vk::ATTACHMENT_UNUSED,
                     layout: vk::ImageLayout::UNDEFINED,
                 };
-                for cat in e.key().colors.iter() {
-                    let (color_ref, resolve_ref) = if let Some(cat) = cat.as_ref() {
-                        let color_ref = vk::AttachmentReference {
-                            attachment: vk_attachments.len() as u32,
-                            layout: cat.base.layout,
-                        };
-                        vk_attachments.push({
-                            let (load_op, store_op) = conv::map_attachment_ops(cat.base.ops);
-                            vk::AttachmentDescription::default()
-                                .format(cat.base.format)
-                                .samples(samples)
-                                .load_op(load_op)
-                                .store_op(store_op)
-                                .initial_layout(cat.base.layout)
-                                .final_layout(cat.base.layout)
-                        });
-                        let resolve_ref = if let Some(ref rat) = cat.resolve {
-                            let (load_op, store_op) = conv::map_attachment_ops(rat.ops);
-                            let vk_attachment = vk::AttachmentDescription::default()
-                                .format(rat.format)
-                                .samples(vk::SampleCountFlags::TYPE_1)
-                                .load_op(load_op)
-                                .store_op(store_op)
-                                .initial_layout(rat.layout)
-                                .final_layout(rat.layout);
-                            vk_attachments.push(vk_attachment);
+                for cat in colors.iter() {
+                    let (color_ref, resolve_ref) =
+                        if let Some(super::ColorAttachmentKey { base, resolve }) = cat {
+                            let super::AttachmentKey {
+                                format,
+                                layout,
+                                ops,
+                            } = *base;
 
-                            vk::AttachmentReference {
-                                attachment: vk_attachments.len() as u32 - 1,
-                                layout: rat.layout,
-                            }
+                            let color_ref = vk::AttachmentReference {
+                                attachment: vk_attachments.len() as u32,
+                                layout,
+                            };
+                            vk_attachments.push({
+                                let (load_op, store_op) = conv::map_attachment_ops(ops);
+                                vk::AttachmentDescription::default()
+                                    .format(format)
+                                    .samples(samples)
+                                    .load_op(load_op)
+                                    .store_op(store_op)
+                                    .initial_layout(layout)
+                                    .final_layout(layout)
+                            });
+                            let resolve_ref = if let Some(rat) = resolve {
+                                let super::AttachmentKey {
+                                    format,
+                                    layout,
+                                    ops,
+                                } = *rat;
+
+                                let (load_op, store_op) = conv::map_attachment_ops(ops);
+                                let vk_attachment = vk::AttachmentDescription::default()
+                                    .format(format)
+                                    .samples(vk::SampleCountFlags::TYPE_1)
+                                    .load_op(load_op)
+                                    .store_op(store_op)
+                                    .initial_layout(layout)
+                                    .final_layout(layout);
+                                vk_attachments.push(vk_attachment);
+
+                                vk::AttachmentReference {
+                                    attachment: vk_attachments.len() as u32 - 1,
+                                    layout,
+                                }
+                            } else {
+                                unused
+                            };
+
+                            (color_ref, resolve_ref)
                         } else {
-                            unused
+                            (unused, unused)
                         };
-
-                        (color_ref, resolve_ref)
-                    } else {
-                        (unused, unused)
-                    };
 
                     color_refs.push(color_ref);
                     resolve_refs.push(resolve_ref);
                 }
 
-                if let Some(ref ds) = e.key().depth_stencil {
+                if let Some(ds) = depth_stencil {
+                    let super::DepthStencilAttachmentKey {
+                        ref base,
+                        stencil_ops,
+                    } = *ds;
+
+                    let super::AttachmentKey {
+                        format,
+                        layout,
+                        ops,
+                    } = *base;
+
                     ds_ref = Some(vk::AttachmentReference {
                         attachment: vk_attachments.len() as u32,
-                        layout: ds.base.layout,
+                        layout,
                     });
-                    let (load_op, store_op) = conv::map_attachment_ops(ds.base.ops);
-                    let (stencil_load_op, stencil_store_op) =
-                        conv::map_attachment_ops(ds.stencil_ops);
+                    let (load_op, store_op) = conv::map_attachment_ops(ops);
+                    let (stencil_load_op, stencil_store_op) = conv::map_attachment_ops(stencil_ops);
                     let vk_attachment = vk::AttachmentDescription::default()
-                        .format(ds.base.format)
+                        .format(format)
                         .samples(samples)
                         .load_op(load_op)
                         .store_op(store_op)
                         .stencil_load_op(stencil_load_op)
                         .stencil_store_op(stencil_store_op)
-                        .initial_layout(ds.base.layout)
-                        .final_layout(ds.base.layout);
+                        .initial_layout(layout)
+                        .final_layout(layout);
                     vk_attachments.push(vk_attachment);
                 }
 
@@ -169,7 +204,7 @@ impl super::DeviceShared {
 
                 let mut multiview_info;
                 let mask;
-                if let Some(multiview) = e.key().multiview {
+                if let Some(multiview) = multiview {
                     // Sanity checks, better to panic here than cause a driver crash
                     assert!(multiview.get() <= 8);
                     assert!(multiview.get() > 1);
@@ -193,85 +228,6 @@ impl super::DeviceShared {
                 };
 
                 *e.insert(raw)
-            }
-        })
-    }
-
-    pub fn make_framebuffer(
-        &self,
-        key: super::FramebufferKey,
-        raw_pass: vk::RenderPass,
-        pass_label: crate::Label,
-    ) -> Result<vk::Framebuffer, crate::DeviceError> {
-        Ok(match self.framebuffers.lock().entry(key) {
-            Entry::Occupied(e) => *e.get(),
-            Entry::Vacant(e) => {
-                let vk_views = e
-                    .key()
-                    .attachments
-                    .iter()
-                    .map(|at| at.raw)
-                    .collect::<ArrayVec<_, { super::MAX_TOTAL_ATTACHMENTS }>>();
-                let vk_view_formats = e
-                    .key()
-                    .attachments
-                    .iter()
-                    .map(|at| self.private_caps.map_texture_format(at.view_format))
-                    .collect::<ArrayVec<_, { super::MAX_TOTAL_ATTACHMENTS }>>();
-                let vk_view_formats_list = e
-                    .key()
-                    .attachments
-                    .iter()
-                    .map(|at| at.raw_view_formats.clone())
-                    .collect::<ArrayVec<_, { super::MAX_TOTAL_ATTACHMENTS }>>();
-
-                let vk_image_infos = e
-                    .key()
-                    .attachments
-                    .iter()
-                    .enumerate()
-                    .map(|(i, at)| {
-                        let mut info = vk::FramebufferAttachmentImageInfo::default()
-                            .usage(conv::map_texture_usage(at.view_usage))
-                            .flags(at.raw_image_flags)
-                            .width(e.key().extent.width)
-                            .height(e.key().extent.height)
-                            .layer_count(e.key().extent.depth_or_array_layers);
-                        // https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VkRenderPassBeginInfo.html#VUID-VkRenderPassBeginInfo-framebuffer-03214
-                        if vk_view_formats_list[i].is_empty() {
-                            info = info.view_formats(&vk_view_formats[i..i + 1]);
-                        } else {
-                            info = info.view_formats(&vk_view_formats_list[i]);
-                        };
-                        info
-                    })
-                    .collect::<ArrayVec<_, { super::MAX_TOTAL_ATTACHMENTS }>>();
-
-                let mut vk_attachment_info = vk::FramebufferAttachmentsCreateInfo::default()
-                    .attachment_image_infos(&vk_image_infos);
-                let mut vk_info = vk::FramebufferCreateInfo::default()
-                    .render_pass(raw_pass)
-                    .width(e.key().extent.width)
-                    .height(e.key().extent.height)
-                    .layers(e.key().extent.depth_or_array_layers);
-
-                if self.private_caps.imageless_framebuffers {
-                    //TODO: https://github.com/MaikKlein/ash/issues/450
-                    vk_info = vk_info
-                        .flags(vk::FramebufferCreateFlags::IMAGELESS_KHR)
-                        .push_next(&mut vk_attachment_info);
-                    vk_info.attachment_count = e.key().attachments.len() as u32;
-                } else {
-                    vk_info = vk_info.attachments(&vk_views);
-                }
-
-                *e.insert(unsafe {
-                    let raw = self.raw.create_framebuffer(&vk_info, None).unwrap();
-                    if let Some(label) = pass_label {
-                        self.set_object_name(raw, label);
-                    }
-                    raw
-                })
             }
         })
     }
@@ -417,6 +373,10 @@ impl
                 vk::DescriptorType::STORAGE_BUFFER_DYNAMIC,
                 descriptor_count.storage_buffer_dynamic,
             ),
+            (
+                vk::DescriptorType::ACCELERATION_STRUCTURE_KHR,
+                descriptor_count.acceleration_structure,
+            ),
         ];
 
         let filtered_counts = unfiltered_counts
@@ -549,7 +509,6 @@ impl super::Device {
         let original_format = self.shared.private_caps.map_texture_format(config.format);
         let mut raw_flags = vk::SwapchainCreateFlagsKHR::empty();
         let mut raw_view_formats: Vec<vk::Format> = vec![];
-        let mut wgt_view_formats = vec![];
         if !config.view_formats.is_empty() {
             raw_flags |= vk::SwapchainCreateFlagsKHR::MUTABLE_FORMAT;
             raw_view_formats = config
@@ -558,9 +517,6 @@ impl super::Device {
                 .map(|f| self.shared.private_caps.map_texture_format(*f))
                 .collect();
             raw_view_formats.push(original_format);
-
-            wgt_view_formats.clone_from(&config.view_formats);
-            wgt_view_formats.push(config.format);
         }
 
         let mut info = vk::SwapchainCreateInfoKHR::default()
@@ -630,12 +586,10 @@ impl super::Device {
 
         Ok(super::Swapchain {
             raw,
-            raw_flags,
             functor,
             device: Arc::clone(&self.shared),
             images,
             config: config.clone(),
-            view_formats: wgt_view_formats,
             surface_semaphores,
             next_semaphore_index: 0,
             next_present_time: None,
@@ -677,11 +631,8 @@ impl super::Device {
             drop_guard,
             external_memory: None,
             block: None,
-            usage: desc.usage,
             format: desc.format,
-            raw_flags: vk::ImageCreateFlags::empty(),
             copy_size: desc.copy_extent(),
-            view_formats,
         }
     }
 
@@ -719,17 +670,19 @@ impl super::Device {
         let copy_size = desc.copy_extent();
 
         let mut raw_flags = vk::ImageCreateFlags::empty();
+        if desc.dimension == wgt::TextureDimension::D3
+            && desc.usage.contains(wgt::TextureUses::COLOR_TARGET)
+        {
+            raw_flags |= vk::ImageCreateFlags::TYPE_2D_ARRAY_COMPATIBLE;
+        }
         if desc.is_cube_compatible() {
             raw_flags |= vk::ImageCreateFlags::CUBE_COMPATIBLE;
         }
 
         let original_format = self.shared.private_caps.map_texture_format(desc.format);
         let mut vk_view_formats = vec![];
-        let mut wgt_view_formats = vec![];
         if !desc.view_formats.is_empty() {
             raw_flags |= vk::ImageCreateFlags::MUTABLE_FORMAT;
-            wgt_view_formats.clone_from(&desc.view_formats);
-            wgt_view_formats.push(desc.format);
 
             if self.shared.private_caps.image_format_list {
                 vk_view_formats = desc
@@ -779,14 +732,12 @@ impl super::Device {
             raw,
             requirements: req,
             copy_size,
-            view_formats: wgt_view_formats,
-            raw_flags,
         })
     }
 
     /// # Safety
     ///
-    /// - Vulkan 1.1+ (or VK_KHR_external_memory)
+    /// - Vulkan (with VK_KHR_external_memory_win32)
     /// - The `d3d11_shared_handle` must be valid and respecting `desc`
     /// - `VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT` flag is used because we need to hold a reference to the handle
     #[cfg(windows)]
@@ -795,8 +746,12 @@ impl super::Device {
         d3d11_shared_handle: windows::Win32::Foundation::HANDLE,
         desc: &crate::TextureDescriptor,
     ) -> Result<super::Texture, crate::DeviceError> {
-        if !self.shared.private_caps.external_memory_win32 {
-            log::error!("VK_KHR_external_memory extension is required");
+        if !self
+            .shared
+            .features
+            .contains(wgt::Features::VULKAN_EXTERNAL_MEMORY_WIN32)
+        {
+            log::error!("Vulkan driver does not support VK_KHR_external_memory_win32");
             return Err(crate::DeviceError::ResourceCreationFailed);
         }
 
@@ -838,11 +793,8 @@ impl super::Device {
             drop_guard: None,
             external_memory: Some(memory),
             block: None,
-            usage: desc.usage,
             format: desc.format,
-            raw_flags: image.raw_flags,
             copy_size: image.copy_size,
-            view_formats: image.view_formats,
         })
     }
 
@@ -894,23 +846,27 @@ impl super::Device {
                 runtime_checks,
             } => {
                 let pipeline_options = naga::back::spv::PipelineOptions {
-                    entry_point: stage.entry_point.to_string(),
+                    entry_point: stage.entry_point.to_owned(),
                     shader_stage: naga_stage,
                 };
-                let needs_temp_options = !runtime_checks
+                let needs_temp_options = !runtime_checks.bounds_checks
+                    || !runtime_checks.force_loop_bounding
                     || !binding_map.is_empty()
                     || naga_shader.debug_source.is_some()
                     || !stage.zero_initialize_workgroup_memory;
                 let mut temp_options;
                 let options = if needs_temp_options {
                     temp_options = self.naga_options.clone();
-                    if !runtime_checks {
+                    if !runtime_checks.bounds_checks {
                         temp_options.bounds_check_policies = naga::proc::BoundsCheckPolicies {
                             index: naga::proc::BoundsCheckPolicy::Unchecked,
                             buffer: naga::proc::BoundsCheckPolicy::Unchecked,
                             image_load: naga::proc::BoundsCheckPolicy::Unchecked,
                             binding_array: naga::proc::BoundsCheckPolicy::Unchecked,
                         };
+                    }
+                    if !runtime_checks.force_loop_bounding {
+                        temp_options.force_loop_bounding = false;
                     }
                     if !binding_map.is_empty() {
                         temp_options.binding_map = binding_map.clone();
@@ -1007,6 +963,97 @@ impl super::Device {
     pub fn shared_instance(&self) -> &super::InstanceShared {
         &self.shared.instance
     }
+
+    fn error_if_would_oom_on_resource_allocation(
+        &self,
+        needs_host_access: bool,
+        size: u64,
+    ) -> Result<(), crate::DeviceError> {
+        let Some(threshold) = self
+            .shared
+            .instance
+            .memory_budget_thresholds
+            .for_resource_creation
+        else {
+            return Ok(());
+        };
+
+        if !self
+            .shared
+            .enabled_extensions
+            .contains(&ext::memory_budget::NAME)
+        {
+            return Ok(());
+        }
+
+        let get_physical_device_properties = self
+            .shared
+            .instance
+            .get_physical_device_properties
+            .as_ref()
+            .unwrap();
+
+        let mut memory_budget_properties = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+
+        let mut memory_properties =
+            vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut memory_budget_properties);
+
+        unsafe {
+            get_physical_device_properties.get_physical_device_memory_properties2(
+                self.shared.physical_device,
+                &mut memory_properties,
+            );
+        }
+
+        let mut host_visible_heaps = [false; vk::MAX_MEMORY_HEAPS];
+        let mut device_local_heaps = [false; vk::MAX_MEMORY_HEAPS];
+
+        let memory_properties = memory_properties.memory_properties;
+
+        for i in 0..memory_properties.memory_type_count {
+            let memory_type = memory_properties.memory_types[i as usize];
+            let flags = memory_type.property_flags;
+
+            if flags.intersects(
+                vk::MemoryPropertyFlags::LAZILY_ALLOCATED | vk::MemoryPropertyFlags::PROTECTED,
+            ) {
+                continue; // not used by gpu-alloc
+            }
+
+            if flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE) {
+                host_visible_heaps[memory_type.heap_index as usize] = true;
+            }
+
+            if flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL) {
+                device_local_heaps[memory_type.heap_index as usize] = true;
+            }
+        }
+
+        let heaps = if needs_host_access {
+            host_visible_heaps
+        } else {
+            device_local_heaps
+        };
+
+        // NOTE: We might end up checking multiple heaps since gpu-alloc doesn't have a way
+        // for us to query the heap the resource will end up on. But this is unlikely,
+        // there is usually only one heap on integrated GPUs and two on dedicated GPUs.
+
+        for (i, check) in heaps.iter().enumerate() {
+            if !check {
+                continue;
+            }
+
+            let heap_usage = memory_budget_properties.heap_usage[i];
+            let heap_budget = memory_budget_properties.heap_budget[i];
+
+            if heap_usage + size >= heap_budget / 100 * threshold as u64 {
+                return Err(crate::DeviceError::OutOfMemory);
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl crate::Device for super::Device {
@@ -1031,17 +1078,17 @@ impl crate::Device for super::Device {
 
         let mut alloc_usage = if desc
             .usage
-            .intersects(crate::BufferUses::MAP_READ | crate::BufferUses::MAP_WRITE)
+            .intersects(wgt::BufferUses::MAP_READ | wgt::BufferUses::MAP_WRITE)
         {
             let mut flags = gpu_alloc::UsageFlags::HOST_ACCESS;
             //TODO: find a way to use `crate::MemoryFlags::PREFER_COHERENT`
             flags.set(
                 gpu_alloc::UsageFlags::DOWNLOAD,
-                desc.usage.contains(crate::BufferUses::MAP_READ),
+                desc.usage.contains(wgt::BufferUses::MAP_READ),
             );
             flags.set(
                 gpu_alloc::UsageFlags::UPLOAD,
-                desc.usage.contains(crate::BufferUses::MAP_WRITE),
+                desc.usage.contains(wgt::BufferUses::MAP_WRITE),
             );
             flags
         } else {
@@ -1051,6 +1098,13 @@ impl crate::Device for super::Device {
             gpu_alloc::UsageFlags::TRANSIENT,
             desc.memory_flags.contains(crate::MemoryFlags::TRANSIENT),
         );
+
+        let needs_host_access = alloc_usage.contains(gpu_alloc::UsageFlags::HOST_ACCESS);
+
+        self.error_if_would_oom_on_resource_allocation(needs_host_access, req.size)
+            .inspect_err(|_| {
+                unsafe { self.shared.raw.destroy_buffer(raw, None) };
+            })?;
 
         let alignment_mask = req.alignment - 1;
 
@@ -1063,15 +1117,21 @@ impl crate::Device for super::Device {
                     usage: alloc_usage,
                     memory_types: req.memory_type_bits & self.valid_ash_memory_types,
                 },
-            )?
-        };
+            )
+        }
+        .inspect_err(|_| {
+            unsafe { self.shared.raw.destroy_buffer(raw, None) };
+        })?;
 
         unsafe {
             self.shared
                 .raw
                 .bind_buffer_memory(raw, *block.memory(), block.offset())
-                .map_err(super::map_host_device_oom_and_ioca_err)?
-        };
+        }
+        .map_err(super::map_host_device_oom_and_ioca_err)
+        .inspect_err(|_| {
+            unsafe { self.shared.raw.destroy_buffer(raw, None) };
+        })?;
 
         if let Some(label) = desc.label {
             unsafe { self.shared.set_object_name(raw, label) };
@@ -1162,6 +1222,11 @@ impl crate::Device for super::Device {
     ) -> Result<super::Texture, crate::DeviceError> {
         let image = self.create_image_without_memory(desc, None)?;
 
+        self.error_if_would_oom_on_resource_allocation(false, image.requirements.size)
+            .inspect_err(|_| {
+                unsafe { self.shared.raw.destroy_image(image.raw, None) };
+            })?;
+
         let block = unsafe {
             self.mem_allocator.lock().alloc(
                 &*self.shared,
@@ -1171,8 +1236,11 @@ impl crate::Device for super::Device {
                     usage: gpu_alloc::UsageFlags::FAST_DEVICE_ACCESS,
                     memory_types: image.requirements.memory_type_bits & self.valid_ash_memory_types,
                 },
-            )?
-        };
+            )
+        }
+        .inspect_err(|_| {
+            unsafe { self.shared.raw.destroy_image(image.raw, None) };
+        })?;
 
         self.counters.texture_memory.add(block.size() as isize);
 
@@ -1180,8 +1248,11 @@ impl crate::Device for super::Device {
             self.shared
                 .raw
                 .bind_image_memory(image.raw, *block.memory(), block.offset())
-                .map_err(super::map_host_device_oom_err)?
-        };
+        }
+        .map_err(super::map_host_device_oom_err)
+        .inspect_err(|_| {
+            unsafe { self.shared.raw.destroy_image(image.raw, None) };
+        })?;
 
         if let Some(label) = desc.label {
             unsafe { self.shared.set_object_name(image.raw, label) };
@@ -1194,11 +1265,8 @@ impl crate::Device for super::Device {
             drop_guard: None,
             external_memory: None,
             block: Some(block),
-            usage: desc.usage,
             format: desc.format,
-            raw_flags: image.raw_flags,
             copy_size: image.copy_size,
-            view_formats: image.view_formats,
         })
     }
     unsafe fn destroy_texture(&self, texture: super::Texture) {
@@ -1227,24 +1295,22 @@ impl crate::Device for super::Device {
         desc: &crate::TextureViewDescriptor,
     ) -> Result<super::TextureView, crate::DeviceError> {
         let subresource_range = conv::map_subresource_range(&desc.range, texture.format);
+        let raw_format = self.shared.private_caps.map_texture_format(desc.format);
         let mut vk_info = vk::ImageViewCreateInfo::default()
             .flags(vk::ImageViewCreateFlags::empty())
             .image(texture.raw)
             .view_type(conv::map_view_dimension(desc.dimension))
-            .format(self.shared.private_caps.map_texture_format(desc.format))
+            .format(raw_format)
             .subresource_range(subresource_range);
         let layers =
             NonZeroU32::new(subresource_range.layer_count).expect("Unexpected zero layer count");
 
         let mut image_view_info;
-        let view_usage = if self.shared.private_caps.image_view_usage && !desc.usage.is_empty() {
+        if self.shared.private_caps.image_view_usage && !desc.usage.is_empty() {
             image_view_info =
                 vk::ImageViewUsageCreateInfo::default().usage(conv::map_texture_usage(desc.usage));
             vk_info = vk_info.push_next(&mut image_view_info);
-            desc.usage
-        } else {
-            texture.usage
-        };
+        }
 
         let raw = unsafe { self.shared.raw.create_image_view(&vk_info, None) }
             .map_err(super::map_host_device_oom_and_ioca_err)?;
@@ -1253,40 +1319,19 @@ impl crate::Device for super::Device {
             unsafe { self.shared.set_object_name(raw, label) };
         }
 
-        let attachment = super::FramebufferAttachment {
-            raw: if self.shared.private_caps.imageless_framebuffers {
-                vk::ImageView::null()
-            } else {
-                raw
-            },
-            raw_image_flags: texture.raw_flags,
-            view_usage,
-            view_format: desc.format,
-            raw_view_formats: texture
-                .view_formats
-                .iter()
-                .map(|tf| self.shared.private_caps.map_texture_format(*tf))
-                .collect(),
-        };
-
         self.counters.texture_views.add(1);
 
         Ok(super::TextureView {
+            raw_texture: texture.raw,
             raw,
             layers,
-            attachment,
+            format: desc.format,
+            raw_format,
+            base_mip_level: desc.range.base_mip_level,
+            dimension: desc.dimension,
         })
     }
     unsafe fn destroy_texture_view(&self, view: super::TextureView) {
-        if !self.shared.private_caps.imageless_framebuffers {
-            let mut fbuf_lock = self.shared.framebuffers.lock();
-            for (key, &raw_fbuf) in fbuf_lock.iter() {
-                if key.attachments.iter().any(|at| at.raw == view.raw) {
-                    unsafe { self.shared.raw.destroy_framebuffer(raw_fbuf, None) };
-                }
-            }
-            fbuf_lock.retain(|key, _| !key.attachments.iter().any(|at| at.raw == view.raw));
-        }
         unsafe { self.shared.raw.destroy_image_view(view.raw, None) };
 
         self.counters.texture_views.sub(1);
@@ -1296,7 +1341,7 @@ impl crate::Device for super::Device {
         &self,
         desc: &crate::SamplerDescriptor,
     ) -> Result<super::Sampler, crate::DeviceError> {
-        let mut vk_info = vk::SamplerCreateInfo::default()
+        let mut create_info = vk::SamplerCreateInfo::default()
             .flags(vk::SamplerCreateFlags::empty())
             .mag_filter(conv::map_filter_mode(desc.mag_filter))
             .min_filter(conv::map_filter_mode(desc.min_filter))
@@ -1308,7 +1353,7 @@ impl crate::Device for super::Device {
             .max_lod(desc.lod_clamp.end);
 
         if let Some(fun) = desc.compare {
-            vk_info = vk_info
+            create_info = create_info
                 .compare_enable(true)
                 .compare_op(conv::map_comparison(fun));
         }
@@ -1316,32 +1361,38 @@ impl crate::Device for super::Device {
         if desc.anisotropy_clamp != 1 {
             // We only enable anisotropy if it is supported, and wgpu-hal interface guarantees
             // the clamp is in the range [1, 16] which is always supported if anisotropy is.
-            vk_info = vk_info
+            create_info = create_info
                 .anisotropy_enable(true)
                 .max_anisotropy(desc.anisotropy_clamp as f32);
         }
 
         if let Some(color) = desc.border_color {
-            vk_info = vk_info.border_color(conv::map_border_color(color));
+            create_info = create_info.border_color(conv::map_border_color(color));
         }
 
-        let raw = unsafe {
-            self.shared
-                .raw
-                .create_sampler(&vk_info, None)
-                .map_err(super::map_host_device_oom_and_ioca_err)?
-        };
+        let raw = self
+            .shared
+            .sampler_cache
+            .lock()
+            .create_sampler(&self.shared.raw, create_info)?;
 
+        // Note: Cached samplers will just continually overwrite the label
+        //
+        // https://github.com/gfx-rs/wgpu/issues/6867
         if let Some(label) = desc.label {
             unsafe { self.shared.set_object_name(raw, label) };
         }
 
         self.counters.samplers.add(1);
 
-        Ok(super::Sampler { raw })
+        Ok(super::Sampler { raw, create_info })
     }
     unsafe fn destroy_sampler(&self, sampler: super::Sampler) {
-        unsafe { self.shared.raw.destroy_sampler(sampler.raw, None) };
+        self.shared.sampler_cache.lock().destroy_sampler(
+            &self.shared.raw,
+            sampler.create_info,
+            sampler.raw,
+        );
 
         self.counters.samplers.sub(1);
     }
@@ -1373,6 +1424,8 @@ impl crate::Device for super::Device {
             discarded: Vec::new(),
             rpass_debug_marker_active: false,
             end_of_pass_timer_query: None,
+            framebuffers: Default::default(),
+            temp_texture_views: Default::default(),
             counters: Arc::clone(&self.counters),
         })
     }
@@ -1426,7 +1479,7 @@ impl crate::Device for super::Device {
                 wgt::BindingType::StorageTexture { .. } => {
                     desc_count.storage_image += count;
                 }
-                wgt::BindingType::AccelerationStructure => {
+                wgt::BindingType::AccelerationStructure { .. } => {
                     desc_count.acceleration_structure += count;
                 }
             }
@@ -1446,44 +1499,47 @@ impl crate::Device for super::Device {
             })
             .collect::<Vec<_>>();
 
-        let vk_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&vk_bindings);
-
-        let binding_arrays = desc
+        let binding_arrays: Vec<_> = desc
             .entries
             .iter()
             .enumerate()
             .filter_map(|(idx, entry)| entry.count.map(|count| (idx as u32, count)))
             .collect();
 
-        let mut binding_flag_info;
-        let binding_flag_vec;
+        let vk_info = vk::DescriptorSetLayoutCreateInfo::default()
+            .bindings(&vk_bindings)
+            .flags(if !binding_arrays.is_empty() {
+                vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL
+            } else {
+                vk::DescriptorSetLayoutCreateFlags::empty()
+            });
 
         let partially_bound = desc
             .flags
             .contains(crate::BindGroupLayoutFlags::PARTIALLY_BOUND);
 
-        let vk_info = if partially_bound {
-            binding_flag_vec = desc
-                .entries
-                .iter()
-                .map(|entry| {
-                    let mut flags = vk::DescriptorBindingFlags::empty();
+        let binding_flag_vec = desc
+            .entries
+            .iter()
+            .map(|entry| {
+                let mut flags = vk::DescriptorBindingFlags::empty();
 
-                    if partially_bound && entry.count.is_some() {
-                        flags |= vk::DescriptorBindingFlags::PARTIALLY_BOUND;
-                    }
+                if partially_bound && entry.count.is_some() {
+                    flags |= vk::DescriptorBindingFlags::PARTIALLY_BOUND;
+                }
 
-                    flags
-                })
-                .collect::<Vec<_>>();
+                if entry.count.is_some() {
+                    flags |= vk::DescriptorBindingFlags::UPDATE_AFTER_BIND;
+                }
 
-            binding_flag_info = vk::DescriptorSetLayoutBindingFlagsCreateInfo::default()
-                .binding_flags(&binding_flag_vec);
+                flags
+            })
+            .collect::<Vec<_>>();
 
-            vk_info.push_next(&mut binding_flag_info)
-        } else {
-            vk_info
-        };
+        let mut binding_flag_info = vk::DescriptorSetLayoutBindingFlagsCreateInfo::default()
+            .binding_flags(&binding_flag_vec);
+
+        let vk_info = vk_info.push_next(&mut binding_flag_info);
 
         let raw = unsafe {
             self.shared
@@ -1596,11 +1652,19 @@ impl crate::Device for super::Device {
             super::AccelerationStructure,
         >,
     ) -> Result<super::BindGroup, crate::DeviceError> {
+        let contains_binding_arrays = !desc.layout.binding_arrays.is_empty();
+
+        let desc_set_layout_flags = if contains_binding_arrays {
+            gpu_descriptor::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND
+        } else {
+            gpu_descriptor::DescriptorSetLayoutCreateFlags::empty()
+        };
+
         let mut vk_sets = unsafe {
             self.desc_allocator.lock().allocate(
                 &*self.shared,
                 &desc.layout.raw,
-                gpu_descriptor::DescriptorSetLayoutCreateFlags::empty(),
+                desc_set_layout_flags,
                 &desc.layout.desc_count,
                 1,
             )?
@@ -1704,10 +1768,8 @@ impl crate::Device for super::Device {
                     (image_infos, local_image_infos) =
                         image_infos.extend(desc.textures[start as usize..end as usize].iter().map(
                             |binding| {
-                                let layout = conv::derive_image_layout(
-                                    binding.usage,
-                                    binding.view.attachment.view_format,
-                                );
+                                let layout =
+                                    conv::derive_image_layout(binding.usage, binding.view.format);
                                 vk::DescriptorImageInfo::default()
                                     .image_view(binding.view.raw)
                                     .image_layout(layout)
@@ -1813,7 +1875,7 @@ impl crate::Device for super::Device {
                             file_name: d.file_name.as_ref().as_ref(),
                             language: naga::back::spv::SourceLanguage::WGSL,
                         });
-                if !desc.runtime_checks {
+                if !desc.runtime_checks.bounds_checks {
                     naga_options.bounds_check_policies = naga::proc::BoundsCheckPolicies {
                         index: naga::proc::BoundsCheckPolicy::Unchecked,
                         buffer: naga::proc::BoundsCheckPolicy::Unchecked,
@@ -1830,6 +1892,9 @@ impl crate::Device for super::Device {
                     )
                     .map_err(|e| crate::ShaderError::Compilation(format!("{e}")))?,
                 )
+            }
+            crate::ShaderInput::Msl { .. } => {
+                panic!("MSL_SHADER_PASSTHROUGH is not enabled for this backend")
             }
             crate::ShaderInput::SpirV(spv) => Cow::Borrowed(spv),
         };
@@ -2037,10 +2102,7 @@ impl crate::Device for super::Device {
         let vk_dynamic_state =
             vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
 
-        let raw_pass = self
-            .shared
-            .make_render_pass(compatible_rp_key)
-            .map_err(crate::DeviceError::from)?;
+        let raw_pass = self.shared.make_render_pass(compatible_rp_key)?;
 
         let vk_infos = [{
             vk::GraphicsPipelineCreateInfo::default()
@@ -2078,6 +2140,235 @@ impl crate::Device for super::Device {
         }
 
         if let Some(raw_module) = compiled_vs.temp_raw_module {
+            unsafe { self.shared.raw.destroy_shader_module(raw_module, None) };
+        }
+        if let Some(CompiledStage {
+            temp_raw_module: Some(raw_module),
+            ..
+        }) = compiled_fs
+        {
+            unsafe { self.shared.raw.destroy_shader_module(raw_module, None) };
+        }
+
+        self.counters.render_pipelines.add(1);
+
+        Ok(super::RenderPipeline { raw })
+    }
+    unsafe fn create_mesh_pipeline(
+        &self,
+        desc: &crate::MeshPipelineDescriptor<
+            <Self::A as crate::Api>::PipelineLayout,
+            <Self::A as crate::Api>::ShaderModule,
+            <Self::A as crate::Api>::PipelineCache,
+        >,
+    ) -> Result<<Self::A as crate::Api>::RenderPipeline, crate::PipelineError> {
+        let dynamic_states = [
+            vk::DynamicState::VIEWPORT,
+            vk::DynamicState::SCISSOR,
+            vk::DynamicState::BLEND_CONSTANTS,
+            vk::DynamicState::STENCIL_REFERENCE,
+        ];
+        let mut compatible_rp_key = super::RenderPassKey {
+            sample_count: desc.multisample.count,
+            multiview: desc.multiview,
+            ..Default::default()
+        };
+        let mut stages = ArrayVec::<_, { crate::MAX_CONCURRENT_SHADER_STAGES }>::new();
+
+        let vk_input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+            .topology(conv::map_topology(desc.primitive.topology))
+            .primitive_restart_enable(desc.primitive.strip_index_format.is_some());
+
+        let compiled_ts = match desc.task_stage {
+            Some(ref stage) => {
+                let mut compiled = self.compile_stage(
+                    stage,
+                    naga::ShaderStage::Task,
+                    &desc.layout.binding_arrays,
+                )?;
+                compiled.create_info.stage = vk::ShaderStageFlags::TASK_EXT;
+                stages.push(compiled.create_info);
+                Some(compiled)
+            }
+            None => None,
+        };
+
+        let mut compiled_ms = self.compile_stage(
+            &desc.mesh_stage,
+            naga::ShaderStage::Mesh,
+            &desc.layout.binding_arrays,
+        )?;
+        compiled_ms.create_info.stage = vk::ShaderStageFlags::MESH_EXT;
+        stages.push(compiled_ms.create_info);
+        let compiled_fs = match desc.fragment_stage {
+            Some(ref stage) => {
+                let compiled = self.compile_stage(
+                    stage,
+                    naga::ShaderStage::Fragment,
+                    &desc.layout.binding_arrays,
+                )?;
+                stages.push(compiled.create_info);
+                Some(compiled)
+            }
+            None => None,
+        };
+
+        let mut vk_rasterization = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(conv::map_polygon_mode(desc.primitive.polygon_mode))
+            .front_face(conv::map_front_face(desc.primitive.front_face))
+            .line_width(1.0)
+            .depth_clamp_enable(desc.primitive.unclipped_depth);
+        if let Some(face) = desc.primitive.cull_mode {
+            vk_rasterization = vk_rasterization.cull_mode(conv::map_cull_face(face))
+        }
+        let mut vk_rasterization_conservative_state =
+            vk::PipelineRasterizationConservativeStateCreateInfoEXT::default()
+                .conservative_rasterization_mode(
+                    vk::ConservativeRasterizationModeEXT::OVERESTIMATE,
+                );
+        if desc.primitive.conservative {
+            vk_rasterization = vk_rasterization.push_next(&mut vk_rasterization_conservative_state);
+        }
+
+        let mut vk_depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default();
+        if let Some(ref ds) = desc.depth_stencil {
+            let vk_format = self.shared.private_caps.map_texture_format(ds.format);
+            let vk_layout = if ds.is_read_only(desc.primitive.cull_mode) {
+                vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL
+            } else {
+                vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+            };
+            compatible_rp_key.depth_stencil = Some(super::DepthStencilAttachmentKey {
+                base: super::AttachmentKey::compatible(vk_format, vk_layout),
+                stencil_ops: crate::AttachmentOps::all(),
+            });
+
+            if ds.is_depth_enabled() {
+                vk_depth_stencil = vk_depth_stencil
+                    .depth_test_enable(true)
+                    .depth_write_enable(ds.depth_write_enabled)
+                    .depth_compare_op(conv::map_comparison(ds.depth_compare));
+            }
+            if ds.stencil.is_enabled() {
+                let s = &ds.stencil;
+                let front = conv::map_stencil_face(&s.front, s.read_mask, s.write_mask);
+                let back = conv::map_stencil_face(&s.back, s.read_mask, s.write_mask);
+                vk_depth_stencil = vk_depth_stencil
+                    .stencil_test_enable(true)
+                    .front(front)
+                    .back(back);
+            }
+
+            if ds.bias.is_enabled() {
+                vk_rasterization = vk_rasterization
+                    .depth_bias_enable(true)
+                    .depth_bias_constant_factor(ds.bias.constant as f32)
+                    .depth_bias_clamp(ds.bias.clamp)
+                    .depth_bias_slope_factor(ds.bias.slope_scale);
+            }
+        }
+
+        let vk_viewport = vk::PipelineViewportStateCreateInfo::default()
+            .flags(vk::PipelineViewportStateCreateFlags::empty())
+            .scissor_count(1)
+            .viewport_count(1);
+
+        let vk_sample_mask = [
+            desc.multisample.mask as u32,
+            (desc.multisample.mask >> 32) as u32,
+        ];
+        let vk_multisample = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::from_raw(desc.multisample.count))
+            .alpha_to_coverage_enable(desc.multisample.alpha_to_coverage_enabled)
+            .sample_mask(&vk_sample_mask);
+
+        let mut vk_attachments = Vec::with_capacity(desc.color_targets.len());
+        for cat in desc.color_targets {
+            let (key, attarchment) = if let Some(cat) = cat.as_ref() {
+                let mut vk_attachment = vk::PipelineColorBlendAttachmentState::default()
+                    .color_write_mask(vk::ColorComponentFlags::from_raw(cat.write_mask.bits()));
+                if let Some(ref blend) = cat.blend {
+                    let (color_op, color_src, color_dst) = conv::map_blend_component(&blend.color);
+                    let (alpha_op, alpha_src, alpha_dst) = conv::map_blend_component(&blend.alpha);
+                    vk_attachment = vk_attachment
+                        .blend_enable(true)
+                        .color_blend_op(color_op)
+                        .src_color_blend_factor(color_src)
+                        .dst_color_blend_factor(color_dst)
+                        .alpha_blend_op(alpha_op)
+                        .src_alpha_blend_factor(alpha_src)
+                        .dst_alpha_blend_factor(alpha_dst);
+                }
+
+                let vk_format = self.shared.private_caps.map_texture_format(cat.format);
+                (
+                    Some(super::ColorAttachmentKey {
+                        base: super::AttachmentKey::compatible(
+                            vk_format,
+                            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                        ),
+                        resolve: None,
+                    }),
+                    vk_attachment,
+                )
+            } else {
+                (None, vk::PipelineColorBlendAttachmentState::default())
+            };
+
+            compatible_rp_key.colors.push(key);
+            vk_attachments.push(attarchment);
+        }
+
+        let vk_color_blend =
+            vk::PipelineColorBlendStateCreateInfo::default().attachments(&vk_attachments);
+
+        let vk_dynamic_state =
+            vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+
+        let raw_pass = self.shared.make_render_pass(compatible_rp_key)?;
+
+        let vk_infos = [{
+            vk::GraphicsPipelineCreateInfo::default()
+                .layout(desc.layout.raw)
+                .stages(&stages)
+                .input_assembly_state(&vk_input_assembly)
+                .rasterization_state(&vk_rasterization)
+                .viewport_state(&vk_viewport)
+                .multisample_state(&vk_multisample)
+                .depth_stencil_state(&vk_depth_stencil)
+                .color_blend_state(&vk_color_blend)
+                .dynamic_state(&vk_dynamic_state)
+                .render_pass(raw_pass)
+        }];
+
+        let pipeline_cache = desc
+            .cache
+            .map(|it| it.raw)
+            .unwrap_or(vk::PipelineCache::null());
+
+        let mut raw_vec = {
+            profiling::scope!("vkCreateGraphicsPipelines");
+            unsafe {
+                self.shared
+                    .raw
+                    .create_graphics_pipelines(pipeline_cache, &vk_infos, None)
+                    .map_err(|(_, e)| super::map_pipeline_err(e))
+            }?
+        };
+
+        let raw = raw_vec.pop().unwrap();
+        if let Some(label) = desc.label {
+            unsafe { self.shared.set_object_name(raw, label) };
+        }
+        // NOTE: this could leak shaders in case of an error.
+        if let Some(CompiledStage {
+            temp_raw_module: Some(raw_module),
+            ..
+        }) = compiled_ts
+        {
+            unsafe { self.shared.raw.destroy_shader_module(raw_module, None) };
+        }
+        if let Some(raw_module) = compiled_ms.temp_raw_module {
             unsafe { self.shared.raw.destroy_shader_module(raw_module, None) };
         }
         if let Some(CompiledStage {
@@ -2178,6 +2469,10 @@ impl crate::Device for super::Device {
         &self,
         desc: &wgt::QuerySetDescriptor<crate::Label>,
     ) -> Result<super::QuerySet, crate::DeviceError> {
+        // Assume each query is 256 bytes.
+        // On an AMD W6800 with driver version 32.0.12030.9, occlusion queries are 256.
+        self.error_if_would_oom_on_resource_allocation(true, desc.count as u64 * 256)?;
+
         let (vk_type, pipeline_statistics) = match desc.ty {
             wgt::QueryType::Occlusion => (
                 vk::QueryType::OCCLUSION,
@@ -2274,7 +2569,7 @@ impl crate::Device for super::Device {
         self.shared.wait_for_fence(fence, wait_value, timeout_ns)
     }
 
-    unsafe fn start_capture(&self) -> bool {
+    unsafe fn start_graphics_debugger_capture(&self) -> bool {
         #[cfg(feature = "renderdoc")]
         {
             // Renderdoc requires us to give us the pointer that vkInstance _points to_.
@@ -2289,7 +2584,7 @@ impl crate::Device for super::Device {
         #[cfg(not(feature = "renderdoc"))]
         false
     }
-    unsafe fn stop_capture(&self) {
+    unsafe fn stop_graphics_debugger_capture(&self) {
         #[cfg(feature = "renderdoc")]
         {
             // Renderdoc requires us to give us the pointer that vkInstance _points to_.
@@ -2347,9 +2642,42 @@ impl crate::Device for super::Device {
                 for triangles in in_geometries {
                     let mut triangle_data =
                         vk::AccelerationStructureGeometryTrianglesDataKHR::default()
+                            .index_type(vk::IndexType::NONE_KHR)
                             .vertex_format(conv::map_vertex_format(triangles.vertex_format))
                             .max_vertex(triangles.vertex_count)
-                            .vertex_stride(triangles.vertex_stride);
+                            .vertex_stride(triangles.vertex_stride)
+                            // The vulkan spec suggests we could pass a non-zero invalid address here if fetching
+                            // the real address has significant overhead, but we pass the real one to be on the
+                            // safe side for now.
+                            // from https://registry.khronos.org/vulkan/specs/latest/man/html/vkGetAccelerationStructureBuildSizesKHR.html
+                            // > The srcAccelerationStructure, dstAccelerationStructure, and mode members
+                            // > of pBuildInfo are ignored. Any VkDeviceOrHostAddressKHR or VkDeviceOrHostAddressConstKHR
+                            // > members of pBuildInfo are ignored by this command, except that the hostAddress
+                            // > member of VkAccelerationStructureGeometryTrianglesDataKHR::transformData will
+                            // > be examined to check if it is NULL.
+                            .transform_data(vk::DeviceOrHostAddressConstKHR {
+                                device_address: if desc
+                                    .flags
+                                    .contains(wgt::AccelerationStructureFlags::USE_TRANSFORM)
+                                {
+                                    unsafe {
+                                        ray_tracing_functions
+                                            .buffer_device_address
+                                            .get_buffer_device_address(
+                                                &vk::BufferDeviceAddressInfo::default().buffer(
+                                                    triangles
+                                                        .transform
+                                                        .as_ref()
+                                                        .unwrap()
+                                                        .buffer
+                                                        .raw,
+                                                ),
+                                            )
+                                    }
+                                } else {
+                                    0
+                                },
+                            });
 
                     let pritive_count = if let Some(ref indices) = triangles.indices {
                         triangle_data =
@@ -2474,20 +2802,34 @@ impl crate::Device for super::Device {
                 .map_err(super::map_host_device_oom_and_ioca_err)?;
             let req = self.shared.raw.get_buffer_memory_requirements(raw_buffer);
 
-            let block = self.mem_allocator.lock().alloc(
-                &*self.shared,
-                gpu_alloc::Request {
-                    size: req.size,
-                    align_mask: req.alignment - 1,
-                    usage: gpu_alloc::UsageFlags::FAST_DEVICE_ACCESS,
-                    memory_types: req.memory_type_bits & self.valid_ash_memory_types,
-                },
-            )?;
+            self.error_if_would_oom_on_resource_allocation(false, req.size)
+                .inspect_err(|_| {
+                    self.shared.raw.destroy_buffer(raw_buffer, None);
+                })?;
+
+            let block = self
+                .mem_allocator
+                .lock()
+                .alloc(
+                    &*self.shared,
+                    gpu_alloc::Request {
+                        size: req.size,
+                        align_mask: req.alignment - 1,
+                        usage: gpu_alloc::UsageFlags::FAST_DEVICE_ACCESS,
+                        memory_types: req.memory_type_bits & self.valid_ash_memory_types,
+                    },
+                )
+                .inspect_err(|_| {
+                    self.shared.raw.destroy_buffer(raw_buffer, None);
+                })?;
 
             self.shared
                 .raw
                 .bind_buffer_memory(raw_buffer, *block.memory(), block.offset())
-                .map_err(super::map_host_device_oom_and_ioca_err)?;
+                .map_err(super::map_host_device_oom_and_ioca_err)
+                .inspect_err(|_| {
+                    self.shared.raw.destroy_buffer(raw_buffer, None);
+                })?;
 
             if let Some(label) = desc.label {
                 self.shared.set_object_name(raw_buffer, label);
@@ -2502,17 +2844,42 @@ impl crate::Device for super::Device {
             let raw_acceleration_structure = ray_tracing_functions
                 .acceleration_structure
                 .create_acceleration_structure(&vk_info, None)
-                .map_err(super::map_host_oom_and_ioca_err)?;
+                .map_err(super::map_host_oom_and_ioca_err)
+                .inspect_err(|_| {
+                    self.shared.raw.destroy_buffer(raw_buffer, None);
+                })?;
 
             if let Some(label) = desc.label {
                 self.shared
                     .set_object_name(raw_acceleration_structure, label);
             }
 
+            let pool = if desc.allow_compaction {
+                let vk_info = vk::QueryPoolCreateInfo::default()
+                    .query_type(vk::QueryType::ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR)
+                    .query_count(1);
+
+                let raw = self
+                    .shared
+                    .raw
+                    .create_query_pool(&vk_info, None)
+                    .map_err(super::map_host_device_oom_err)
+                    .inspect_err(|_| {
+                        ray_tracing_functions
+                            .acceleration_structure
+                            .destroy_acceleration_structure(raw_acceleration_structure, None);
+                        self.shared.raw.destroy_buffer(raw_buffer, None);
+                    })?;
+                Some(raw)
+            } else {
+                None
+            };
+
             Ok(super::AccelerationStructure {
                 raw: raw_acceleration_structure,
                 buffer: raw_buffer,
                 block: Mutex::new(block),
+                compacted_size_query: pool,
             })
         }
     }
@@ -2538,6 +2905,9 @@ impl crate::Device for super::Device {
             self.mem_allocator
                 .lock()
                 .dealloc(&*self.shared, acceleration_structure.block.into_inner());
+            if let Some(query) = acceleration_structure.compacted_size_query {
+                self.shared.raw.destroy_query_pool(query, None)
+            }
         }
     }
 
@@ -2553,15 +2923,63 @@ impl crate::Device for super::Device {
         const MAX_U24: u32 = (1u32 << 24u32) - 1u32;
         let temp = RawTlasInstance {
             transform: instance.transform,
-            custom_index_and_mask: (instance.custom_index & MAX_U24)
+            custom_data_and_mask: (instance.custom_data & MAX_U24)
                 | (u32::from(instance.mask) << 24),
             shader_binding_table_record_offset_and_flags: 0,
             acceleration_structure_reference: instance.blas_address,
         };
-        let temp: *const _ = &temp;
-        unsafe {
-            slice::from_raw_parts::<u8>(temp.cast::<u8>(), size_of::<RawTlasInstance>()).to_vec()
+        bytemuck::bytes_of(&temp).to_vec()
+    }
+
+    fn check_if_oom(&self) -> Result<(), crate::DeviceError> {
+        let Some(threshold) = self
+            .shared
+            .instance
+            .memory_budget_thresholds
+            .for_device_loss
+        else {
+            return Ok(());
+        };
+
+        if !self
+            .shared
+            .enabled_extensions
+            .contains(&ext::memory_budget::NAME)
+        {
+            return Ok(());
         }
+
+        let get_physical_device_properties = self
+            .shared
+            .instance
+            .get_physical_device_properties
+            .as_ref()
+            .unwrap();
+
+        let mut memory_budget_properties = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+
+        let mut memory_properties =
+            vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut memory_budget_properties);
+
+        unsafe {
+            get_physical_device_properties.get_physical_device_memory_properties2(
+                self.shared.physical_device,
+                &mut memory_properties,
+            );
+        }
+
+        let memory_properties = memory_properties.memory_properties;
+
+        for i in 0..memory_properties.memory_heap_count {
+            let heap_usage = memory_budget_properties.heap_usage[i as usize];
+            let heap_budget = memory_budget_properties.heap_budget[i as usize];
+
+            if heap_usage >= heap_budget / 100 * threshold as u64 {
+                return Err(crate::DeviceError::OutOfMemory);
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -2672,6 +3090,4 @@ struct ImageWithoutMemory {
     raw: vk::Image,
     requirements: vk::MemoryRequirements,
     copy_size: crate::CopyExtent,
-    view_formats: Vec<wgt::TextureFormat>,
-    raw_flags: vk::ImageCreateFlags,
 }

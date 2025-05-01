@@ -5,7 +5,7 @@ use crate::*;
 /// It can be created with [`Device::create_texture`].
 ///
 /// Corresponds to [WebGPU `GPUTexture`](https://gpuweb.github.io/gpuweb/#texture-interface).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Texture {
     pub(crate) inner: dispatch::DispatchTexture,
     pub(crate) descriptor: TextureDescriptor<'static>,
@@ -37,7 +37,17 @@ impl Texture {
         }
     }
 
-    /// Creates a view of this texture.
+    #[cfg(custom)]
+    /// Returns custom implementation of Texture (if custom backend and is internally T)
+    pub fn as_custom<T: custom::TextureInterface>(&self) -> Option<&T> {
+        self.inner.as_custom()
+    }
+
+    /// Creates a view of this texture, specifying an interpretation of its texels and
+    /// possibly a subset of its layers and mip levels.
+    ///
+    /// Texture views are needed to use a texture as a binding in a [`BindGroup`]
+    /// or as an attachment in a [`RenderPass`].
     pub fn create_view(&self, desc: &TextureViewDescriptor<'_>) -> TextureView {
         let view = self.inner.create_view(desc);
 

@@ -1,8 +1,9 @@
-use std::{error, fmt, future::Future, sync::Arc};
+use alloc::{boxed::Box, string::String, sync::Arc};
+use core::{error, fmt, future::Future};
 
 use parking_lot::Mutex;
 
-use crate::api::blas::{Blas, BlasGeometrySizeDescriptors, BlasShared, CreateBlasDescriptor};
+use crate::api::blas::{Blas, BlasGeometrySizeDescriptors, CreateBlasDescriptor};
 use crate::api::tlas::{CreateTlasDescriptor, Tlas};
 use crate::*;
 
@@ -14,7 +15,7 @@ use crate::*;
 /// A device may be requested from an adapter with [`Adapter::request_device`].
 ///
 /// Corresponds to [WebGPU `GPUDevice`](https://gpuweb.github.io/gpuweb/#gpu-device).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Device {
     pub(crate) inner: dispatch::DispatchDevice,
 }
@@ -33,7 +34,55 @@ pub type DeviceDescriptor<'a> = wgt::DeviceDescriptor<Label<'a>>;
 static_assertions::assert_impl_all!(DeviceDescriptor<'_>: Send, Sync);
 
 impl Device {
-    /// Check for resource cleanups and mapping callbacks. Will block if [`Maintain::Wait`] is passed.
+    #[cfg(custom)]
+    /// Returns custom implementation of Device (if custom backend and is internally T)
+    pub fn as_custom<T: custom::DeviceInterface>(&self) -> Option<&T> {
+        self.inner.as_custom()
+    }
+
+    #[cfg(custom)]
+    /// Creates Device from custom implementation
+    pub fn from_custom<T: custom::DeviceInterface>(device: T) -> Self {
+        Self {
+            inner: dispatch::DispatchDevice::custom(device),
+        }
+    }
+
+    /// Constructs a stub device for testing using [`Backend::Noop`].
+    ///
+    /// This is a convenience function which avoids the configuration, `async`, and fallibility
+    /// aspects of constructing a device through `Instance`.
+    #[cfg(feature = "noop")]
+    pub fn noop(desc: &DeviceDescriptor<'_>) -> (Device, Queue) {
+        use core::future::Future as _;
+        use core::pin::pin;
+        use core::task;
+        let ctx = &mut task::Context::from_waker(waker::noop_waker_ref());
+
+        let instance = Instance::new(&InstanceDescriptor {
+            backends: Backends::NOOP,
+            backend_options: BackendOptions {
+                noop: NoopBackendOptions { enable: true },
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        // Both of these futures are trivial and should complete instantaneously,
+        // so we do not need an executor and can just poll them once.
+        let task::Poll::Ready(Ok(adapter)) =
+            pin!(instance.request_adapter(&RequestAdapterOptions::default())).poll(ctx)
+        else {
+            unreachable!()
+        };
+        let task::Poll::Ready(Ok(device_and_queue)) = pin!(adapter.request_device(desc)).poll(ctx)
+        else {
+            unreachable!()
+        };
+        device_and_queue
+    }
+
+    /// Check for resource cleanups and mapping callbacks. Will block if [`PollType::Wait`] is passed.
     ///
     /// Return `true` if the queue is empty, or `false` if there are more queue
     /// submissions still in flight. (Note that, unless access to the [`Queue`] is
@@ -42,8 +91,8 @@ impl Device {
     /// other threads could submit new work at any time.)
     ///
     /// When running on WebGPU, this is a no-op. `Device`s are automatically polled.
-    pub fn poll(&self, maintain: Maintain) -> MaintainResult {
-        self.inner.poll(maintain)
+    pub fn poll(&self, poll_type: PollType) -> Result<crate::PollStatus, crate::PollError> {
+        self.inner.poll(poll_type.map_index(|s| s.index))
     }
 
     /// The features which can be used on this device.
@@ -62,7 +111,7 @@ impl Device {
         self.inner.limits()
     }
 
-    /// Creates a shader module from either SPIR-V or WGSL source code.
+    /// Creates a shader module.
     ///
     /// <div class="warning">
     // NOTE: Keep this in sync with `naga::front::wgsl::parse_str`!
@@ -80,45 +129,67 @@ impl Device {
     pub fn create_shader_module(&self, desc: ShaderModuleDescriptor<'_>) -> ShaderModule {
         let module = self
             .inner
-            .create_shader_module(desc, wgt::ShaderBoundChecks::new());
+            .create_shader_module(desc, wgt::ShaderRuntimeChecks::checked());
         ShaderModule { inner: module }
     }
 
-    /// Creates a shader module from either SPIR-V or WGSL source code without runtime checks.
+    /// Deprecated: Use [`create_shader_module_trusted`][csmt] instead.
     ///
     /// # Safety
-    /// In contrast with [`create_shader_module`](Self::create_shader_module) this function
-    /// creates a shader module without runtime checks which allows shaders to perform
-    /// operations which can lead to undefined behavior like indexing out of bounds, thus it's
-    /// the caller responsibility to pass a shader which doesn't perform any of this
-    /// operations.
     ///
-    /// This has no effect on web.
+    /// See [`create_shader_module_trusted`][csmt].
+    ///
+    /// [csmt]: Self::create_shader_module_trusted
+    #[deprecated(
+        since = "24.0.0",
+        note = "Use `Device::create_shader_module_trusted(desc, wgpu::ShaderRuntimeChecks::unchecked())` instead."
+    )]
     #[must_use]
     pub unsafe fn create_shader_module_unchecked(
         &self,
         desc: ShaderModuleDescriptor<'_>,
     ) -> ShaderModule {
-        let module = self
-            .inner
-            .create_shader_module(desc, unsafe { wgt::ShaderBoundChecks::unchecked() });
-        ShaderModule { inner: module }
+        unsafe { self.create_shader_module_trusted(desc, crate::ShaderRuntimeChecks::unchecked()) }
     }
 
-    /// Creates a shader module from SPIR-V binary directly.
+    /// Creates a shader module with flags to dictate runtime checks.
+    ///
+    /// When running on WebGPU, this will merely call [`create_shader_module`][csm].
     ///
     /// # Safety
     ///
-    /// This function passes binary data to the backend as-is and can potentially result in a
-    /// driver crash or bogus behaviour. No attempt is made to ensure that data is valid SPIR-V.
+    /// In contrast with [`create_shader_module`][csm] this function
+    /// creates a shader module with user-customizable runtime checks which allows shaders to
+    /// perform operations which can lead to undefined behavior like indexing out of bounds,
+    /// thus it's the caller responsibility to pass a shader which doesn't perform any of this
+    /// operations.
     ///
-    /// See also [`include_spirv_raw!`] and [`util::make_spirv_raw`].
+    /// See the documentation for [`ShaderRuntimeChecks`][src] for more information about specific checks.
+    ///
+    /// [csm]: Self::create_shader_module
+    /// [src]: crate::ShaderRuntimeChecks
     #[must_use]
-    pub unsafe fn create_shader_module_spirv(
+    pub unsafe fn create_shader_module_trusted(
         &self,
-        desc: &ShaderModuleDescriptorSpirV<'_>,
+        desc: ShaderModuleDescriptor<'_>,
+        runtime_checks: crate::ShaderRuntimeChecks,
     ) -> ShaderModule {
-        let module = unsafe { self.inner.create_shader_module_spirv(desc) };
+        let module = self.inner.create_shader_module(desc, runtime_checks);
+        ShaderModule { inner: module }
+    }
+
+    /// Creates a shader module which will bypass wgpu's shader tooling and validation and be used directly by the backend.
+    ///
+    /// # Safety
+    ///
+    /// This function passes data to the backend as-is and can potentially result in a
+    /// driver crash or bogus behaviour. No attempt is made to ensure that data is valid.
+    #[must_use]
+    pub unsafe fn create_shader_module_passthrough(
+        &self,
+        desc: ShaderModuleDescriptorPassthrough<'_>,
+    ) -> ShaderModule {
+        let module = unsafe { self.inner.create_shader_module_passthrough(&desc) };
         ShaderModule { inner: module }
     }
 
@@ -138,7 +209,7 @@ impl Device {
         let encoder = self.inner.create_render_bundle_encoder(desc);
         RenderBundleEncoder {
             inner: encoder,
-            _p: std::marker::PhantomData,
+            _p: core::marker::PhantomData,
         }
     }
 
@@ -183,7 +254,7 @@ impl Device {
     /// Creates a [`Buffer`].
     #[must_use]
     pub fn create_buffer(&self, desc: &BufferDescriptor<'_>) -> Buffer {
-        let mut map_context = MapContext::new(desc.size);
+        let mut map_context = MapContext::new();
         if desc.mapped_at_creation {
             map_context.initial_range = 0..desc.size;
         }
@@ -192,7 +263,7 @@ impl Device {
 
         Buffer {
             inner: buffer,
-            map_context: Mutex::new(map_context),
+            map_context: Arc::new(Mutex::new(map_context)),
             size: desc.size,
             usage: desc.usage,
         }
@@ -259,7 +330,7 @@ impl Device {
         hal_buffer: A::Buffer,
         desc: &BufferDescriptor<'_>,
     ) -> Buffer {
-        let mut map_context = MapContext::new(desc.size);
+        let mut map_context = MapContext::new();
         if desc.mapped_at_creation {
             map_context.initial_range = 0..desc.size;
         }
@@ -273,7 +344,7 @@ impl Device {
 
         Buffer {
             inner: buffer.into(),
-            map_context: Mutex::new(map_context),
+            map_context: Arc::new(Mutex::new(map_context)),
             size: desc.size,
             usage: desc.usage,
         }
@@ -310,14 +381,65 @@ impl Device {
         self.inner.pop_error_scope()
     }
 
-    /// Starts frame capture.
-    pub fn start_capture(&self) {
-        self.inner.start_capture()
+    /// Starts a capture in the attached graphics debugger.
+    ///
+    /// This behaves differently depending on which graphics debugger is attached:
+    ///
+    /// - Renderdoc: Calls [`StartFrameCapture(device, NULL)`][rd].
+    /// - Xcode: Creates a capture with [`MTLCaptureManager`][xcode].
+    /// - None: No action is taken.
+    ///
+    /// # Safety
+    ///
+    /// - There should not be any other captures currently active.
+    /// - All other safety rules are defined by the graphics debugger, see the
+    ///   documentation for the specific debugger.
+    /// - In general, graphics debuggers can easily cause crashes, so this isn't
+    ///   ever guaranteed to be sound.
+    ///
+    /// # Tips
+    ///
+    /// - Debuggers need to capture both the recording of the commands and the
+    ///   submission of the commands to the GPU. Try to wrap all of your
+    ///   gpu work in a capture.
+    /// - If you encounter issues, try waiting for the GPU to finish all work
+    ///   before stopping the capture.
+    ///
+    /// [rd]: https://renderdoc.org/docs/in_application_api.html#_CPPv417StartFrameCapture23RENDERDOC_DevicePointer22RENDERDOC_WindowHandle
+    /// [xcode]: https://developer.apple.com/documentation/metal/mtlcapturemanager
+    #[doc(alias = "start_renderdoc_capture")]
+    #[doc(alias = "start_xcode_capture")]
+    pub unsafe fn start_graphics_debugger_capture(&self) {
+        unsafe { self.inner.start_graphics_debugger_capture() }
     }
 
-    /// Stops frame capture.
-    pub fn stop_capture(&self) {
-        self.inner.stop_capture()
+    /// Stops the current capture in the attached graphics debugger.
+    ///
+    /// This behaves differently depending on which graphics debugger is attached:
+    ///
+    /// - Renderdoc: Calls [`EndFrameCapture(device, NULL)`][rd].
+    /// - Xcode: Stops the capture with [`MTLCaptureManager`][xcode].
+    /// - None: No action is taken.
+    ///
+    /// # Safety
+    ///
+    /// - There should be a capture currently active.
+    /// - All other safety rules are defined by the graphics debugger, see the
+    ///   documentation for the specific debugger.
+    /// - In general, graphics debuggers can easily cause crashes, so this isn't
+    ///   ever guaranteed to be sound.
+    ///
+    /// # Tips
+    ///
+    /// - If you encounter issues, try to submit all work to the GPU, and waiting
+    ///   for that work to finish before stopping the capture.
+    ///
+    /// [rd]: https://renderdoc.org/docs/in_application_api.html#_CPPv415EndFrameCapture23RENDERDOC_DevicePointer22RENDERDOC_WindowHandle
+    /// [xcode]: https://developer.apple.com/documentation/metal/mtlcapturemanager
+    #[doc(alias = "stop_renderdoc_capture")]
+    #[doc(alias = "stop_xcode_capture")]
+    pub unsafe fn stop_graphics_debugger_capture(&self) {
+        unsafe { self.inner.stop_graphics_debugger_capture() }
     }
 
     /// Query internal counters from the native backend for debugging purposes.
@@ -445,15 +567,15 @@ impl Device {
     /// # Validation
     /// If any of the following is not satisfied a validation error is generated
     ///
-    /// The device ***must*** have [Features::EXPERIMENTAL_RAY_TRACING_ACCELERATION_STRUCTURE] enabled.
-    /// if `sizes` is [BlasGeometrySizeDescriptors::Triangles] then the following must be satisfied
+    /// The device ***must*** have [`Features::EXPERIMENTAL_RAY_TRACING_ACCELERATION_STRUCTURE`] enabled.
+    /// if `sizes` is [`BlasGeometrySizeDescriptors::Triangles`] then the following must be satisfied
     /// - For every geometry descriptor (for the purposes this is called `geo_desc`) of `sizes.descriptors` the following must be satisfied:
     ///     - `geo_desc.vertex_format` must be within allowed formats (allowed formats for a given feature set
-    ///       may be queried with [Features::allowed_vertex_formats_for_blas]).
+    ///       may be queried with [`Features::allowed_vertex_formats_for_blas`]).
     ///     - Both or neither of `geo_desc.index_format` and `geo_desc.index_count` must be provided.
     ///
-    /// [Features::EXPERIMENTAL_RAY_TRACING_ACCELERATION_STRUCTURE]: wgt::Features::EXPERIMENTAL_RAY_TRACING_ACCELERATION_STRUCTURE
-    /// [Features::allowed_vertex_formats_for_blas]: wgt::Features::allowed_vertex_formats_for_blas
+    /// [`Features::EXPERIMENTAL_RAY_TRACING_ACCELERATION_STRUCTURE`]: wgt::Features::EXPERIMENTAL_RAY_TRACING_ACCELERATION_STRUCTURE
+    /// [`Features::allowed_vertex_formats_for_blas`]: wgt::Features::allowed_vertex_formats_for_blas
     #[must_use]
     pub fn create_blas(
         &self,
@@ -463,7 +585,7 @@ impl Device {
         let (handle, blas) = self.inner.create_blas(desc, sizes);
 
         Blas {
-            shared: Arc::new(BlasShared { inner: blas }),
+            inner: blas,
             handle,
         }
     }
@@ -474,16 +596,18 @@ impl Device {
     /// # Validation
     /// If any of the following is not satisfied a validation error is generated
     ///
-    /// The device ***must*** have [Features::EXPERIMENTAL_RAY_TRACING_ACCELERATION_STRUCTURE] enabled.
+    /// The device ***must*** have [`Features::EXPERIMENTAL_RAY_TRACING_ACCELERATION_STRUCTURE`] enabled.
     ///
-    /// [Features::EXPERIMENTAL_RAY_TRACING_ACCELERATION_STRUCTURE]: wgt::Features::EXPERIMENTAL_RAY_TRACING_ACCELERATION_STRUCTURE
+    /// [`Features::EXPERIMENTAL_RAY_TRACING_ACCELERATION_STRUCTURE`]: wgt::Features::EXPERIMENTAL_RAY_TRACING_ACCELERATION_STRUCTURE
     #[must_use]
     pub fn create_tlas(&self, desc: &CreateTlasDescriptor<'_>) -> Tlas {
         let tlas = self.inner.create_tlas(desc);
 
         Tlas {
-            inner: tlas,
-            max_instances: desc.max_instances,
+            shared: Arc::new(TlasShared {
+                inner: tlas,
+                max_instances: desc.max_instances,
+            }),
         }
     }
 }
@@ -504,15 +628,9 @@ pub(crate) enum RequestDeviceErrorKind {
     ///
     /// (This is currently never used by the webgl backend, but it could be.)
     #[cfg(webgpu)]
-    WebGpu(wasm_bindgen::JsValue),
+    WebGpu(String),
 }
 
-#[cfg(send_sync)]
-unsafe impl Send for RequestDeviceErrorKind {}
-#[cfg(send_sync)]
-unsafe impl Sync for RequestDeviceErrorKind {}
-
-#[cfg(send_sync)]
 static_assertions::assert_impl_all!(RequestDeviceError: Send, Sync);
 
 impl fmt::Display for RequestDeviceError {
@@ -521,9 +639,8 @@ impl fmt::Display for RequestDeviceError {
             #[cfg(wgpu_core)]
             RequestDeviceErrorKind::Core(error) => error.fmt(_f),
             #[cfg(webgpu)]
-            RequestDeviceErrorKind::WebGpu(error_js_value) => {
-                // wasm-bindgen provides a reasonable error stringification via `Debug` impl
-                write!(_f, "{error_js_value:?}")
+            RequestDeviceErrorKind::WebGpu(error) => {
+                write!(_f, "{error}")
             }
             #[cfg(not(any(webgpu, wgpu_core)))]
             _ => unimplemented!("unknown `RequestDeviceErrorKind`"),
@@ -557,7 +674,7 @@ impl From<wgc::instance::RequestDeviceError> for RequestDeviceError {
 pub trait UncapturedErrorHandler: Fn(Error) + Send + 'static {}
 impl<T> UncapturedErrorHandler for T where T: Fn(Error) + Send + 'static {}
 
-/// Filter for error scopes.
+/// Kinds of [`Error`]s a [`Device::push_error_scope()`] may be configured to catch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd)]
 pub enum ErrorFilter {
     /// Catch only out-of-memory errors.
@@ -582,15 +699,19 @@ pub type ErrorSource = Box<dyn error::Error + Send + Sync + 'static>;
 #[cfg_attr(docsrs, doc(cfg(all())))]
 pub type ErrorSource = Box<dyn error::Error + 'static>;
 
-/// Error type
+/// Errors resulting from usage of GPU APIs.
+///
+/// By default, errors translate into panics. Depending on the backend and circumstances,
+/// errors may occur synchronously or asynchronously. When errors need to be handled, use
+/// [`Device::push_error_scope()`] or [`Device::on_uncaptured_error()`].
 #[derive(Debug)]
 pub enum Error {
-    /// Out of memory error
+    /// Out of memory.
     OutOfMemory {
         /// Lower level source of the error.
         source: ErrorSource,
     },
-    /// Validation error, signifying a bug in code or data
+    /// Validation error, signifying a bug in code or data provided to `wgpu`.
     Validation {
         /// Lower level source of the error.
         source: ErrorSource,
@@ -627,5 +748,38 @@ impl fmt::Display for Error {
             Error::Validation { description, .. } => f.write_str(description),
             Error::Internal { description, .. } => f.write_str(description),
         }
+    }
+}
+
+// Copied from [`futures::task::noop_waker`].
+// Needed until MSRV is 1.85 with `task::Waker::noop()` available
+#[cfg(feature = "noop")]
+mod waker {
+    use core::ptr::null;
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+
+    unsafe fn noop_clone(_data: *const ()) -> RawWaker {
+        noop_raw_waker()
+    }
+
+    unsafe fn noop(_data: *const ()) {}
+
+    const NOOP_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(noop_clone, noop, noop, noop);
+
+    const fn noop_raw_waker() -> RawWaker {
+        RawWaker::new(null(), &NOOP_WAKER_VTABLE)
+    }
+
+    /// Get a static reference to a [`Waker`] which
+    /// does nothing when `wake()` is called on it.
+    #[inline]
+    pub fn noop_waker_ref() -> &'static Waker {
+        struct SyncRawWaker(RawWaker);
+        unsafe impl Sync for SyncRawWaker {}
+
+        static NOOP_WAKER_INSTANCE: SyncRawWaker = SyncRawWaker(noop_raw_waker());
+
+        // SAFETY: `Waker` is #[repr(transparent)] over its `RawWaker`.
+        unsafe { &*(&NOOP_WAKER_INSTANCE.0 as *const RawWaker as *const Waker) }
     }
 }

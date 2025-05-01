@@ -6,7 +6,7 @@ use crate::*;
 /// It can be created with [`Device::create_compute_pipeline`].
 ///
 /// Corresponds to [WebGPU `GPUComputePipeline`](https://gpuweb.github.io/gpuweb/#compute-pipeline).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ComputePipeline {
     pub(crate) inner: dispatch::DispatchComputePipeline,
 }
@@ -26,6 +26,12 @@ impl ComputePipeline {
     pub fn get_bind_group_layout(&self, index: u32) -> BindGroupLayout {
         let bind_group = self.inner.get_bind_group_layout(index);
         BindGroupLayout { inner: bind_group }
+    }
+
+    #[cfg(custom)]
+    /// Returns custom implementation of ComputePipeline (if custom backend and is internally T)
+    pub fn as_custom<T: custom::ComputePipelineInterface>(&self) -> Option<&T> {
+        self.inner.as_custom()
     }
 }
 

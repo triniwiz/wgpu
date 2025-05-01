@@ -1,10 +1,10 @@
-use glow::HasContext;
-use once_cell::sync::Lazy;
-use parking_lot::{MappedMutexGuard, Mutex, MutexGuard, RwLock};
+use alloc::{rc::Rc, string::String, sync::Arc, vec::Vec};
+use core::{ffi, mem::ManuallyDrop, ptr, time::Duration};
+use std::{os::raw, sync::LazyLock};
 
-use std::{
-    collections::HashMap, ffi, mem::ManuallyDrop, os::raw, ptr, rc::Rc, sync::Arc, time::Duration,
-};
+use glow::HasContext;
+use hashbrown::HashMap;
+use parking_lot::{MappedMutexGuard, Mutex, MutexGuard, RwLock};
 
 /// The amount of time to wait while trying to obtain a lock to the adapter context
 const CONTEXT_LOCK_TIMEOUT_SECS: u64 = 1;
@@ -143,7 +143,7 @@ impl Drop for DisplayOwner {
         match self.display {
             DisplayRef::X11(ptr) => unsafe {
                 let func: libloading::Symbol<XCloseDisplayFun> =
-                    self.library.get(b"XCloseDisplay\0").unwrap();
+                    self.library.get(c"XCloseDisplay".to_bytes()).unwrap();
                 func(ptr.as_ptr());
             },
             DisplayRef::Wayland => {}
@@ -155,7 +155,8 @@ fn open_x_display() -> Option<DisplayOwner> {
     log::debug!("Loading X11 library to get the current display");
     unsafe {
         let library = find_library(&["libX11.so.6", "libX11.so"])?;
-        let func: libloading::Symbol<XOpenDisplayFun> = library.get(b"XOpenDisplay\0").unwrap();
+        let func: libloading::Symbol<XOpenDisplayFun> =
+            library.get(c"XOpenDisplay".to_bytes()).unwrap();
         let result = func(ptr::null());
         ptr::NonNull::new(result).map(|ptr| DisplayOwner {
             display: DisplayRef::X11(ptr),
@@ -181,10 +182,12 @@ fn test_wayland_display() -> Option<DisplayOwner> {
     log::debug!("Loading Wayland library to get the current display");
     let library = unsafe {
         let client_library = find_library(&["libwayland-client.so.0", "libwayland-client.so"])?;
-        let wl_display_connect: libloading::Symbol<WlDisplayConnectFun> =
-            client_library.get(b"wl_display_connect\0").unwrap();
-        let wl_display_disconnect: libloading::Symbol<WlDisplayDisconnectFun> =
-            client_library.get(b"wl_display_disconnect\0").unwrap();
+        let wl_display_connect: libloading::Symbol<WlDisplayConnectFun> = client_library
+            .get(c"wl_display_connect".to_bytes())
+            .unwrap();
+        let wl_display_disconnect: libloading::Symbol<WlDisplayDisconnectFun> = client_library
+            .get(c"wl_display_disconnect".to_bytes())
+            .unwrap();
         let display = ptr::NonNull::new(wl_display_connect(ptr::null()))?;
         wl_display_disconnect(display.as_ptr());
         find_library(&["libwayland-egl.so.1", "libwayland-egl.so"])?
@@ -260,11 +263,12 @@ fn choose_config(
                     log::warn!("EGL says it can present to the window but not natively",);
                 }
                 // Android emulator can't natively present either.
-                let tier_threshold = if cfg!(target_os = "android") || cfg!(windows) {
-                    1
-                } else {
-                    2
-                };
+                let tier_threshold =
+                    if cfg!(target_os = "android") || cfg!(windows) || cfg!(target_env = "ohos") {
+                        1
+                    } else {
+                        2
+                    };
                 return Ok((config, tier_max >= tier_threshold));
             }
             Ok(None) => {
@@ -385,7 +389,7 @@ pub struct AdapterContextLock<'a> {
     egl: Option<EglContextLock<'a>>,
 }
 
-impl<'a> std::ops::Deref for AdapterContextLock<'a> {
+impl<'a> core::ops::Deref for AdapterContextLock<'a> {
     type Target = glow::Context;
 
     fn deref(&self) -> &Self::Target {
@@ -466,7 +470,8 @@ struct Inner {
 // Different calls to `eglGetPlatformDisplay` may return the same `Display`, making it a global
 // state of all our `EglContext`s. This forces us to track the number of such context to prevent
 // terminating the display if it's currently used by another `EglContext`.
-static DISPLAYS_REFERENCE_COUNT: Lazy<Mutex<HashMap<usize, usize>>> = Lazy::new(Default::default);
+static DISPLAYS_REFERENCE_COUNT: LazyLock<Mutex<HashMap<usize, usize>>> =
+    LazyLock::new(Default::default);
 
 fn initialize_display(
     egl: &EglInstance,
@@ -738,6 +743,7 @@ struct WindowSystemInterface {
 pub struct Instance {
     wsi: WindowSystemInterface,
     flags: wgt::InstanceFlags,
+    options: wgt::GlBackendOptions,
     inner: Mutex<Inner>,
 }
 
@@ -785,7 +791,7 @@ impl crate::Instance for Instance {
                     "libEGL.dll",
                 )
             }
-        } else if cfg!(any(target_os = "macos", target_os = "ios")) {
+        } else if cfg!(target_vendor = "apple") {
             unsafe {
                 khronos_egl::DynamicInstance::<khronos_egl::EGL1_4>::load_required_from_filename(
                     "libEGL.dylib",
@@ -906,7 +912,7 @@ impl crate::Instance for Instance {
             log::debug!("Enabling EGL debug output");
             let function: EglDebugMessageControlFun = {
                 let addr = egl.get_proc_address("eglDebugMessageControlKHR").unwrap();
-                unsafe { std::mem::transmute(addr) }
+                unsafe { core::mem::transmute(addr) }
             };
             let attributes = [
                 EGL_DEBUG_MSG_CRITICAL_KHR as khronos_egl::Attrib,
@@ -922,7 +928,12 @@ impl crate::Instance for Instance {
             unsafe { (function)(Some(egl_debug_proc), attributes.as_ptr()) };
         }
 
-        let inner = Inner::create(desc.flags, egl, display, desc.gles_minor_version)?;
+        let inner = Inner::create(
+            desc.flags,
+            egl,
+            display,
+            desc.backend_options.gl.gles_minor_version,
+        )?;
 
         Ok(Instance {
             wsi: WindowSystemInterface {
@@ -930,6 +941,7 @@ impl crate::Instance for Instance {
                 kind: wsi_kind,
             },
             flags: desc.flags,
+            options: desc.backend_options.gl.clone(),
             inner: Mutex::new(inner),
         })
     }
@@ -950,6 +962,7 @@ impl crate::Instance for Instance {
             (Rwh::Xcb(_), _) => {}
             (Rwh::Win32(_), _) => {}
             (Rwh::AppKit(_), _) => {}
+            (Rwh::OhosNdk(_), _) => {}
             #[cfg(target_os = "android")]
             (Rwh::AndroidNdk(handle), _) => {
                 let format = inner
@@ -995,7 +1008,7 @@ impl crate::Instance for Instance {
                      */
                     log::warn!("Re-initializing Gles context due to Wayland window");
 
-                    use std::ops::DerefMut;
+                    use core::ops::DerefMut;
                     let display_attributes = [khronos_egl::ATTRIB_NONE];
 
                     let display = unsafe {
@@ -1019,7 +1032,7 @@ impl crate::Instance for Instance {
                         inner.force_gles_minor_version,
                     )?;
 
-                    let old_inner = std::mem::replace(inner.deref_mut(), new_inner);
+                    let old_inner = core::mem::replace(inner.deref_mut(), new_inner);
                     inner.wl_display = Some(display_handle.display.as_ptr());
 
                     drop(old_inner);
@@ -1089,10 +1102,13 @@ impl crate::Instance for Instance {
         inner.egl.unmake_current();
 
         unsafe {
-            super::Adapter::expose(AdapterContext {
-                glow: Mutex::new(gl),
-                egl: Some(inner.egl.clone()),
-            })
+            super::Adapter::expose(
+                AdapterContext {
+                    glow: Mutex::new(gl),
+                    egl: Some(inner.egl.clone()),
+                },
+                self.options.clone(),
+            )
         }
         .into_iter()
         .collect()
@@ -1111,13 +1127,17 @@ impl super::Adapter {
     ///   dropping any objects returned from this adapter.
     pub unsafe fn new_external(
         fun: impl FnMut(&str) -> *const ffi::c_void,
+        options: wgt::GlBackendOptions,
     ) -> Option<crate::ExposedAdapter<super::Api>> {
         let context = unsafe { glow::Context::from_loader_function(fun) };
         unsafe {
-            Self::expose(AdapterContext {
-                glow: Mutex::new(ManuallyDrop::new(context)),
-                egl: None,
-            })
+            Self::expose(
+                AdapterContext {
+                    glow: Mutex::new(ManuallyDrop::new(context)),
+                    egl: None,
+                },
+                options,
+            )
         }
     }
 
@@ -1293,10 +1313,11 @@ impl crate::Surface for Surface {
                     (WindowKind::Unknown, Rwh::AndroidNdk(handle)) => {
                         handle.a_native_window.as_ptr()
                     }
+                    (WindowKind::Unknown, Rwh::OhosNdk(handle)) => handle.native_window.as_ptr(),
                     (WindowKind::Wayland, Rwh::Wayland(handle)) => {
                         let library = &self.wsi.display_owner.as_ref().unwrap().library;
                         let wl_egl_window_create: libloading::Symbol<WlEglWindowCreateFun> =
-                            unsafe { library.get(b"wl_egl_window_create\0") }.unwrap();
+                            unsafe { library.get(c"wl_egl_window_create".to_bytes()) }.unwrap();
                         let window =
                             unsafe { wl_egl_window_create(handle.surface.as_ptr(), 640, 480) }
                                 .cast();
@@ -1336,8 +1357,11 @@ impl crate::Surface for Surface {
                     // We don't want any of the buffering done by the driver, because we
                     // manage a swapchain on our side.
                     // Some drivers just fail on surface creation seeing `EGL_SINGLE_BUFFER`.
-                    if cfg!(any(target_os = "android", target_os = "macos"))
-                        || cfg!(windows)
+                    if cfg!(any(
+                        target_os = "android",
+                        target_os = "macos",
+                        target_env = "ohos"
+                    )) || cfg!(windows)
                         || self.wsi.kind == WindowKind::AngleX11
                     {
                         khronos_egl::BACK_BUFFER
@@ -1405,7 +1429,7 @@ impl crate::Surface for Surface {
         if let Some(window) = wl_window {
             let library = &self.wsi.display_owner.as_ref().unwrap().library;
             let wl_egl_window_resize: libloading::Symbol<WlEglWindowResizeFun> =
-                unsafe { library.get(b"wl_egl_window_resize\0") }.unwrap();
+                unsafe { library.get(c"wl_egl_window_resize".to_bytes()) }.unwrap();
             unsafe {
                 wl_egl_window_resize(
                     window,
@@ -1477,7 +1501,7 @@ impl crate::Surface for Surface {
                     .expect("unsupported window")
                     .library;
                 let wl_egl_window_destroy: libloading::Symbol<WlEglWindowDestroyFun> =
-                    unsafe { library.get(b"wl_egl_window_destroy\0") }.unwrap();
+                    unsafe { library.get(c"wl_egl_window_destroy".to_bytes()) }.unwrap();
                 unsafe { wl_egl_window_destroy(window) };
             }
         }

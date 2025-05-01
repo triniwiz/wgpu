@@ -1,4 +1,4 @@
-use std::future::Future;
+use core::future::Future;
 
 use crate::*;
 
@@ -13,7 +13,7 @@ use crate::*;
 /// Does not have to be kept alive.
 ///
 /// Corresponds to [WebGPU `GPUAdapter`](https://gpuweb.github.io/gpuweb/#gpu-adapter).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Adapter {
     pub(crate) inner: dispatch::DispatchAdapter,
 }
@@ -46,8 +46,7 @@ impl Adapter {
     /// # Arguments
     ///
     /// - `desc` - Description of the features and limits requested from the given device.
-    /// - `trace_path` - Can be used for API call tracing, if that feature is
-    ///   enabled in `wgpu-core`.
+    /// - `trace` - Can be used for API call tracing, if the feature is enabled.
     ///
     /// # Panics
     ///
@@ -61,9 +60,8 @@ impl Adapter {
     pub fn request_device(
         &self,
         desc: &DeviceDescriptor<'_>,
-        trace_path: Option<&std::path::Path>,
     ) -> impl Future<Output = Result<(Device, Queue), RequestDeviceError>> + WasmNotSend {
-        let device = self.inner.request_device(desc, trace_path);
+        let device = self.inner.request_device(desc);
         async move {
             device
                 .await
@@ -82,13 +80,12 @@ impl Adapter {
         &self,
         hal_device: hal::OpenDevice<A>,
         desc: &DeviceDescriptor<'_>,
-        trace_path: Option<&std::path::Path>,
     ) -> Result<(Device, Queue), RequestDeviceError> {
         let core_adapter = self.inner.as_core();
         let (device, queue) = unsafe {
             core_adapter
                 .context
-                .create_device_from_hal(core_adapter, hal_device, desc, trace_path)
+                .create_device_from_hal(core_adapter, hal_device, desc)
         }?;
 
         Ok((
@@ -133,6 +130,20 @@ impl Adapter {
             }
         } else {
             hal_adapter_callback(None)
+        }
+    }
+
+    #[cfg(custom)]
+    /// Returns custom implementation of adapter (if custom backend and is internally T)
+    pub fn as_custom<T: custom::AdapterInterface>(&self) -> Option<&T> {
+        self.inner.as_custom()
+    }
+
+    #[cfg(custom)]
+    /// Creates Adapter from custom implementation
+    pub fn from_custom<T: custom::AdapterInterface>(adapter: T) -> Self {
+        Self {
+            inner: dispatch::DispatchAdapter::custom(adapter),
         }
     }
 

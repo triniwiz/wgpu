@@ -1,8 +1,17 @@
-use std::sync::Arc;
-use std::{borrow::Cow, collections::HashMap};
+use alloc::{
+    borrow::{Cow, ToOwned as _},
+    boxed::Box,
+    string::String,
+    sync::Arc,
+    vec,
+    vec::Vec,
+};
+
+use hashbrown::HashMap;
+use thiserror::Error;
 
 use crate::{
-    api_log,
+    api_log, api_log_debug,
     device::{queue::Queue, resource::Device, DeviceDescriptor, DeviceError},
     global::Global,
     hal_api::HalApi,
@@ -10,12 +19,12 @@ use crate::{
     lock::{rank, Mutex},
     present::Presentation,
     resource::ResourceType,
-    resource_log, DOWNLEVEL_WARNING_MESSAGE,
+    resource_log,
+    timestamp_normalization::TimestampNormalizerInitError,
+    DOWNLEVEL_WARNING_MESSAGE,
 };
 
 use wgt::{Backend, Backends, PowerPreference};
-
-use thiserror::Error;
 
 pub type RequestAdapterOptions = wgt::RequestAdapterOptions<SurfaceId>;
 
@@ -54,63 +63,97 @@ fn downlevel_default_limits_less_than_default_limits() {
 #[derive(Default)]
 pub struct Instance {
     #[allow(dead_code)]
-    pub name: String,
-    /// List of instances per backend.
+    name: String,
+
+    /// List of instances per `wgpu-hal` backend.
     ///
     /// The ordering in this list implies prioritization and needs to be preserved.
-    pub instance_per_backend: Vec<(Backend, Box<dyn hal::DynInstance>)>,
+    instance_per_backend: Vec<(Backend, Box<dyn hal::DynInstance>)>,
+
+    /// The backends that were requested by the user.
+    requested_backends: Backends,
+
+    /// The backends that we could have attempted to obtain from `wgpu-hal` —
+    /// those for which support is compiled in, currently.
+    ///
+    /// The union of this and `requested_backends` is the set of backends that would be used,
+    /// independent of whether accessing the drivers/hardware for them succeeds.
+    /// To obtain the set of backends actually in use by this instance, check
+    /// `instance_per_backend` instead.
+    supported_backends: Backends,
+
     pub flags: wgt::InstanceFlags,
 }
 
 impl Instance {
-    pub fn new(name: &str, instance_desc: wgt::InstanceDescriptor) -> Self {
-        fn init<A: HalApi>(
-            _: A,
-            instance_desc: &wgt::InstanceDescriptor,
-            instance_per_backend: &mut Vec<(Backend, Box<dyn hal::DynInstance>)>,
-        ) {
-            if instance_desc.backends.contains(A::VARIANT.into()) {
-                let hal_desc = hal::InstanceDescriptor {
-                    name: "wgpu",
-                    flags: instance_desc.flags,
-                    dx12_shader_compiler: instance_desc.dx12_shader_compiler.clone(),
-                    gles_minor_version: instance_desc.gles_minor_version,
-                };
-
-                use hal::Instance as _;
-                match unsafe { A::Instance::init(&hal_desc) } {
-                    Ok(instance) => {
-                        log::debug!("Instance::new: created {:?} backend", A::VARIANT);
-                        instance_per_backend.push((A::VARIANT, Box::new(instance)));
-                    }
-                    Err(err) => {
-                        log::debug!(
-                            "Instance::new: failed to create {:?} backend: {:?}",
-                            A::VARIANT,
-                            err
-                        );
-                    }
-                }
-            } else {
-                log::trace!("Instance::new: backend {:?} not requested", A::VARIANT);
-            }
-        }
-
-        let mut instance_per_backend = Vec::new();
+    pub fn new(name: &str, instance_desc: &wgt::InstanceDescriptor) -> Self {
+        let mut this = Self {
+            name: name.to_owned(),
+            instance_per_backend: Vec::new(),
+            requested_backends: instance_desc.backends,
+            supported_backends: Backends::empty(),
+            flags: instance_desc.flags,
+        };
 
         #[cfg(vulkan)]
-        init(hal::api::Vulkan, &instance_desc, &mut instance_per_backend);
+        this.try_add_hal(hal::api::Vulkan, instance_desc);
         #[cfg(metal)]
-        init(hal::api::Metal, &instance_desc, &mut instance_per_backend);
+        this.try_add_hal(hal::api::Metal, instance_desc);
         #[cfg(dx12)]
-        init(hal::api::Dx12, &instance_desc, &mut instance_per_backend);
+        this.try_add_hal(hal::api::Dx12, instance_desc);
         #[cfg(gles)]
-        init(hal::api::Gles, &instance_desc, &mut instance_per_backend);
+        this.try_add_hal(hal::api::Gles, instance_desc);
+        #[cfg(feature = "noop")]
+        this.try_add_hal(hal::api::Noop, instance_desc);
 
+        this
+    }
+
+    /// Helper for `Instance::new()`; attempts to add a single `wgpu-hal` backend to this instance.
+    fn try_add_hal<A: HalApi>(&mut self, _: A, instance_desc: &wgt::InstanceDescriptor) {
+        // Whether or not the backend was requested, and whether or not it succeeds,
+        // note that we *could* try it.
+        self.supported_backends |= A::VARIANT.into();
+
+        if !instance_desc.backends.contains(A::VARIANT.into()) {
+            log::trace!("Instance::new: backend {:?} not requested", A::VARIANT);
+            return;
+        }
+
+        let hal_desc = hal::InstanceDescriptor {
+            name: "wgpu",
+            flags: self.flags,
+            memory_budget_thresholds: instance_desc.memory_budget_thresholds,
+            backend_options: instance_desc.backend_options.clone(),
+        };
+
+        use hal::Instance as _;
+        match unsafe { A::Instance::init(&hal_desc) } {
+            Ok(instance) => {
+                log::debug!("Instance::new: created {:?} backend", A::VARIANT);
+                self.instance_per_backend
+                    .push((A::VARIANT, Box::new(instance)));
+            }
+            Err(err) => {
+                log::debug!(
+                    "Instance::new: failed to create {:?} backend: {:?}",
+                    A::VARIANT,
+                    err
+                );
+            }
+        }
+    }
+
+    pub(crate) fn from_hal_instance<A: HalApi>(
+        name: String,
+        hal_instance: <A as hal::Api>::Instance,
+    ) -> Self {
         Self {
-            name: name.to_string(),
-            instance_per_backend,
-            flags: instance_desc.flags,
+            name,
+            instance_per_backend: vec![(A::VARIANT, Box::new(hal_instance))],
+            requested_backends: A::VARIANT.into(),
+            supported_backends: A::VARIANT.into(),
+            flags: wgt::InstanceFlags::default(),
         }
     }
 
@@ -194,13 +237,79 @@ impl Instance {
         }
     }
 
+    /// Creates a new surface from the given drm configuration.
+    ///
+    /// # Safety
+    ///
+    /// - All parameters must point to valid DRM values.
+    ///
+    /// # Platform Support
+    ///
+    /// This function is only available on non-apple Unix-like platforms (Linux, FreeBSD) and
+    /// currently only works with the Vulkan backend.
+    #[cfg(all(unix, not(target_vendor = "apple"), not(target_family = "wasm")))]
+    #[cfg_attr(not(vulkan), expect(unused_variables))]
+    pub unsafe fn create_surface_from_drm(
+        &self,
+        fd: i32,
+        plane: u32,
+        connector_id: u32,
+        width: u32,
+        height: u32,
+        refresh_rate: u32,
+    ) -> Result<Surface, CreateSurfaceError> {
+        profiling::scope!("Instance::create_surface_from_drm");
+
+        let mut errors = HashMap::default();
+        let mut surface_per_backend: HashMap<Backend, Box<dyn hal::DynSurface>> =
+            HashMap::default();
+
+        #[cfg(vulkan)]
+        {
+            let instance = unsafe { self.as_hal::<hal::api::Vulkan>() }
+                .ok_or(CreateSurfaceError::BackendNotEnabled(Backend::Vulkan))?;
+
+            // Safety must be upheld by the caller
+            match unsafe {
+                instance.create_surface_from_drm(
+                    fd,
+                    plane,
+                    connector_id,
+                    width,
+                    height,
+                    refresh_rate,
+                )
+            } {
+                Ok(surface) => {
+                    surface_per_backend.insert(Backend::Vulkan, Box::new(surface));
+                }
+                Err(err) => {
+                    errors.insert(Backend::Vulkan, err);
+                }
+            }
+        }
+
+        if surface_per_backend.is_empty() {
+            Err(CreateSurfaceError::FailedToCreateSurfaceForAnyBackend(
+                errors,
+            ))
+        } else {
+            let surface = Surface {
+                presentation: Mutex::new(rank::SURFACE_PRESENTATION, None),
+                surface_per_backend,
+            };
+
+            Ok(surface)
+        }
+    }
+
     /// # Safety
     ///
     /// `layer` must be a valid pointer.
     #[cfg(metal)]
     pub unsafe fn create_surface_metal(
         &self,
-        layer: *mut std::ffi::c_void,
+        layer: *mut core::ffi::c_void,
     ) -> Result<Surface, CreateSurfaceError> {
         profiling::scope!("Instance::create_surface_metal");
 
@@ -225,7 +334,7 @@ impl Instance {
 
         let surface = Surface {
             presentation: Mutex::new(rank::SURFACE_PRESENTATION, None),
-            surface_per_backend: std::iter::once((Backend::Metal, raw_surface)).collect(),
+            surface_per_backend: core::iter::once((Backend::Metal, raw_surface)).collect(),
         };
 
         Ok(surface)
@@ -242,7 +351,7 @@ impl Instance {
 
         let surface = Surface {
             presentation: Mutex::new(rank::SURFACE_PRESENTATION, None),
-            surface_per_backend: std::iter::once((Backend::Dx12, surface)).collect(),
+            surface_per_backend: core::iter::once((Backend::Dx12, surface)).collect(),
         };
 
         Ok(surface)
@@ -254,7 +363,7 @@ impl Instance {
     /// The visual must be valid and able to be used to make a swapchain with.
     pub unsafe fn create_surface_from_visual(
         &self,
-        visual: *mut std::ffi::c_void,
+        visual: *mut core::ffi::c_void,
     ) -> Result<Surface, CreateSurfaceError> {
         profiling::scope!("Instance::instance_create_surface_from_visual");
         self.create_surface_dx12(|inst| unsafe { inst.create_surface_from_visual(visual) })
@@ -266,7 +375,7 @@ impl Instance {
     /// The surface_handle must be valid and able to be used to make a swapchain with.
     pub unsafe fn create_surface_from_surface_handle(
         &self,
-        surface_handle: *mut std::ffi::c_void,
+        surface_handle: *mut core::ffi::c_void,
     ) -> Result<Surface, CreateSurfaceError> {
         profiling::scope!("Instance::instance_create_surface_from_surface_handle");
         self.create_surface_dx12(|inst| unsafe {
@@ -280,7 +389,7 @@ impl Instance {
     /// The swap_chain_panel must be valid and able to be used to make a swapchain with.
     pub unsafe fn create_surface_from_swap_chain_panel(
         &self,
-        swap_chain_panel: *mut std::ffi::c_void,
+        swap_chain_panel: *mut core::ffi::c_void,
     ) -> Result<Surface, CreateSurfaceError> {
         profiling::scope!("Instance::instance_create_surface_from_swap_chain_panel");
         self.create_surface_dx12(|inst| unsafe {
@@ -300,12 +409,12 @@ impl Instance {
         {
             // NOTE: We might be using `profiling` without any features. The empty backend of this
             // macro emits no code, so unused code linting changes depending on the backend.
-            profiling::scope!("enumerating", &*format!("{:?}", _backend));
+            profiling::scope!("enumerating", &*alloc::format!("{:?}", _backend));
 
             let hal_adapters = unsafe { instance.enumerate_adapters(None) };
             for raw in hal_adapters {
                 let adapter = Adapter::new(raw);
-                log::info!("Adapter {:?}", adapter.raw.info);
+                api_log_debug!("Adapter {:?}", adapter.raw.info);
                 adapters.push(adapter);
             }
         }
@@ -316,28 +425,59 @@ impl Instance {
         &self,
         desc: &wgt::RequestAdapterOptions<&Surface>,
         backends: Backends,
-    ) -> Result<Adapter, RequestAdapterError> {
+    ) -> Result<Adapter, wgt::RequestAdapterError> {
         profiling::scope!("Instance::request_adapter");
         api_log!("Instance::request_adapter");
 
         let mut adapters = Vec::new();
+        let mut incompatible_surface_backends = Backends::empty();
+        let mut no_fallback_backends = Backends::empty();
+        let mut no_adapter_backends = Backends::empty();
 
-        for (backend, instance) in self
+        for &(backend, ref instance) in self
             .instance_per_backend
             .iter()
-            .filter(|(backend, _)| backends.contains(Backends::from(*backend)))
+            .filter(|&&(backend, _)| backends.contains(Backends::from(backend)))
         {
             let compatible_hal_surface = desc
                 .compatible_surface
-                .and_then(|surface| surface.raw(*backend));
+                .and_then(|surface| surface.raw(backend));
+
             let mut backend_adapters =
                 unsafe { instance.enumerate_adapters(compatible_hal_surface) };
+            if backend_adapters.is_empty() {
+                no_adapter_backends |= Backends::from(backend);
+                // by continuing, we avoid setting the further error bits below
+                continue;
+            }
+
             if desc.force_fallback_adapter {
                 backend_adapters.retain(|exposed| exposed.info.device_type == wgt::DeviceType::Cpu);
+                if backend_adapters.is_empty() {
+                    no_fallback_backends |= Backends::from(backend);
+                    continue;
+                }
             }
+
             if let Some(surface) = desc.compatible_surface {
-                backend_adapters
-                    .retain(|exposed| surface.get_capabilities_with_raw(exposed).is_ok());
+                backend_adapters.retain(|exposed| {
+                    let capabilities = surface.get_capabilities_with_raw(exposed);
+                    if let Err(err) = capabilities {
+                        log::debug!(
+                            "Adapter {:?} not compatible with surface: {}",
+                            exposed.info,
+                            err
+                        );
+                        incompatible_surface_backends |= Backends::from(backend);
+                        false
+                    } else {
+                        true
+                    }
+                });
+                if backend_adapters.is_empty() {
+                    incompatible_surface_backends |= Backends::from(backend);
+                    continue;
+                }
             }
             adapters.extend(backend_adapters);
         }
@@ -353,10 +493,8 @@ impl Instance {
         };
 
         fn sort(adapters: &mut [hal::DynExposedAdapter], prefer_integrated_gpu: bool) {
-            adapters.sort_by(|a, b| {
-                get_order(a.info.device_type, prefer_integrated_gpu)
-                    .cmp(&get_order(b.info.device_type, prefer_integrated_gpu))
-            });
+            adapters
+                .sort_by_key(|adapter| get_order(adapter.info.device_type, prefer_integrated_gpu));
         }
 
         fn get_order(device_type: wgt::DeviceType, prefer_integrated_gpu: bool) -> u8 {
@@ -378,13 +516,41 @@ impl Instance {
             }
         }
 
+        // `request_adapter` can be a bit of a black box.
+        // Shine some light on its decision in debug log.
+        if adapters.is_empty() {
+            log::debug!("Request adapter didn't find compatible adapters.");
+        } else {
+            log::debug!(
+                "Found {} compatible adapters. Sorted by preference:",
+                adapters.len()
+            );
+            for adapter in &adapters {
+                log::debug!("* {:?}", adapter.info);
+            }
+        }
+
         if let Some(adapter) = adapters.into_iter().next() {
-            log::info!("Adapter {:?}", adapter.info);
+            api_log_debug!("Request adapter result {:?}", adapter.info);
             let adapter = Adapter::new(adapter);
             Ok(adapter)
         } else {
-            Err(RequestAdapterError::NotFound)
+            Err(wgt::RequestAdapterError::NotFound {
+                supported_backends: self.supported_backends,
+                requested_backends: self.requested_backends,
+                active_backends: self.active_backends(),
+                no_fallback_backends,
+                no_adapter_backends,
+                incompatible_surface_backends,
+            })
         }
+    }
+
+    fn active_backends(&self) -> Backends {
+        self.instance_per_backend
+            .iter()
+            .map(|&(backend, _)| Backends::from(backend))
+            .collect()
     }
 }
 
@@ -513,12 +679,19 @@ impl Adapter {
         allowed_usages.set(
             wgt::TextureUsages::STORAGE_BINDING,
             caps.intersects(
-                Tfc::STORAGE_WRITE_ONLY | Tfc::STORAGE_READ_ONLY | Tfc::STORAGE_READ_WRITE,
+                Tfc::STORAGE_WRITE_ONLY
+                    | Tfc::STORAGE_READ_ONLY
+                    | Tfc::STORAGE_READ_WRITE
+                    | Tfc::STORAGE_ATOMIC,
             ),
         );
         allowed_usages.set(
             wgt::TextureUsages::RENDER_ATTACHMENT,
             caps.intersects(Tfc::COLOR_ATTACHMENT | Tfc::DEPTH_STENCIL_ATTACHMENT),
+        );
+        allowed_usages.set(
+            wgt::TextureUsages::STORAGE_ATOMIC,
+            caps.contains(Tfc::STORAGE_ATOMIC),
         );
 
         let mut flags = wgt::TextureFormatFeatureFlags::empty();
@@ -533,6 +706,11 @@ impl Adapter {
         flags.set(
             wgt::TextureFormatFeatureFlags::STORAGE_READ_WRITE,
             caps.contains(Tfc::STORAGE_READ_WRITE),
+        );
+
+        flags.set(
+            wgt::TextureFormatFeatureFlags::STORAGE_ATOMIC,
+            caps.contains(Tfc::STORAGE_ATOMIC),
         );
 
         flags.set(
@@ -579,17 +757,17 @@ impl Adapter {
         hal_device: hal::DynOpenDevice,
         desc: &DeviceDescriptor,
         instance_flags: wgt::InstanceFlags,
-        trace_path: Option<&std::path::Path>,
     ) -> Result<(Arc<Device>, Arc<Queue>), RequestDeviceError> {
         api_log!("Adapter::create_device");
 
-        let device = Device::new(hal_device.device, self, desc, trace_path, instance_flags)?;
+        let device = Device::new(hal_device.device, self, desc, instance_flags)?;
         let device = Arc::new(device);
 
         let queue = Queue::new(device.clone(), hal_device.queue)?;
         let queue = Arc::new(queue);
 
         device.set_queue(&queue);
+        device.late_init_resources_with_queue()?;
 
         Ok((device, queue))
     }
@@ -598,7 +776,6 @@ impl Adapter {
         self: &Arc<Self>,
         desc: &DeviceDescriptor,
         instance_flags: wgt::InstanceFlags,
-        trace_path: Option<&std::path::Path>,
     ) -> Result<(Arc<Device>, Arc<Queue>), RequestDeviceError> {
         // Verify all features were exposed by the adapter
         if !self.raw.features.contains(desc.required_features) {
@@ -645,7 +822,7 @@ impl Adapter {
         }
         .map_err(DeviceError::from_hal)?;
 
-        self.create_device_and_queue_from_hal(open, desc, instance_flags, trace_path)
+        self.create_device_and_queue_from_hal(open, desc, instance_flags)
     }
 }
 
@@ -662,7 +839,6 @@ pub enum GetSurfaceSupportError {
 }
 
 #[derive(Clone, Debug, Error)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 /// Error when requesting a device from the adapter
 #[non_exhaustive]
 pub enum RequestDeviceError {
@@ -670,16 +846,10 @@ pub enum RequestDeviceError {
     Device(#[from] DeviceError),
     #[error(transparent)]
     LimitsExceeded(#[from] FailedLimit),
+    #[error("Failed to initialize Timestamp Normalizer")]
+    TimestampNormalizerInitFailed(#[from] TimestampNormalizerInitError),
     #[error("Unsupported features were requested: {0:?}")]
     UnsupportedFeature(wgt::Features),
-}
-
-#[derive(Clone, Debug, Error)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[non_exhaustive]
-pub enum RequestAdapterError {
-    #[error("No suitable adapter found")]
-    NotFound,
 }
 
 #[derive(Clone, Debug, Error)]
@@ -721,13 +891,49 @@ impl Global {
         Ok(id)
     }
 
+    /// Creates a new surface from the given drm configuration.
+    ///
+    /// # Safety
+    ///
+    /// - All parameters must point to valid DRM values.
+    ///
+    /// # Platform Support
+    ///
+    /// This function is only available on non-apple Unix-like platforms (Linux, FreeBSD) and
+    /// currently only works with the Vulkan backend.
+    #[cfg(all(unix, not(target_vendor = "apple"), not(target_family = "wasm")))]
+    pub unsafe fn instance_create_surface_from_drm(
+        &self,
+        fd: i32,
+        plane: u32,
+        connector_id: u32,
+        width: u32,
+        height: u32,
+        refresh_rate: u32,
+        id_in: Option<SurfaceId>,
+    ) -> Result<SurfaceId, CreateSurfaceError> {
+        let surface = unsafe {
+            self.instance.create_surface_from_drm(
+                fd,
+                plane,
+                connector_id,
+                width,
+                height,
+                refresh_rate,
+            )
+        }?;
+        let id = self.surfaces.prepare(id_in).assign(Arc::new(surface));
+
+        Ok(id)
+    }
+
     /// # Safety
     ///
     /// `layer` must be a valid pointer.
     #[cfg(metal)]
     pub unsafe fn instance_create_surface_metal(
         &self,
-        layer: *mut std::ffi::c_void,
+        layer: *mut core::ffi::c_void,
         id_in: Option<SurfaceId>,
     ) -> Result<SurfaceId, CreateSurfaceError> {
         let surface = unsafe { self.instance.create_surface_metal(layer) }?;
@@ -741,7 +947,7 @@ impl Global {
     /// The visual must be valid and able to be used to make a swapchain with.
     pub unsafe fn instance_create_surface_from_visual(
         &self,
-        visual: *mut std::ffi::c_void,
+        visual: *mut core::ffi::c_void,
         id_in: Option<SurfaceId>,
     ) -> Result<SurfaceId, CreateSurfaceError> {
         let surface = unsafe { self.instance.create_surface_from_visual(visual) }?;
@@ -755,7 +961,7 @@ impl Global {
     /// The surface_handle must be valid and able to be used to make a swapchain with.
     pub unsafe fn instance_create_surface_from_surface_handle(
         &self,
-        surface_handle: *mut std::ffi::c_void,
+        surface_handle: *mut core::ffi::c_void,
         id_in: Option<SurfaceId>,
     ) -> Result<SurfaceId, CreateSurfaceError> {
         let surface = unsafe {
@@ -772,7 +978,7 @@ impl Global {
     /// The swap_chain_panel must be valid and able to be used to make a swapchain with.
     pub unsafe fn instance_create_surface_from_swap_chain_panel(
         &self,
-        swap_chain_panel: *mut std::ffi::c_void,
+        swap_chain_panel: *mut core::ffi::c_void,
         id_in: Option<SurfaceId>,
     ) -> Result<SurfaceId, CreateSurfaceError> {
         let surface = unsafe {
@@ -804,7 +1010,7 @@ impl Global {
         desc: &RequestAdapterOptions,
         backends: Backends,
         id_in: Option<AdapterId>,
-    ) -> Result<AdapterId, RequestAdapterError> {
+    ) -> Result<AdapterId, wgt::RequestAdapterError> {
         let compatible_surface = desc.compatible_surface.map(|id| self.surfaces.get(id));
         let desc = wgt::RequestAdapterOptions {
             power_preference: desc.power_preference,
@@ -886,7 +1092,6 @@ impl Global {
         &self,
         adapter_id: AdapterId,
         desc: &DeviceDescriptor,
-        trace_path: Option<&std::path::Path>,
         device_id_in: Option<DeviceId>,
         queue_id_in: Option<QueueId>,
     ) -> Result<(DeviceId, QueueId), RequestDeviceError> {
@@ -897,8 +1102,7 @@ impl Global {
         let queue_fid = self.hub.queues.prepare(queue_id_in);
 
         let adapter = self.hub.adapters.get(adapter_id);
-        let (device, queue) =
-            adapter.create_device_and_queue(desc, self.instance.flags, trace_path)?;
+        let (device, queue) = adapter.create_device_and_queue(desc, self.instance.flags)?;
 
         let device_id = device_fid.assign(device);
         resource_log!("Created Device {:?}", device_id);
@@ -918,7 +1122,6 @@ impl Global {
         adapter_id: AdapterId,
         hal_device: hal::DynOpenDevice,
         desc: &DeviceDescriptor,
-        trace_path: Option<&std::path::Path>,
         device_id_in: Option<DeviceId>,
         queue_id_in: Option<QueueId>,
     ) -> Result<(DeviceId, QueueId), RequestDeviceError> {
@@ -928,12 +1131,8 @@ impl Global {
         let queues_fid = self.hub.queues.prepare(queue_id_in);
 
         let adapter = self.hub.adapters.get(adapter_id);
-        let (device, queue) = adapter.create_device_and_queue_from_hal(
-            hal_device,
-            desc,
-            self.instance.flags,
-            trace_path,
-        )?;
+        let (device, queue) =
+            adapter.create_device_and_queue_from_hal(hal_device, desc, self.instance.flags)?;
 
         let device_id = devices_fid.assign(device);
         resource_log!("Created Device {:?}", device_id);
@@ -943,39 +1142,4 @@ impl Global {
 
         Ok((device_id, queue_id))
     }
-}
-
-/// Generates a set of backends from a comma separated list of case-insensitive backend names.
-///
-/// Whitespace is stripped, so both 'gl, dx12' and 'gl,dx12' are valid.
-///
-/// Always returns WEBGPU on wasm over webgpu.
-///
-/// Names:
-/// - vulkan = "vulkan" or "vk"
-/// - dx12   = "dx12" or "d3d12"
-/// - metal  = "metal" or "mtl"
-/// - gles   = "opengl" or "gles" or "gl"
-/// - webgpu = "webgpu"
-pub fn parse_backends_from_comma_list(string: &str) -> Backends {
-    let mut backends = Backends::empty();
-    for backend in string.to_lowercase().split(',') {
-        backends |= match backend.trim() {
-            "vulkan" | "vk" => Backends::VULKAN,
-            "dx12" | "d3d12" => Backends::DX12,
-            "metal" | "mtl" => Backends::METAL,
-            "opengl" | "gles" | "gl" => Backends::GL,
-            "webgpu" => Backends::BROWSER_WEBGPU,
-            b => {
-                log::warn!("unknown backend string '{}'", b);
-                continue;
-            }
-        }
-    }
-
-    if backends.is_empty() {
-        log::warn!("no valid backend strings found!");
-    }
-
-    backends
 }

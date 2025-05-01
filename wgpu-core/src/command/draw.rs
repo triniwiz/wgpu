@@ -1,3 +1,7 @@
+use alloc::boxed::Box;
+
+use thiserror::Error;
+
 use crate::{
     binding_model::{LateMinBufferBindingSizeMismatch, PushConstantUploadError},
     resource::{
@@ -6,9 +10,6 @@ use crate::{
     },
     track::ResourceUsageCompatibilityError,
 };
-use wgt::VertexStepMode;
-
-use thiserror::Error;
 
 use super::bind::BinderError;
 
@@ -33,13 +34,6 @@ pub enum DrawError {
     VertexBeyondLimit {
         last_vertex: u64,
         vertex_limit: u64,
-        slot: u32,
-    },
-    #[error("{step_mode:?} buffer out of bounds at slot {slot}. Offset {offset} beyond limit {limit}. Did you bind the correct `Vertex` step-rate vertex buffer?")]
-    VertexOutOfBounds {
-        step_mode: VertexStepMode,
-        offset: u64,
-        limit: u64,
         slot: u32,
     },
     #[error("Instance {last_instance} extends beyond limit {instance_limit} imposed by the buffer in slot {slot}. Did you bind the correct `Instance` step-rate vertex buffer?")]
@@ -87,8 +81,10 @@ pub enum RenderCommandError {
     MissingTextureUsage(#[from] MissingTextureUsageError),
     #[error(transparent)]
     PushConstants(#[from] PushConstantUploadError),
-    #[error("Viewport has invalid rect {0:?}; origin and/or size is less than or equal to 0, and/or is not contained in the render target {1:?}")]
-    InvalidViewportRect(Rect<f32>, wgt::Extent3d),
+    #[error("Viewport size {{ w: {w}, h: {h} }} greater than device's requested `max_texture_dimension_2d` limit {max}, or less than zero")]
+    InvalidViewportRectSize { w: f32, h: f32, max: u32 },
+    #[error("Viewport has invalid rect {rect:?} for device's requested `max_texture_dimension_2d` limit; Origin less than -2 * `max_texture_dimension_2d` ({min}), or rect extends past 2 * `max_texture_dimension_2d` - 1 ({max})")]
+    InvalidViewportRectPosition { rect: Rect<f32>, min: f32, max: f32 },
     #[error("Viewport minDepth {0} and/or maxDepth {1} are not in [0, 1]")]
     InvalidViewportDepth(f32, f32),
     #[error("Scissor {0:?} is not contained in the render target {1:?}")]

@@ -1,22 +1,25 @@
 [package]
 name = "naga-fuzz"
-version = "0.0.0"
-authors = ["Automatically generated"]
+version.workspace = true
+authors.workspace = true
 publish = false
-edition = "2018"
-license = "MIT OR Apache-2.0"
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
 
 [package.metadata]
 cargo-fuzz = true
 
 [target.'cfg(not(any(target_arch = "wasm32", target_os = "ios")))'.dependencies]
-arbitrary = { version = "1.4.1", features = ["derive"] }
-libfuzzer-sys = "0.4"
+arbitrary = { workspace = true, features = ["derive"] }
+libfuzzer-sys.workspace = true
 
-[target.'cfg(not(any(target_arch = "wasm32", target_os = "ios")))'.dependencies.naga]
-path = ".."
-version = "23.0.0"
+[target.'cfg(not(any(target_arch = "wasm32", target_os = "ios", target_os = "visionos")))'.dependencies.naga]
+workspace = true
 features = ["arbitrary", "spv-in", "wgsl-in", "glsl-in"]
+
+[build-dependencies]
+cfg_aliases.workspace = true
 
 [[bin]]
 name = "spv_parser"
@@ -45,3 +48,6 @@ path = "fuzz_targets/ir.rs"
 bench = false
 test = false
 doc = false
+
+[lints.clippy]
+disallowed_types = "allow"
