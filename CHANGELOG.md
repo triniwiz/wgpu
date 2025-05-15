@@ -42,8 +42,13 @@ Bottom level categories:
 
 ### New Features
 
+#### Naga
+
+- Added `no_std` support with default features disabled. By @Bushrat011899 in [#7585](https://github.com/gfx-rs/wgpu/pull/7585).
+
 #### General
 
+- Add support for astc-sliced-3d feature. By @mehmetoguzderin in [#7577](https://github.com/gfx-rs/wgpu/issues/7577)
 - Add support for rendering to slices of 3D texture views and single layered 2D-Array texture views (this requires `VK_KHR_maintenance1` which should be widely available on newer drivers). By @teoxoy in [#7596](https://github.com/gfx-rs/wgpu/pull/7596)
 
 #### Naga
@@ -75,6 +80,7 @@ Naga now infers the correct binding layout when a resource appears only in an as
 #### General
 
 - Removed `MaintainBase` in favor of using `PollType`. By @waywardmonkeys in [#7508](https://github.com/gfx-rs/wgpu/pull/7508).
+- wgpu-core no longer raises an error if `destroy` is called multiple times for a buffer or texture. This only affects the wgpu-core API; the wgpu API already allowed multiple `destroy` calls. By @andyleiserson in [#7686](https://github.com/gfx-rs/wgpu/pull/7686).
 
 #### Naga
 
