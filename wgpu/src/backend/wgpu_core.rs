@@ -7,17 +7,31 @@ use alloc::{
     vec,
     vec::Vec,
 };
-use core::{error::Error, fmt, future::ready, ops::Range, pin::Pin, ptr::NonNull, slice};
+use core::{
+    error::Error,
+    fmt,
+    future::ready,
+    ops::{Deref, Range},
+    pin::Pin,
+    ptr::NonNull,
+    slice,
+};
 
 use arrayvec::ArrayVec;
-use parking_lot::Mutex;
 use smallvec::SmallVec;
-use wgc::{command::bundle_ffi::*, error::ContextErrorSource, pipeline::CreateShaderModuleError};
-use wgt::WasmNotSendSync;
+use wgc::{
+    command::bundle_ffi::*, error::ContextErrorSource, pipeline::CreateShaderModuleError,
+    resource::BlasPrepareCompactResult,
+};
+use wgt::{
+    error::{ErrorType, WebGpuError},
+    WasmNotSendSync,
+};
 
+use crate::util::Mutex;
 use crate::{
     api,
-    dispatch::{self, BufferMappedRangeInterface},
+    dispatch::{self, BlasCompactCallback, BufferMappedRangeInterface},
     BindingResource, Blas, BufferBinding, BufferDescriptor, CompilationInfo, CompilationMessage,
     CompilationMessageType, ErrorSource, Features, Label, LoadOp, MapMode, Operations,
     ShaderSource, SurfaceTargetUnsafe, TextureDescriptor, Tlas,
@@ -41,7 +55,7 @@ impl fmt::Debug for ContextWgpuCore {
 }
 
 impl ContextWgpuCore {
-    pub unsafe fn from_hal_instance<A: wgc::hal_api::HalApi>(hal_instance: A::Instance) -> Self {
+    pub unsafe fn from_hal_instance<A: hal::Api>(hal_instance: A::Instance) -> Self {
         Self(unsafe {
             Arc::new(wgc::global::Global::from_hal_instance::<A>(
                 "wgpu",
@@ -53,7 +67,7 @@ impl ContextWgpuCore {
     /// # Safety
     ///
     /// - The raw instance handle returned must not be manually destroyed.
-    pub unsafe fn instance_as_hal<A: wgc::hal_api::HalApi>(&self) -> Option<&A::Instance> {
+    pub unsafe fn instance_as_hal<A: hal::Api>(&self) -> Option<&A::Instance> {
         unsafe { self.0.instance_as_hal::<A>() }
     }
 
@@ -66,40 +80,28 @@ impl ContextWgpuCore {
         self.0.enumerate_adapters(backends)
     }
 
-    pub unsafe fn create_adapter_from_hal<A: wgc::hal_api::HalApi>(
+    pub unsafe fn create_adapter_from_hal<A: hal::Api>(
         &self,
         hal_adapter: hal::ExposedAdapter<A>,
     ) -> wgc::id::AdapterId {
         unsafe { self.0.create_adapter_from_hal(hal_adapter.into(), None) }
     }
 
-    pub unsafe fn adapter_as_hal<
-        A: wgc::hal_api::HalApi,
-        F: FnOnce(Option<&A::Adapter>) -> R,
-        R,
-    >(
+    pub unsafe fn adapter_as_hal<A: hal::Api>(
         &self,
         adapter: &CoreAdapter,
-        hal_adapter_callback: F,
-    ) -> R {
-        unsafe {
-            self.0
-                .adapter_as_hal::<A, F, R>(adapter.id, hal_adapter_callback)
-        }
+    ) -> Option<impl Deref<Target = A::Adapter> + WasmNotSendSync> {
+        unsafe { self.0.adapter_as_hal::<A>(adapter.id) }
     }
 
-    pub unsafe fn buffer_as_hal<A: wgc::hal_api::HalApi, F: FnOnce(Option<&A::Buffer>) -> R, R>(
+    pub unsafe fn buffer_as_hal<A: hal::Api>(
         &self,
         buffer: &CoreBuffer,
-        hal_buffer_callback: F,
-    ) -> R {
-        unsafe {
-            self.0
-                .buffer_as_hal::<A, F, R>(buffer.id, hal_buffer_callback)
-        }
+    ) -> Option<impl Deref<Target = A::Buffer>> {
+        unsafe { self.0.buffer_as_hal::<A>(buffer.id) }
     }
 
-    pub unsafe fn create_device_from_hal<A: wgc::hal_api::HalApi>(
+    pub unsafe fn create_device_from_hal<A: hal::Api>(
         &self,
         adapter: &CoreAdapter,
         hal_device: hal::OpenDevice<A>,
@@ -138,7 +140,7 @@ impl ContextWgpuCore {
         Ok((device, queue))
     }
 
-    pub unsafe fn create_texture_from_hal<A: wgc::hal_api::HalApi>(
+    pub unsafe fn create_texture_from_hal<A: hal::Api>(
         &self,
         hal_texture: A::Texture,
         device: &CoreDevice,
@@ -164,7 +166,13 @@ impl ContextWgpuCore {
         }
     }
 
-    pub unsafe fn create_buffer_from_hal<A: wgc::hal_api::HalApi>(
+    /// # Safety
+    ///
+    /// - `hal_buffer` must be created from `device`.
+    /// - `hal_buffer` must be created respecting `desc`
+    /// - `hal_buffer` must be initialized
+    /// - `hal_buffer` must not have zero size.
+    pub unsafe fn create_buffer_from_hal<A: hal::Api>(
         &self,
         hal_buffer: A::Buffer,
         device: &CoreDevice,
@@ -193,65 +201,37 @@ impl ContextWgpuCore {
         }
     }
 
-    pub unsafe fn device_as_hal<A: wgc::hal_api::HalApi, F: FnOnce(Option<&A::Device>) -> R, R>(
+    pub unsafe fn device_as_hal<A: hal::Api>(
         &self,
         device: &CoreDevice,
-        hal_device_callback: F,
-    ) -> R {
-        unsafe {
-            self.0
-                .device_as_hal::<A, F, R>(device.id, hal_device_callback)
-        }
+    ) -> Option<impl Deref<Target = A::Device>> {
+        unsafe { self.0.device_as_hal::<A>(device.id) }
     }
 
-    pub unsafe fn surface_as_hal<
-        A: wgc::hal_api::HalApi,
-        F: FnOnce(Option<&A::Surface>) -> R,
-        R,
-    >(
+    pub unsafe fn surface_as_hal<A: hal::Api>(
         &self,
         surface: &CoreSurface,
-        hal_surface_callback: F,
-    ) -> R {
-        unsafe {
-            self.0
-                .surface_as_hal::<A, F, R>(surface.id, hal_surface_callback)
-        }
+    ) -> Option<impl Deref<Target = A::Surface>> {
+        unsafe { self.0.surface_as_hal::<A>(surface.id) }
     }
 
-    pub unsafe fn texture_as_hal<
-        A: wgc::hal_api::HalApi,
-        F: FnOnce(Option<&A::Texture>) -> R,
-        R,
-    >(
+    pub unsafe fn texture_as_hal<A: hal::Api>(
         &self,
         texture: &CoreTexture,
-        hal_texture_callback: F,
-    ) -> R {
-        unsafe {
-            self.0
-                .texture_as_hal::<A, F, R>(texture.id, hal_texture_callback)
-        }
+    ) -> Option<impl Deref<Target = A::Texture>> {
+        unsafe { self.0.texture_as_hal::<A>(texture.id) }
     }
 
-    pub unsafe fn texture_view_as_hal<
-        A: wgc::hal_api::HalApi,
-        F: FnOnce(Option<&A::TextureView>) -> R,
-        R,
-    >(
+    pub unsafe fn texture_view_as_hal<A: hal::Api>(
         &self,
         texture_view: &CoreTextureView,
-        hal_texture_view_callback: F,
-    ) -> R {
-        unsafe {
-            self.0
-                .texture_view_as_hal::<A, F, R>(texture_view.id, hal_texture_view_callback)
-        }
+    ) -> Option<impl Deref<Target = A::TextureView>> {
+        unsafe { self.0.texture_view_as_hal::<A>(texture_view.id) }
     }
 
     /// This method will start the wgpu_core level command recording.
     pub unsafe fn command_encoder_as_hal_mut<
-        A: wgc::hal_api::HalApi,
+        A: hal::Api,
         F: FnOnce(Option<&mut A::CommandEncoder>) -> R,
         R,
     >(
@@ -267,28 +247,18 @@ impl ContextWgpuCore {
         }
     }
 
-    pub unsafe fn blas_as_hal<
-        A: wgc::hal_api::HalApi,
-        F: FnOnce(Option<&A::AccelerationStructure>) -> R,
-        R,
-    >(
+    pub unsafe fn blas_as_hal<A: hal::Api>(
         &self,
         blas: &CoreBlas,
-        hal_blas_callback: F,
-    ) -> R {
-        unsafe { self.0.blas_as_hal::<A, F, R>(blas.id, hal_blas_callback) }
+    ) -> Option<impl Deref<Target = A::AccelerationStructure>> {
+        unsafe { self.0.blas_as_hal::<A>(blas.id) }
     }
 
-    pub unsafe fn tlas_as_hal<
-        A: wgc::hal_api::HalApi,
-        F: FnOnce(Option<&A::AccelerationStructure>) -> R,
-        R,
-    >(
+    pub unsafe fn tlas_as_hal<A: hal::Api>(
         &self,
         tlas: &CoreTlas,
-        hal_tlas_callback: F,
-    ) -> R {
-        unsafe { self.0.tlas_as_hal::<A, F, R>(tlas.id, hal_tlas_callback) }
+    ) -> Option<impl Deref<Target = A::AccelerationStructure>> {
+        unsafe { self.0.tlas_as_hal::<A>(tlas.id) }
     }
 
     pub fn generate_report(&self) -> wgc::global::GlobalReport {
@@ -301,65 +271,46 @@ impl ContextWgpuCore {
     fn handle_error_inner(
         &self,
         sink_mutex: &Mutex<ErrorSinkRaw>,
+        error_type: ErrorType,
         source: ContextErrorSource,
         label: Label<'_>,
         fn_ident: &'static str,
     ) {
-        let source_error: ErrorSource = Box::new(wgc::error::ContextError {
+        let source: ErrorSource = Box::new(wgc::error::ContextError {
             fn_ident,
             source,
             label: label.unwrap_or_default().to_string(),
         });
-        let mut sink = sink_mutex.lock();
-        let mut source_opt: Option<&(dyn Error + 'static)> = Some(&*source_error);
-        let error = loop {
-            if let Some(source) = source_opt {
-                if let Some(wgc::device::DeviceError::OutOfMemory) =
-                    source.downcast_ref::<wgc::device::DeviceError>()
-                {
-                    break crate::Error::OutOfMemory {
-                        source: source_error,
-                    };
+        let final_error_handling = {
+            let mut sink = sink_mutex.lock();
+            let description = || self.format_error(&*source);
+            let error = match error_type {
+                ErrorType::Internal => {
+                    let description = description();
+                    crate::Error::Internal {
+                        source,
+                        description,
+                    }
                 }
-                let device_error =
-                    if let Some(wgc::resource::CreateTextureError::Device(device_error)) =
-                        source.downcast_ref::<wgc::resource::CreateTextureError>()
-                    {
-                        Some(device_error)
-                    } else if let Some(wgc::resource::CreateBufferError::Device(device_error)) =
-                        source.downcast_ref::<wgc::resource::CreateBufferError>()
-                    {
-                        Some(device_error)
-                    } else if let Some(wgc::resource::CreateQuerySetError::Device(device_error)) =
-                        source.downcast_ref::<wgc::resource::CreateQuerySetError>()
-                    {
-                        Some(device_error)
-                    } else if let Some(wgc::ray_tracing::CreateBlasError::Device(device_error)) =
-                        source.downcast_ref::<wgc::ray_tracing::CreateBlasError>()
-                    {
-                        Some(device_error)
-                    } else if let Some(wgc::ray_tracing::CreateTlasError::Device(device_error)) =
-                        source.downcast_ref::<wgc::ray_tracing::CreateTlasError>()
-                    {
-                        Some(device_error)
-                    } else {
-                        None
-                    };
-                if let Some(wgc::device::DeviceError::OutOfMemory) = device_error {
-                    break crate::Error::OutOfMemory {
-                        source: source_error,
-                    };
+                ErrorType::OutOfMemory => crate::Error::OutOfMemory { source },
+                ErrorType::Validation => {
+                    let description = description();
+                    crate::Error::Validation {
+                        source,
+                        description,
+                    }
                 }
-                source_opt = source.source();
-            } else {
-                // Otherwise, it is a validation error
-                break crate::Error::Validation {
-                    description: self.format_error(&*source_error),
-                    source: source_error,
-                };
-            }
+                ErrorType::DeviceLost => return, // will be surfaced via callback
+            };
+            sink.handle_error_or_return_handler(error)
         };
-        sink.handle_error(error);
+
+        if let Some(f) = final_error_handling {
+            // If the user has provided their own `uncaptured_handler` callback, invoke it now,
+            // having released our lock on `sink_mutex`. See the comments on
+            // `handle_error_or_return_handler` for details.
+            f();
+        }
     }
 
     #[inline]
@@ -367,11 +318,12 @@ impl ContextWgpuCore {
     fn handle_error(
         &self,
         sink_mutex: &Mutex<ErrorSinkRaw>,
-        source: impl Error + WasmNotSendSync + 'static,
+        source: impl WebGpuError + WasmNotSendSync + 'static,
         label: Label<'_>,
         fn_ident: &'static str,
     ) {
-        self.handle_error_inner(sink_mutex, Box::new(source), label, fn_ident)
+        let error_type = source.webgpu_error_type();
+        self.handle_error_inner(sink_mutex, error_type, Box::new(source), label, fn_ident)
     }
 
     #[inline]
@@ -379,10 +331,11 @@ impl ContextWgpuCore {
     fn handle_error_nolabel(
         &self,
         sink_mutex: &Mutex<ErrorSinkRaw>,
-        source: impl Error + WasmNotSendSync + 'static,
+        source: impl WebGpuError + WasmNotSendSync + 'static,
         fn_ident: &'static str,
     ) {
-        self.handle_error_inner(sink_mutex, Box::new(source), None, fn_ident)
+        let error_type = source.webgpu_error_type();
+        self.handle_error_inner(sink_mutex, error_type, Box::new(source), None, fn_ident)
     }
 
     #[track_caller]
@@ -425,12 +378,11 @@ impl ContextWgpuCore {
         format!("Validation Error\n\nCaused by:\n{output}")
     }
 
-    pub unsafe fn queue_as_hal<A: wgc::hal_api::HalApi, F: FnOnce(Option<&A::Queue>) -> R, R>(
+    pub unsafe fn queue_as_hal<A: hal::Api>(
         &self,
         queue: &CoreQueue,
-        hal_queue_callback: F,
-    ) -> R {
-        unsafe { self.0.queue_as_hal::<A, F, R>(queue.id, hal_queue_callback) }
+    ) -> Option<impl Deref<Target = A::Queue> + WasmNotSendSync> {
+        unsafe { self.0.queue_as_hal::<A>(queue.id) }
     }
 }
 
@@ -554,6 +506,12 @@ pub struct CoreTextureView {
 }
 
 #[derive(Debug)]
+pub struct CoreExternalTexture {
+    pub(crate) context: ContextWgpuCore,
+    id: wgc::id::ExternalTextureId,
+}
+
+#[derive(Debug)]
 pub struct CoreSampler {
     pub(crate) context: ContextWgpuCore,
     id: wgc::id::SamplerId,
@@ -637,14 +595,13 @@ pub struct CoreCommandEncoder {
     pub(crate) context: ContextWgpuCore,
     id: wgc::id::CommandEncoderId,
     error_sink: ErrorSink,
-    open: bool,
 }
 
 #[derive(Debug)]
 pub struct CoreBlas {
     pub(crate) context: ContextWgpuCore,
     id: wgc::id::BlasId,
-    // error_sink: ErrorSink,
+    error_sink: ErrorSink,
 }
 
 #[derive(Debug)]
@@ -669,7 +626,7 @@ struct ErrorScope {
 
 struct ErrorSinkRaw {
     scopes: Vec<ErrorScope>,
-    uncaptured_handler: Option<Box<dyn crate::UncapturedErrorHandler>>,
+    uncaptured_handler: Option<Arc<dyn crate::UncapturedErrorHandler>>,
 }
 
 impl ErrorSinkRaw {
@@ -680,8 +637,18 @@ impl ErrorSinkRaw {
         }
     }
 
+    /// Deliver the error to
+    ///
+    /// * the innermost error scope, if any, or
+    /// * the uncaptured error handler, if there is one, or
+    /// * [`default_error_handler()`].
+    ///
+    /// If a closure is returned, the caller should call it immediately after dropping the
+    /// [`ErrorSink`] mutex guard. This makes sure that the user callback is not called with
+    /// a wgpu mutex held.
     #[track_caller]
-    fn handle_error(&mut self, err: crate::Error) {
+    #[must_use]
+    fn handle_error_or_return_handler(&mut self, err: crate::Error) -> Option<impl FnOnce()> {
         let filter = match err {
             crate::Error::OutOfMemory { .. } => crate::ErrorFilter::OutOfMemory,
             crate::Error::Validation { .. } => crate::ErrorFilter::Validation,
@@ -697,13 +664,15 @@ impl ErrorSinkRaw {
                 if scope.error.is_none() {
                     scope.error = Some(err);
                 }
+                None
             }
             None => {
-                if let Some(custom_handler) = self.uncaptured_handler.as_ref() {
-                    (custom_handler)(err);
+                if let Some(custom_handler) = &self.uncaptured_handler {
+                    let custom_handler = Arc::clone(custom_handler);
+                    Some(move || (custom_handler)(err))
                 } else {
                     // direct call preserves #[track_caller] where dyn can't
-                    default_error_handler(err);
+                    default_error_handler(err)
                 }
             }
         }
@@ -717,7 +686,7 @@ impl fmt::Debug for ErrorSinkRaw {
 }
 
 #[track_caller]
-fn default_error_handler(err: crate::Error) {
+fn default_error_handler(err: crate::Error) -> ! {
     log::error!("Handling wgpu errors as fatal by default");
     panic!("wgpu error: {err}\n");
 }
@@ -786,6 +755,7 @@ crate::cmp::impl_eq_ord_hash_proxy!(CoreTextureView => .id);
 crate::cmp::impl_eq_ord_hash_proxy!(CoreSampler => .id);
 crate::cmp::impl_eq_ord_hash_proxy!(CoreBuffer => .id);
 crate::cmp::impl_eq_ord_hash_proxy!(CoreTexture => .id);
+crate::cmp::impl_eq_ord_hash_proxy!(CoreExternalTexture => .id);
 crate::cmp::impl_eq_ord_hash_proxy!(CoreBlas => .id);
 crate::cmp::impl_eq_ord_hash_proxy!(CoreTlas => .id);
 crate::cmp::impl_eq_ord_hash_proxy!(CoreQuerySet => .id);
@@ -1118,7 +1088,7 @@ impl dispatch::DeviceInterface for CoreDevice {
                 self.context.handle_error(
                     &self.error_sink,
                     cause.clone(),
-                    desc.label().as_deref(),
+                    desc.label.as_deref(),
                     "Device::create_shader_module_passthrough",
                 );
                 CompilationInfo::from(cause)
@@ -1238,8 +1208,11 @@ impl dispatch::DeviceInterface for CoreDevice {
                     }
                     BindingResource::AccelerationStructure(acceleration_structure) => {
                         bm::BindingResource::AccelerationStructure(
-                            acceleration_structure.shared.inner.as_core().id,
+                            acceleration_structure.inner.as_core().id,
                         )
+                    }
+                    BindingResource::ExternalTexture(external_texture) => {
+                        bm::BindingResource::ExternalTexture(external_texture.inner.as_core().id)
                     }
                 },
             })
@@ -1378,13 +1351,109 @@ impl dispatch::DeviceInterface for CoreDevice {
             cache: desc.cache.map(|cache| cache.inner.as_core().id),
         };
 
-        let (id, error) =
-            self.context
-                .0
-                .device_create_render_pipeline(self.id, &descriptor, None, None);
+        let (id, error) = self
+            .context
+            .0
+            .device_create_render_pipeline(self.id, &descriptor, None);
         if let Some(cause) = error {
             if let wgc::pipeline::CreateRenderPipelineError::Internal { stage, ref error } = cause {
-                log::error!("Shader translation error for stage {:?}: {}", stage, error);
+                log::error!("Shader translation error for stage {stage:?}: {error}");
+                log::error!("Please report it to https://github.com/gfx-rs/wgpu");
+            }
+            self.context.handle_error(
+                &self.error_sink,
+                cause,
+                desc.label,
+                "Device::create_render_pipeline",
+            );
+        }
+        CoreRenderPipeline {
+            context: self.context.clone(),
+            id,
+            error_sink: Arc::clone(&self.error_sink),
+        }
+        .into()
+    }
+
+    fn create_mesh_pipeline(
+        &self,
+        desc: &crate::MeshPipelineDescriptor<'_>,
+    ) -> dispatch::DispatchRenderPipeline {
+        use wgc::pipeline as pipe;
+
+        let mesh_constants = desc
+            .mesh
+            .compilation_options
+            .constants
+            .iter()
+            .map(|&(key, value)| (String::from(key), value))
+            .collect();
+        let descriptor = pipe::MeshPipelineDescriptor {
+            label: desc.label.map(Borrowed),
+            task: desc.task.as_ref().map(|task| {
+                let task_constants = task
+                    .compilation_options
+                    .constants
+                    .iter()
+                    .map(|&(key, value)| (String::from(key), value))
+                    .collect();
+                pipe::TaskState {
+                    stage: pipe::ProgrammableStageDescriptor {
+                        module: task.module.inner.as_core().id,
+                        entry_point: task.entry_point.map(Borrowed),
+                        constants: task_constants,
+                        zero_initialize_workgroup_memory: desc
+                            .mesh
+                            .compilation_options
+                            .zero_initialize_workgroup_memory,
+                    },
+                }
+            }),
+            mesh: pipe::MeshState {
+                stage: pipe::ProgrammableStageDescriptor {
+                    module: desc.mesh.module.inner.as_core().id,
+                    entry_point: desc.mesh.entry_point.map(Borrowed),
+                    constants: mesh_constants,
+                    zero_initialize_workgroup_memory: desc
+                        .mesh
+                        .compilation_options
+                        .zero_initialize_workgroup_memory,
+                },
+            },
+            layout: desc.layout.map(|layout| layout.inner.as_core().id),
+            primitive: desc.primitive,
+            depth_stencil: desc.depth_stencil.clone(),
+            multisample: desc.multisample,
+            fragment: desc.fragment.as_ref().map(|frag| {
+                let frag_constants = frag
+                    .compilation_options
+                    .constants
+                    .iter()
+                    .map(|&(key, value)| (String::from(key), value))
+                    .collect();
+                pipe::FragmentState {
+                    stage: pipe::ProgrammableStageDescriptor {
+                        module: frag.module.inner.as_core().id,
+                        entry_point: frag.entry_point.map(Borrowed),
+                        constants: frag_constants,
+                        zero_initialize_workgroup_memory: frag
+                            .compilation_options
+                            .zero_initialize_workgroup_memory,
+                    },
+                    targets: Borrowed(frag.targets),
+                }
+            }),
+            multiview: desc.multiview,
+            cache: desc.cache.map(|cache| cache.inner.as_core().id),
+        };
+
+        let (id, error) = self
+            .context
+            .0
+            .device_create_mesh_pipeline(self.id, &descriptor, None);
+        if let Some(cause) = error {
+            if let wgc::pipeline::CreateRenderPipelineError::Internal { stage, ref error } = cause {
+                log::error!("Shader translation error for stage {stage:?}: {error}");
                 log::error!("Please report it to https://github.com/gfx-rs/wgpu");
             }
             self.context.handle_error(
@@ -1429,10 +1498,10 @@ impl dispatch::DeviceInterface for CoreDevice {
             cache: desc.cache.map(|cache| cache.inner.as_core().id),
         };
 
-        let (id, error) =
-            self.context
-                .0
-                .device_create_compute_pipeline(self.id, &descriptor, None, None);
+        let (id, error) = self
+            .context
+            .0
+            .device_create_compute_pipeline(self.id, &descriptor, None);
         if let Some(cause) = error {
             if let wgc::pipeline::CreateComputePipelineError::Internal(ref error) = cause {
                 log::error!(
@@ -1530,6 +1599,36 @@ impl dispatch::DeviceInterface for CoreDevice {
         .into()
     }
 
+    fn create_external_texture(
+        &self,
+        desc: &crate::ExternalTextureDescriptor<'_>,
+        planes: &[&crate::TextureView],
+    ) -> dispatch::DispatchExternalTexture {
+        let wgt_desc = desc.map_label(|l| l.map(Borrowed));
+        let planes = planes
+            .iter()
+            .map(|plane| plane.inner.as_core().id)
+            .collect::<Vec<_>>();
+        let (id, error) = self
+            .context
+            .0
+            .device_create_external_texture(self.id, &wgt_desc, &planes, None);
+        if let Some(cause) = error {
+            self.context.handle_error(
+                &self.error_sink,
+                cause,
+                desc.label,
+                "Device::create_external_texture",
+            );
+        }
+
+        CoreExternalTexture {
+            context: self.context.clone(),
+            id,
+        }
+        .into()
+    }
+
     fn create_blas(
         &self,
         desc: &crate::CreateBlasDescriptor<'_>,
@@ -1547,7 +1646,7 @@ impl dispatch::DeviceInterface for CoreDevice {
             CoreBlas {
                 context: self.context.clone(),
                 id,
-                // error_sink: Arc::clone(&self.error_sink),
+                error_sink: Arc::clone(&self.error_sink),
             }
             .into(),
         )
@@ -1645,7 +1744,6 @@ impl dispatch::DeviceInterface for CoreDevice {
             context: self.context.clone(),
             id,
             error_sink: Arc::clone(&self.error_sink),
-            open: true,
         }
         .into()
     }
@@ -1680,7 +1778,7 @@ impl dispatch::DeviceInterface for CoreDevice {
             .device_set_device_lost_closure(self.id, device_lost_callback);
     }
 
-    fn on_uncaptured_error(&self, handler: Box<dyn crate::UncapturedErrorHandler>) {
+    fn on_uncaptured_error(&self, handler: Arc<dyn crate::UncapturedErrorHandler>) {
         let mut error_sink = self.error_sink.lock();
         error_sink.uncaptured_handler = Some(handler);
     }
@@ -1931,6 +2029,27 @@ impl dispatch::QueueInterface for CoreQueue {
             .0
             .queue_on_submitted_work_done(self.id, callback);
     }
+
+    fn compact_blas(&self, blas: &dispatch::DispatchBlas) -> (Option<u64>, dispatch::DispatchBlas) {
+        let (id, handle, error) =
+            self.context
+                .0
+                .queue_compact_blas(self.id, blas.as_core().id, None);
+
+        if let Some(cause) = error {
+            self.context
+                .handle_error_nolabel(&self.error_sink, cause, "Queue::compact_blas");
+        }
+        (
+            handle,
+            CoreBlas {
+                context: self.context.clone(),
+                id,
+                error_sink: Arc::clone(&self.error_sink),
+            }
+            .into(),
+        )
+    }
 }
 
 impl Drop for CoreQueue {
@@ -1973,6 +2092,18 @@ impl Drop for CoreTextureView {
     fn drop(&mut self) {
         // TODO: We don't use this error at all?
         let _ = self.context.0.texture_view_drop(self.id);
+    }
+}
+
+impl dispatch::ExternalTextureInterface for CoreExternalTexture {
+    fn destroy(&self) {
+        self.context.0.external_texture_destroy(self.id);
+    }
+}
+
+impl Drop for CoreExternalTexture {
+    fn drop(&mut self) {
+        self.context.0.external_texture_drop(self.id);
     }
 }
 
@@ -2035,14 +2166,6 @@ impl dispatch::BufferInterface for CoreBuffer {
                 .context
                 .handle_error_fatal(err, "Buffer::get_mapped_range"),
         }
-    }
-
-    #[cfg(webgpu)]
-    fn get_mapped_range_as_array_buffer(
-        &self,
-        _sub_range: Range<wgt::BufferAddress>,
-    ) -> Option<js_sys::ArrayBuffer> {
-        None
     }
 
     fn unmap(&self) {
@@ -2110,7 +2233,39 @@ impl Drop for CoreTexture {
     }
 }
 
-impl dispatch::BlasInterface for CoreBlas {}
+impl dispatch::BlasInterface for CoreBlas {
+    fn prepare_compact_async(&self, callback: BlasCompactCallback) {
+        let callback: Option<wgc::resource::BlasCompactCallback> =
+            Some(Box::new(|status: BlasPrepareCompactResult| {
+                let res = status.map_err(|_| crate::BlasAsyncError);
+                callback(res);
+            }));
+
+        match self.context.0.blas_prepare_compact_async(self.id, callback) {
+            Ok(_) => (),
+            Err(cause) => self.context.handle_error_nolabel(
+                &self.error_sink,
+                cause,
+                "Blas::prepare_compact_async",
+            ),
+        }
+    }
+
+    fn ready_for_compaction(&self) -> bool {
+        match self.context.0.ready_for_compaction(self.id) {
+            Ok(ready) => ready,
+            Err(cause) => {
+                self.context.handle_error_nolabel(
+                    &self.error_sink,
+                    cause,
+                    "Blas::ready_for_compaction",
+                );
+                // A BLAS is definitely not ready for compaction if it's not valid
+                false
+            }
+        }
+    }
+}
 
 impl Drop for CoreBlas {
     fn drop(&mut self) {
@@ -2402,8 +2557,10 @@ impl dispatch::CommandEncoderInterface for CoreCommandEncoder {
 
     fn finish(&mut self) -> dispatch::DispatchCommandBuffer {
         let descriptor = wgt::CommandBufferDescriptor::default();
-        self.open = false; // prevent the drop
-        let (id, error) = self.context.0.command_encoder_finish(self.id, &descriptor);
+        let (id, error) = self
+            .context
+            .0
+            .command_encoder_finish(self.id, &descriptor, None);
         if let Some(cause) = error {
             self.context
                 .handle_error_nolabel(&self.error_sink, cause, "a CommandEncoder");
@@ -2546,7 +2703,7 @@ impl dispatch::CommandEncoderInterface for CoreCommandEncoder {
             .map(|b| b.inner.as_core().id)
             .collect::<SmallVec<[_; 4]>>();
         let tlas = tlas
-            .map(|t| t.shared.inner.as_core().id)
+            .map(|t| t.inner.as_core().id)
             .collect::<SmallVec<[_; 4]>>();
         if let Err(cause) = self
             .context
@@ -2561,60 +2718,10 @@ impl dispatch::CommandEncoderInterface for CoreCommandEncoder {
         }
     }
 
-    fn build_acceleration_structures_unsafe_tlas<'a>(
-        &self,
-        blas: &mut dyn Iterator<Item = &'a crate::BlasBuildEntry<'a>>,
-        tlas: &mut dyn Iterator<Item = &'a crate::TlasBuildEntry<'a>>,
-    ) {
-        let blas = blas.map(|e: &crate::BlasBuildEntry<'_>| {
-            let geometries = match e.geometry {
-                crate::BlasGeometries::TriangleGeometries(ref triangle_geometries) => {
-                    let iter = triangle_geometries.iter().map(|tg| {
-                        wgc::ray_tracing::BlasTriangleGeometry {
-                            vertex_buffer: tg.vertex_buffer.inner.as_core().id,
-                            index_buffer: tg.index_buffer.map(|buf| buf.inner.as_core().id),
-                            transform_buffer: tg.transform_buffer.map(|buf| buf.inner.as_core().id),
-                            size: tg.size,
-                            transform_buffer_offset: tg.transform_buffer_offset,
-                            first_vertex: tg.first_vertex,
-                            vertex_stride: tg.vertex_stride,
-                            first_index: tg.first_index,
-                        }
-                    });
-                    wgc::ray_tracing::BlasGeometries::TriangleGeometries(Box::new(iter))
-                }
-            };
-            wgc::ray_tracing::BlasBuildEntry {
-                blas_id: e.blas.inner.as_core().id,
-                geometries,
-            }
-        });
-
-        let tlas = tlas.into_iter().map(|e: &crate::TlasBuildEntry<'a>| {
-            wgc::ray_tracing::TlasBuildEntry {
-                tlas_id: e.tlas.shared.inner.as_core().id,
-                instance_buffer_id: e.instance_buffer.inner.as_core().id,
-                instance_count: e.instance_count,
-            }
-        });
-
-        if let Err(cause) = self
-            .context
-            .0
-            .command_encoder_build_acceleration_structures_unsafe_tlas(self.id, blas, tlas)
-        {
-            self.context.handle_error_nolabel(
-                &self.error_sink,
-                cause,
-                "CommandEncoder::build_acceleration_structures_unsafe_tlas",
-            );
-        }
-    }
-
     fn build_acceleration_structures<'a>(
         &self,
         blas: &mut dyn Iterator<Item = &'a crate::BlasBuildEntry<'a>>,
-        tlas: &mut dyn Iterator<Item = &'a crate::TlasPackage>,
+        tlas: &mut dyn Iterator<Item = &'a crate::Tlas>,
     ) {
         let blas = blas.map(|e: &crate::BlasBuildEntry<'_>| {
             let geometries = match e.geometry {
@@ -2655,7 +2762,7 @@ impl dispatch::CommandEncoderInterface for CoreCommandEncoder {
                         })
                 });
             wgc::ray_tracing::TlasPackage {
-                tlas_id: e.tlas.shared.inner.as_core().id,
+                tlas_id: e.inner.as_core().id,
                 instances: Box::new(instances),
                 lowest_unmodified: e.lowest_unmodified,
             }
@@ -2708,9 +2815,7 @@ impl dispatch::CommandEncoderInterface for CoreCommandEncoder {
 
 impl Drop for CoreCommandEncoder {
     fn drop(&mut self) {
-        if self.open {
-            self.context.0.command_encoder_drop(self.id)
-        }
+        self.context.0.command_encoder_drop(self.id)
     }
 }
 
@@ -3137,6 +3242,22 @@ impl dispatch::RenderPassInterface for CoreRenderPass {
         }
     }
 
+    fn draw_mesh_tasks(&mut self, group_count_x: u32, group_count_y: u32, group_count_z: u32) {
+        if let Err(cause) = self.context.0.render_pass_draw_mesh_tasks(
+            &mut self.pass,
+            group_count_x,
+            group_count_y,
+            group_count_z,
+        ) {
+            self.context.handle_error(
+                &self.error_sink,
+                cause,
+                self.pass.label(),
+                "RenderPass::draw_mesh_tasks",
+            );
+        }
+    }
+
     fn draw_indirect(
         &mut self,
         indirect_buffer: &dispatch::DispatchBuffer,
@@ -3175,6 +3296,27 @@ impl dispatch::RenderPassInterface for CoreRenderPass {
                 cause,
                 self.pass.label(),
                 "RenderPass::draw_indexed_indirect",
+            );
+        }
+    }
+
+    fn draw_mesh_tasks_indirect(
+        &mut self,
+        indirect_buffer: &dispatch::DispatchBuffer,
+        indirect_offset: crate::BufferAddress,
+    ) {
+        let indirect_buffer = indirect_buffer.as_core();
+
+        if let Err(cause) = self.context.0.render_pass_draw_mesh_tasks_indirect(
+            &mut self.pass,
+            indirect_buffer.id,
+            indirect_offset,
+        ) {
+            self.context.handle_error(
+                &self.error_sink,
+                cause,
+                self.pass.label(),
+                "RenderPass::draw_mesh_tasks_indirect",
             );
         }
     }
@@ -3221,6 +3363,29 @@ impl dispatch::RenderPassInterface for CoreRenderPass {
                 cause,
                 self.pass.label(),
                 "RenderPass::multi_draw_indexed_indirect",
+            );
+        }
+    }
+
+    fn multi_draw_mesh_tasks_indirect(
+        &mut self,
+        indirect_buffer: &dispatch::DispatchBuffer,
+        indirect_offset: crate::BufferAddress,
+        count: u32,
+    ) {
+        let indirect_buffer = indirect_buffer.as_core();
+
+        if let Err(cause) = self.context.0.render_pass_multi_draw_mesh_tasks_indirect(
+            &mut self.pass,
+            indirect_buffer.id,
+            indirect_offset,
+            count,
+        ) {
+            self.context.handle_error(
+                &self.error_sink,
+                cause,
+                self.pass.label(),
+                "RenderPass::multi_draw_mesh_tasks_indirect",
             );
         }
     }
@@ -3281,6 +3446,38 @@ impl dispatch::RenderPassInterface for CoreRenderPass {
                 cause,
                 self.pass.label(),
                 "RenderPass::multi_draw_indexed_indirect_count",
+            );
+        }
+    }
+
+    fn multi_draw_mesh_tasks_indirect_count(
+        &mut self,
+        indirect_buffer: &dispatch::DispatchBuffer,
+        indirect_offset: crate::BufferAddress,
+        count_buffer: &dispatch::DispatchBuffer,
+        count_buffer_offset: crate::BufferAddress,
+        max_count: u32,
+    ) {
+        let indirect_buffer = indirect_buffer.as_core();
+        let count_buffer = count_buffer.as_core();
+
+        if let Err(cause) = self
+            .context
+            .0
+            .render_pass_multi_draw_mesh_tasks_indirect_count(
+                &mut self.pass,
+                indirect_buffer.id,
+                indirect_offset,
+                count_buffer.id,
+                count_buffer_offset,
+                max_count,
+            )
+        {
+            self.context.handle_error(
+                &self.error_sink,
+                cause,
+                self.pass.label(),
+                "RenderPass::multi_draw_mesh_tasks_indirect_count",
             );
         }
     }
@@ -3704,5 +3901,10 @@ impl dispatch::BufferMappedRangeInterface for CoreBufferMappedRange {
     #[inline]
     fn slice_mut(&mut self) -> &mut [u8] {
         unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), self.size) }
+    }
+
+    #[cfg(webgpu)]
+    fn as_uint8array(&self) -> &js_sys::Uint8Array {
+        panic!("Only available on WebGPU")
     }
 }

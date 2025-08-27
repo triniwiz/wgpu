@@ -3,33 +3,34 @@ name: Shaders
 on:
   push:
     branches-ignore: [
-        # We don't need to run on renovate PRs.
+        # Renovate branches are always PRs, so they will be covered
+        # by the pull_request event.
         "renovate/**",
-        # This is the branch the merge queue creates.
+        # Branches with the `gh-readonly-queue` prefix are used by the
+        # merge queue, so they are already covered by the `merge_group` event.
         "gh-readonly-queue/**",
       ]
-    tags: [v0.*]
   pull_request:
   merge_group:
 
 env:
   # Sourced from https://vulkan.lunarg.com/sdk/home#linux
-  #
-  # We don't include the 4th version number, as it's not used in any URL.
-  VULKAN_SDK_VERSION: "1.4.309"
+  VULKAN_SDK_VERSION: "1.4.321"
+  VULKAN_FULL_SDK_VERSION: "1.4.321.0"
 
-  # Sourced from https://github.com/microsoft/DirectXShaderCompiler/releases
-  #
-  # Must also be changed in ci.yaml
-  DXC_RELEASE: "v1.8.2502"
-  DXC_FILENAME: "dxc_2025_02_20.zip"
+# Every time a PR is pushed to, cancel any previous jobs. This
+# makes us behave nicer to github and get faster turnaround times
+# on PRs that are pushed to multiple times in rapid succession.
+concurrency:
+  group: ${{github.workflow}}-${{github.ref}}
+  cancel-in-progress: ${{github.event_name == 'pull_request'}}
 
 jobs:
   naga-validate-windows:
     name: "Validate: HLSL"
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Debug symbols to `line-tables-only`
         shell: bash
@@ -56,15 +57,7 @@ jobs:
         shell: powershell
 
       - name: Setup DXC
-        shell: bash
-        run: |
-          set -e
-
-          curl.exe -L --retry 5 https://github.com/microsoft/DirectXShaderCompiler/releases/download/$DXC_RELEASE/$DXC_FILENAME -o dxc.zip
-          7z.exe e dxc.zip -odxc bin/x64/{dxc.exe,dxcompiler.dll}
-
-          # We need to use cygpath to convert PWD to a windows path as we're using bash.
-          cygpath --windows "$PWD/dxc" >> "$GITHUB_PATH"
+        uses: ./.github/actions/install-dxc
 
       - name: Validate
         shell: bash
@@ -81,7 +74,7 @@ jobs:
     name: "Validate: MSL"
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Debug symbols to line-tables-only
         shell: bash
@@ -103,21 +96,22 @@ jobs:
     name: "Validate: SPIR-V/GLSL/DOT/WGSL"
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Vulkan SDK
         shell: bash
         run: |
           set -e
 
-          sudo apt-get update -y -qq
+          curl -L --retry 5 https://sdk.lunarg.com/sdk/download/${{ env.VULKAN_FULL_SDK_VERSION }}/linux/vulkansdk-linux-x86_64-${{ env.VULKAN_FULL_SDK_VERSION }}.tar.xz -o vulkan-sdk.tar.xz
+          mkdir vulkan-sdk
+          tar xpf vulkan-sdk.tar.xz -C vulkan-sdk
 
-          # vulkan sdk
-          wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
-          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-$VULKAN_SDK_VERSION-noble.list https://packages.lunarg.com/vulkan/$VULKAN_SDK_VERSION/lunarg-vulkan-$VULKAN_SDK_VERSION-noble.list
+          mv ./vulkan-sdk/${{ env.VULKAN_FULL_SDK_VERSION }} $HOME/VulkanSDK
 
-          sudo apt-get update
-          sudo apt install -y vulkan-sdk
+          echo "$HOME/VulkanSDK/x86_64/bin" >> "$GITHUB_PATH"
+          echo "LD_LIBRARY_PATH=$HOME/VulkanSDK/x86_64/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+          echo "VK_ADD_LAYER_PATH=$HOME/VulkanSDK/x86_64/share/vulkan/explicit_layer.d" >> "$GITHUB_ENV"
 
       - name: Install Graphviz
         run: sudo apt-get install graphviz

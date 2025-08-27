@@ -414,7 +414,7 @@ impl GPUCommandEncoder {
 
         let (id, err) = self
             .instance
-            .command_encoder_finish(self.id, &wgpu_descriptor);
+            .command_encoder_finish(self.id, &wgpu_descriptor, None);
 
         self.error_handler.push_error(err);
 
@@ -422,7 +422,6 @@ impl GPUCommandEncoder {
             instance: self.instance.clone(),
             id,
             label: descriptor.label,
-            consumed: Default::default(),
         }
     }
 

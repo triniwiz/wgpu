@@ -200,10 +200,13 @@ const windowOrWorkerGlobalScope = {
   GPUTextureUsage: util.nonEnumerable(webgpu.GPUTextureUsage),
   GPUTexture: util.nonEnumerable(webgpu.GPUTexture),
   GPUTextureView: util.nonEnumerable(webgpu.GPUTextureView),
+  GPUExternalTexture: util.nonEnumerable(webgpu.GPUExternalTexture),
   GPUSampler: util.nonEnumerable(webgpu.GPUSampler),
   GPUBindGroupLayout: util.nonEnumerable(webgpu.GPUBindGroupLayout),
   GPUPipelineLayout: util.nonEnumerable(webgpu.GPUPipelineLayout),
   GPUBindGroup: util.nonEnumerable(webgpu.GPUBindGroup),
+  GPUCompilationInfo: util.nonEnumerable(webgpu.GPUCompilationInfo),
+  GPUCompilationMessage: util.nonEnumerable(webgpu.GPUCompilationMessage),
   GPUShaderModule: util.nonEnumerable(webgpu.GPUShaderModule),
   GPUShaderStage: util.nonEnumerable(webgpu.GPUShaderStage),
   GPUComputePipeline: util.nonEnumerable(webgpu.GPUComputePipeline),
@@ -217,8 +220,10 @@ const windowOrWorkerGlobalScope = {
   GPURenderBundle: util.nonEnumerable(webgpu.GPURenderBundle),
   GPUQuerySet: util.nonEnumerable(webgpu.GPUQuerySet),
   GPUError: util.nonEnumerable(webgpu.GPUError),
+  GPUInternalError: util.nonEnumerable(webgpu.GPUInternalError),
   GPUValidationError: util.nonEnumerable(webgpu.GPUValidationError),
   GPUOutOfMemoryError: util.nonEnumerable(webgpu.GPUOutOfMemoryError),
+  GPUUncapturedErrorEvent: util.nonEnumerable(webgpu.GPUUncapturedErrorEvent),
 };
 
 windowOrWorkerGlobalScope.console.enumerable = false;

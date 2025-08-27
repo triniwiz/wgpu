@@ -1,5 +1,5 @@
 use alloc::{string::String, vec::Vec};
-use core::ops::Range;
+use core::{convert::Infallible, ops::Range};
 
 #[cfg(feature = "trace")]
 use {alloc::borrow::Cow, std::io::Write as _};
@@ -58,6 +58,13 @@ pub enum Action<'a> {
         desc: crate::resource::TextureViewDescriptor<'a>,
     },
     DestroyTextureView(id::TextureViewId),
+    CreateExternalTexture {
+        id: id::ExternalTextureId,
+        desc: crate::resource::ExternalTextureDescriptor<'a>,
+        planes: alloc::boxed::Box<[id::TextureViewId]>,
+    },
+    FreeExternalTexture(id::ExternalTextureId),
+    DestroyExternalTexture(id::ExternalTextureId),
     CreateSampler(id::SamplerId, crate::resource::SamplerDescriptor<'a>),
     DestroySampler(id::SamplerId),
     GetSurfaceTexture {
@@ -86,19 +93,28 @@ pub enum Action<'a> {
         desc: crate::pipeline::ShaderModuleDescriptor<'a>,
         data: FileName,
     },
+    CreateShaderModulePassthrough {
+        id: id::ShaderModuleId,
+        data: Vec<FileName>,
+
+        entry_point: String,
+        label: crate::Label<'a>,
+        num_workgroups: (u32, u32, u32),
+        runtime_checks: wgt::ShaderRuntimeChecks,
+    },
     DestroyShaderModule(id::ShaderModuleId),
     CreateComputePipeline {
         id: id::ComputePipelineId,
         desc: crate::pipeline::ComputePipelineDescriptor<'a>,
-        #[cfg_attr(feature = "replay", serde(default))]
-        implicit_context: Option<super::ImplicitPipelineContext>,
     },
     DestroyComputePipeline(id::ComputePipelineId),
     CreateRenderPipeline {
         id: id::RenderPipelineId,
         desc: crate::pipeline::RenderPipelineDescriptor<'a>,
-        #[cfg_attr(feature = "replay", serde(default))]
-        implicit_context: Option<super::ImplicitPipelineContext>,
+    },
+    CreateMeshPipeline {
+        id: id::RenderPipelineId,
+        desc: crate::pipeline::MeshPipelineDescriptor<'a>,
     },
     DestroyRenderPipeline(id::RenderPipelineId),
     CreatePipelineCache {
@@ -109,7 +125,7 @@ pub enum Action<'a> {
     CreateRenderBundle {
         id: id::RenderBundleId,
         desc: crate::command::RenderBundleEncoderDescriptor<'a>,
-        base: crate::command::BasePass<crate::command::RenderCommand>,
+        base: crate::command::BasePass<crate::command::RenderCommand, Infallible>,
     },
     DestroyRenderBundle(id::RenderBundleId),
     CreateQuerySet {
@@ -192,19 +208,15 @@ pub enum Command {
     PopDebugGroup,
     InsertDebugMarker(String),
     RunComputePass {
-        base: crate::command::BasePass<crate::command::ComputeCommand>,
+        base: crate::command::BasePass<crate::command::ComputeCommand, Infallible>,
         timestamp_writes: Option<crate::command::PassTimestampWrites>,
     },
     RunRenderPass {
-        base: crate::command::BasePass<crate::command::RenderCommand>,
+        base: crate::command::BasePass<crate::command::RenderCommand, Infallible>,
         target_colors: Vec<Option<crate::command::RenderPassColorAttachment>>,
         target_depth_stencil: Option<crate::command::RenderPassDepthStencilAttachment>,
         timestamp_writes: Option<crate::command::PassTimestampWrites>,
         occlusion_query_set_id: Option<id::QuerySetId>,
-    },
-    BuildAccelerationStructuresUnsafeTlas {
-        blas: Vec<crate::ray_tracing::TraceBlasBuildEntry>,
-        tlas: Vec<crate::ray_tracing::TlasBuildEntry>,
     },
     BuildAccelerationStructures {
         blas: Vec<crate::ray_tracing::TraceBlasBuildEntry>,
@@ -224,7 +236,7 @@ pub struct Trace {
 #[cfg(feature = "trace")]
 impl Trace {
     pub fn new(path: std::path::PathBuf) -> Result<Self, std::io::Error> {
-        log::info!("Tracing into '{:?}'", path);
+        log::info!("Tracing into '{path:?}'");
         let mut file = std::fs::File::create(path.join(FILE_NAME))?;
         file.write_all(b"[\n")?;
         Ok(Self {
@@ -245,10 +257,10 @@ impl Trace {
     pub(crate) fn add(&mut self, action: Action) {
         match ron::ser::to_string_pretty(&action, self.config.clone()) {
             Ok(string) => {
-                let _ = writeln!(self.file, "{},", string);
+                let _ = writeln!(self.file, "{string},");
             }
             Err(e) => {
-                log::warn!("RON serialization failure: {:?}", e);
+                log::warn!("RON serialization failure: {e:?}");
             }
         }
     }

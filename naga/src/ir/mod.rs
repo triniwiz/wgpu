@@ -221,7 +221,7 @@ An override expression can be evaluated at pipeline creation time.
 
 mod block;
 
-use alloc::{string::String, vec::Vec};
+use alloc::{boxed::Box, string::String, vec::Vec};
 
 #[cfg(feature = "arbitrary")]
 use arbitrary::Arbitrary;
@@ -347,7 +347,21 @@ pub enum AddressSpace {
     Storage { access: StorageAccess },
     /// Opaque handles, such as samplers and images.
     Handle,
+
     /// Push constants.
+    ///
+    /// A [`Module`] may contain at most one [`GlobalVariable`] in
+    /// this address space. Its contents are provided not by a buffer
+    /// but by `SetPushConstant` pass commands, allowing the CPU to
+    /// establish different values for each draw/dispatch.
+    ///
+    /// `PushConstant` variables may not contain `f16` values, even if
+    /// the [`SHADER_FLOAT16`] capability is enabled.
+    ///
+    /// Backends generally place tight limits on the size of
+    /// `PushConstant` variables.
+    ///
+    /// [`SHADER_FLOAT16`]: crate::valid::Capabilities::SHADER_FLOAT16
     PushConstant,
 }
 
@@ -409,6 +423,18 @@ pub enum VectorSize {
 
 impl VectorSize {
     pub const MAX: usize = Self::Quad as usize;
+}
+
+impl From<VectorSize> for u8 {
+    fn from(size: VectorSize) -> u8 {
+        size as u8
+    }
+}
+
+impl From<VectorSize> for u32 {
+    fn from(size: VectorSize) -> u32 {
+        size as u32
+    }
 }
 
 /// Primitive type for a scalar.
@@ -640,6 +666,8 @@ pub enum ImageClass {
         /// Multi-sampled depth image.
         multi: bool,
     },
+    /// External texture.
+    External,
     /// Storage image.
     Storage {
         format: StorageFormat,
@@ -1509,6 +1537,10 @@ pub enum Expression {
         offset: Option<Handle<Expression>>,
         level: SampleLevel,
         depth_ref: Option<Handle<Expression>>,
+        /// Whether the sampling operation should clamp each component of
+        /// `coordinate` to the range `[half_texel, 1 - half_texel]`, regardless
+        /// of `sampler`.
+        clamp_to_edge: bool,
     },
 
     /// Load a texel from an image.
@@ -1916,7 +1948,12 @@ pub enum Statement {
     /// Synchronize invocations within the work group.
     /// The `Barrier` flags control which memory accesses should be synchronized.
     /// If empty, this becomes purely an execution barrier.
-    Barrier(Barrier),
+    ControlBarrier(Barrier),
+
+    /// Synchronize invocations within the work group.
+    /// The `Barrier` flags control which memory accesses should be synchronized.
+    MemoryBarrier(Barrier),
+
     /// Stores a value at an address.
     ///
     /// For [`TypeInner::Atomic`] type behind the pointer, the value
@@ -2323,6 +2360,51 @@ pub struct SpecialTypes {
     /// Call [`Module::generate_vertex_return_type`]
     pub ray_vertex_return: Option<Handle<Type>>,
 
+    /// Struct containing parameters required by some backends to emit code for
+    /// [`ImageClass::External`] textures.
+    ///
+    /// See `wgpu_core::device::resource::ExternalTextureParams` for the
+    /// documentation of each field.
+    ///
+    /// In WGSL, this type would be:
+    ///
+    /// ```ignore
+    /// struct NagaExternalTextureParams {         // align size offset
+    ///     yuv_conversion_matrix: mat4x4<f32>,    //    16   64      0
+    ///     gamut_conversion_matrix: mat3x3<f32>,  //    16   48     64
+    ///     src_tf: NagaExternalTextureTransferFn, //     4   16    112
+    ///     dst_tf: NagaExternalTextureTransferFn, //     4   16    128
+    ///     sample_transform: mat3x2<f32>,         //     8   24    144
+    ///     load_transform: mat3x2<f32>,           //     8   24    168
+    ///     size: vec2<u32>,                       //     8    8    192
+    ///     num_planes: u32,                       //     4    4    200
+    /// }                            // whole struct:    16  208
+    /// ```
+    ///
+    /// Call [`Module::generate_external_texture_types`] to populate this if
+    /// needed.
+    pub external_texture_params: Option<Handle<Type>>,
+
+    /// Struct describing a gamma encoding transfer function. Member of
+    /// `NagaExternalTextureParams`, describing how the backend should perform
+    /// color space conversion when sampling from [`ImageClass::External`]
+    /// textures.
+    ///
+    /// In WGSL, this type would be:
+    ///
+    /// ```ignore
+    /// struct NagaExternalTextureTransferFn { // align size offset
+    ///     a: f32,                            //     4    4      0
+    ///     b: f32,                            //     4    4      4
+    ///     g: f32,                            //     4    4      8
+    ///     k: f32,                            //     4    4     12
+    /// }                         // whole struct:    4   16
+    /// ```
+    ///
+    /// Call [`Module::generate_external_texture_types`] to populate this if
+    /// needed.
+    pub external_texture_transfer_function: Option<Handle<Type>>,
+
     /// Types for predeclared wgsl types instantiated on demand.
     ///
     /// Call [`Module::generate_predeclared_type`] to populate this if
@@ -2384,6 +2466,28 @@ pub enum RayQueryIntersection {
     /// Intersecting with Axis Aligned Bounding Boxes.
     /// Matches `RayQueryCandidateIntersectionAABBKHR`.
     Aabb = 3,
+}
+
+/// Doc comments preceding items.
+///
+/// These can be used to generate automated documentation,
+/// IDE hover information or translate shaders with their context comments.
+#[derive(Debug, Default, Clone)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[cfg_attr(feature = "deserialize", derive(Deserialize))]
+#[cfg_attr(feature = "arbitrary", derive(Arbitrary))]
+pub struct DocComments {
+    pub types: FastIndexMap<Handle<Type>, Vec<String>>,
+    // The key is:
+    // - key.0: the handle to the Struct
+    // - key.1: the index of the `StructMember`.
+    pub struct_members: FastIndexMap<(Handle<Type>, usize), Vec<String>>,
+    pub entry_points: FastIndexMap<usize, Vec<String>>,
+    pub functions: FastIndexMap<Handle<Function>, Vec<String>>,
+    pub constants: FastIndexMap<Handle<Constant>, Vec<String>>,
+    pub global_variables: FastIndexMap<Handle<GlobalVariable>, Vec<String>>,
+    // Top level comments, appearing before any space.
+    pub module: Vec<String>,
 }
 
 /// Shader module.
@@ -2471,4 +2575,6 @@ pub struct Module {
     /// See [`DiagnosticFilterNode`] for details on how the tree is represented and used in
     /// validation.
     pub diagnostic_filter_leaf: Option<Handle<DiagnosticFilterNode>>,
+    /// Doc comments.
+    pub doc_comments: Option<Box<DocComments>>,
 }

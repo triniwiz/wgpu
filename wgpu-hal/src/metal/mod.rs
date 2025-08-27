@@ -28,7 +28,6 @@ mod time;
 
 use alloc::{borrow::ToOwned as _, string::String, sync::Arc, vec::Vec};
 use core::{fmt, iter, ops, ptr::NonNull, sync::atomic};
-use std::thread;
 
 use arrayvec::ArrayVec;
 use bitflags::bitflags;
@@ -48,6 +47,8 @@ pub struct Api;
 type ResourceIndex = u32;
 
 impl crate::Api for Api {
+    const VARIANT: wgt::Backend = wgt::Backend::Metal;
+
     type Instance = Instance;
     type Surface = Surface;
     type Adapter = Adapter;
@@ -310,9 +311,17 @@ struct PrivateDisabilities {
     broken_layered_clear_image: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Settings {
     retain_command_buffer_references: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            retain_command_buffer_references: true,
+        }
+    }
 }
 
 struct AdapterShared {
@@ -329,7 +338,7 @@ unsafe impl Sync for AdapterShared {}
 impl AdapterShared {
     fn new(device: metal::Device) -> Self {
         let private_caps = PrivateCapabilities::new(&device);
-        log::debug!("{:#?}", private_caps);
+        log::debug!("{private_caps:#?}");
 
         Self {
             disabilities: PrivateDisabilities::new(&device),
@@ -376,7 +385,6 @@ pub struct Surface {
     render_layer: Mutex<metal::MetalLayer>,
     swapchain_format: RwLock<Option<wgt::TextureFormat>>,
     extent: RwLock<wgt::Extent3d>,
-    main_thread_id: thread::ThreadId,
     // Useful for UI-intensive applications that are sensitive to
     // window resizing.
     pub present_with_transaction: bool,

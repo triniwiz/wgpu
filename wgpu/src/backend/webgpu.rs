@@ -10,10 +10,12 @@ use alloc::{
     format,
     rc::Rc,
     string::{String, ToString as _},
+    sync::Arc,
     vec,
     vec::Vec,
 };
 use core::{
+    cell::OnceCell,
     cell::RefCell,
     fmt,
     future::Future,
@@ -26,7 +28,10 @@ use wgt::Backends;
 use js_sys::Promise;
 use wasm_bindgen::{prelude::*, JsCast};
 
-use crate::{dispatch, Blas, SurfaceTargetUnsafe, Tlas};
+use crate::{
+    dispatch::{self, BlasCompactCallback},
+    Blas, SurfaceTargetUnsafe, Tlas,
+};
 
 use defined_non_null_js_value::DefinedNonNullJsValue;
 
@@ -112,11 +117,7 @@ fn map_utf16_to_utf8_offset(utf16_offset: u32, text: &str) -> u32 {
     if utf16_i >= utf16_offset {
         text.len() as u32
     } else {
-        log::error!(
-            "UTF16 offset {} is out of bounds for string {}",
-            utf16_offset,
-            text
-        );
+        log::error!("UTF16 offset {utf16_offset} is out of bounds for string {text}");
         u32::MAX
     }
 }
@@ -376,8 +377,7 @@ fn map_primitive_state(primitive: &wgt::PrimitiveState) -> webgpu_sys::GpuPrimit
         PrimitiveTopology::TriangleStrip => pt::TriangleStrip,
     });
 
-    //TODO:
-    //mapped.unclipped_depth(primitive.unclipped_depth);
+    mapped.set_unclipped_depth(primitive.unclipped_depth);
 
     match primitive.polygon_mode {
         wgt::PolygonMode::Fill => {}
@@ -708,7 +708,7 @@ fn map_map_mode(mode: crate::MapMode) -> u32 {
     }
 }
 
-const FEATURES_MAPPING: [(wgt::Features, webgpu_sys::GpuFeatureName); 14] = [
+const FEATURES_MAPPING: [(wgt::Features, webgpu_sys::GpuFeatureName); 15] = [
     (
         wgt::Features::DEPTH_CLIP_CONTROL,
         webgpu_sys::GpuFeatureName::DepthClipControl,
@@ -765,6 +765,10 @@ const FEATURES_MAPPING: [(wgt::Features, webgpu_sys::GpuFeatureName); 14] = [
         wgt::Features::DUAL_SOURCE_BLENDING,
         webgpu_sys::GpuFeatureName::DualSourceBlending,
     ),
+    (
+        wgt::Features::CLIP_DISTANCES,
+        webgpu_sys::GpuFeatureName::ClipDistances,
+    ),
 ];
 
 fn map_wgt_features(supported_features: webgpu_sys::GpuSupportedFeatures) -> wgt::Features {
@@ -820,6 +824,17 @@ fn map_wgt_limits(limits: webgpu_sys::GpuSupportedLimits) -> wgt::Limits {
         max_push_constant_size: wgt::Limits::default().max_push_constant_size,
         max_non_sampler_bindings: wgt::Limits::default().max_non_sampler_bindings,
         max_inter_stage_shader_components: wgt::Limits::default().max_inter_stage_shader_components,
+
+        max_task_workgroup_total_count: wgt::Limits::default().max_task_workgroup_total_count,
+        max_task_workgroups_per_dimension: wgt::Limits::default().max_task_workgroups_per_dimension,
+        max_mesh_output_layers: wgt::Limits::default().max_mesh_output_layers,
+        max_mesh_multiview_count: wgt::Limits::default().max_mesh_multiview_count,
+
+        max_blas_primitive_count: wgt::Limits::default().max_blas_primitive_count,
+        max_blas_geometry_count: wgt::Limits::default().max_blas_geometry_count,
+        max_tlas_instance_count: wgt::Limits::default().max_tlas_instance_count,
+        max_acceleration_structures_per_shader_stage: wgt::Limits::default()
+            .max_acceleration_structures_per_shader_stage,
     }
 }
 
@@ -1219,16 +1234,6 @@ impl WebBuffer {
         }
     }
 
-    /// Creates a raw Javascript array buffer over the provided range.
-    fn get_mapped_array_buffer(&self, sub_range: Range<wgt::BufferAddress>) -> js_sys::ArrayBuffer {
-        self.inner
-            .get_mapped_range_with_f64_and_f64(
-                sub_range.start as f64,
-                (sub_range.end - sub_range.start) as f64,
-            )
-            .unwrap()
-    }
-
     /// Obtains a reference to the re-usable buffer mapping as a Javascript array view.
     fn get_mapped_range(&self, sub_range: Range<wgt::BufferAddress>) -> js_sys::Uint8Array {
         let mut mapping = self.mapping.borrow_mut();
@@ -1258,6 +1263,12 @@ impl WebBuffer {
 pub struct WebTexture {
     pub(crate) inner: webgpu_sys::GpuTexture,
     /// Unique identifier for this Texture.
+    ident: crate::cmp::Identifier,
+}
+
+#[derive(Debug)]
+pub struct WebExternalTexture {
+    /// Unique identifier for this ExternalTexture.
     ident: crate::cmp::Identifier,
 }
 
@@ -1374,9 +1385,9 @@ pub struct WebQueueWriteBuffer {
 #[derive(Debug)]
 pub struct WebBufferMappedRange {
     actual_mapping: js_sys::Uint8Array,
-    /// Copy of the mapped data that lives in the Rust/Wasm heap instead of JS,
-    /// so Rust code can borrow it.
-    temporary_mapping: Vec<u8>,
+    /// Copy of actual_mapping that lives in the Rust/Wasm heap instead of JS. This
+    /// is done only when accessed for the first time to avoid unnecessary allocations.
+    temporary_mapping: OnceCell<Vec<u8>>,
     /// Whether `temporary_mapping` has possibly been written to and needs to be written back to JS.
     temporary_mapping_modified: bool,
     /// Unique identifier for this BufferMappedRange.
@@ -1394,6 +1405,7 @@ impl_send_sync!(WebTextureView);
 impl_send_sync!(WebSampler);
 impl_send_sync!(WebBuffer);
 impl_send_sync!(WebTexture);
+impl_send_sync!(WebExternalTexture);
 impl_send_sync!(WebBlas);
 impl_send_sync!(WebTlas);
 impl_send_sync!(WebQuerySet);
@@ -1423,6 +1435,7 @@ crate::cmp::impl_eq_ord_hash_proxy!(WebTextureView => .ident);
 crate::cmp::impl_eq_ord_hash_proxy!(WebSampler => .ident);
 crate::cmp::impl_eq_ord_hash_proxy!(WebBuffer => .ident);
 crate::cmp::impl_eq_ord_hash_proxy!(WebTexture => .ident);
+crate::cmp::impl_eq_ord_hash_proxy!(WebExternalTexture => .ident);
 crate::cmp::impl_eq_ord_hash_proxy!(WebBlas => .ident);
 crate::cmp::impl_eq_ord_hash_proxy!(WebTlas => .ident);
 crate::cmp::impl_eq_ord_hash_proxy!(WebQuerySet => .ident);
@@ -1849,9 +1862,43 @@ impl dispatch::DeviceInterface for WebDevice {
 
     unsafe fn create_shader_module_passthrough(
         &self,
-        _desc: &crate::ShaderModuleDescriptorPassthrough<'_>,
+        desc: &crate::ShaderModuleDescriptorPassthrough<'_>,
     ) -> dispatch::DispatchShaderModule {
-        unreachable!("No XXX_SHADER_PASSTHROUGH feature enabled for this backend")
+        let shader_module_result = if let Some(ref code) = desc.wgsl {
+            let shader_module = webgpu_sys::GpuShaderModuleDescriptor::new(code);
+            Ok((
+                shader_module,
+                WebShaderCompilationInfo::Wgsl {
+                    source: code.to_string(),
+                },
+            ))
+        } else {
+            Err(crate::CompilationInfo {
+                messages: vec![crate::CompilationMessage {
+                    message:
+                        "Passthrough shader not compiled for WGSL on WebGPU backend (WGPU error)"
+                            .to_string(),
+                    location: None,
+                    message_type: crate::CompilationMessageType::Error,
+                }],
+            })
+        };
+        let (descriptor, compilation_info) = match shader_module_result {
+            Ok(v) => v,
+            Err(compilation_info) => (
+                webgpu_sys::GpuShaderModuleDescriptor::new(""),
+                WebShaderCompilationInfo::Transformed { compilation_info },
+            ),
+        };
+        if let Some(label) = desc.label {
+            descriptor.set_label(label);
+        }
+        WebShaderModule {
+            module: self.inner.create_shader_module(&descriptor),
+            compilation_info,
+            ident: crate::cmp::Identifier::create(),
+        }
+        .into()
     }
 
     fn create_bind_group_layout(
@@ -1944,6 +1991,11 @@ impl dispatch::DeviceInterface for WebDevice {
                         mapped_entry.set_storage_texture(&storage_texture);
                     }
                     wgt::BindingType::AccelerationStructure { .. } => todo!(),
+                    wgt::BindingType::ExternalTexture => {
+                        mapped_entry.set_external_texture(
+                            &webgpu_sys::GpuExternalTextureBindingLayout::new(),
+                        );
+                    }
                 }
 
                 mapped_entry
@@ -2005,6 +2057,9 @@ impl dispatch::DeviceInterface for WebDevice {
                     }
                     crate::BindingResource::AccelerationStructure(_) => {
                         unimplemented!("Raytracing not implemented for web")
+                    }
+                    crate::BindingResource::ExternalTexture(_) => {
+                        unimplemented!("ExternalTexture not implemented for web")
                     }
                 };
 
@@ -2160,6 +2215,13 @@ impl dispatch::DeviceInterface for WebDevice {
         .into()
     }
 
+    fn create_mesh_pipeline(
+        &self,
+        _desc: &crate::MeshPipelineDescriptor<'_>,
+    ) -> dispatch::DispatchRenderPipeline {
+        panic!("MESH_SHADER feature must be enabled to call create_mesh_pipeline")
+    }
+
     fn create_compute_pipeline(
         &self,
         desc: &crate::ComputePipelineDescriptor<'_>,
@@ -2238,6 +2300,14 @@ impl dispatch::DeviceInterface for WebDevice {
             ident: crate::cmp::Identifier::create(),
         }
         .into()
+    }
+
+    fn create_external_texture(
+        &self,
+        _desc: &crate::ExternalTextureDescriptor<'_>,
+        _planes: &[&crate::TextureView],
+    ) -> dispatch::DispatchExternalTexture {
+        unimplemented!("ExternalTexture not implemented for web");
     }
 
     fn create_blas(
@@ -2369,16 +2439,20 @@ impl dispatch::DeviceInterface for WebDevice {
             );
         });
         let _ = self.inner.lost().then(&closure);
+        // Release memory management of this closure from Rust to the JS GC.
+        // TODO: This will leak if weak references is not supported.
+        closure.forget();
     }
 
-    fn on_uncaptured_error(&self, handler: Box<dyn crate::UncapturedErrorHandler>) {
+    fn on_uncaptured_error(&self, handler: Arc<dyn crate::UncapturedErrorHandler>) {
         let f = Closure::wrap(Box::new(move |event: webgpu_sys::GpuUncapturedErrorEvent| {
             let error = crate::Error::from_js(event.error().value_of());
             handler(error);
         }) as Box<dyn FnMut(_)>);
         self.inner
             .set_onuncapturederror(Some(f.as_ref().unchecked_ref()));
-        // TODO: This will leak the memory associated with the error handler by default.
+        // Release memory management of this closure from Rust to the JS GC.
+        // TODO: This will leak if weak references is not supported.
         f.forget();
     }
 
@@ -2486,16 +2560,12 @@ impl dispatch::QueueInterface for WebQueue {
         }
         let write_size = u64::from(size);
         if write_size % wgt::COPY_BUFFER_ALIGNMENT != 0 {
-            log::error!(
-                "Copy size {} does not respect `COPY_BUFFER_ALIGNMENT`",
-                size
-            );
+            log::error!("Copy size {size} does not respect `COPY_BUFFER_ALIGNMENT`");
             return None;
         }
         if offset % wgt::COPY_BUFFER_ALIGNMENT != 0 {
             log::error!(
-                "Buffer offset {} is not aligned to block size or `COPY_BUFFER_ALIGNMENT`",
-                offset
+                "Buffer offset {offset} is not aligned to block size or `COPY_BUFFER_ALIGNMENT`"
             );
             return None;
         }
@@ -2587,8 +2657,24 @@ impl dispatch::QueueInterface for WebQueue {
         1.0
     }
 
-    fn on_submitted_work_done(&self, _callback: dispatch::BoxSubmittedWorkDoneCallback) {
-        unimplemented!("on_submitted_work_done is not yet implemented");
+    fn on_submitted_work_done(&self, callback: dispatch::BoxSubmittedWorkDoneCallback) {
+        let promise = self.inner.on_submitted_work_done();
+        wasm_bindgen_futures::spawn_local(async move {
+            match wasm_bindgen_futures::JsFuture::from(promise).await {
+                Ok(_) => callback(),
+                Err(error) => {
+                    log::error!("on_submitted_work_done promise failed: {error:?}");
+                    callback();
+                }
+            }
+        });
+    }
+
+    fn compact_blas(
+        &self,
+        _blas: &dispatch::DispatchBlas,
+    ) -> (Option<u64>, dispatch::DispatchBlas) {
+        unimplemented!("Raytracing not implemented for web")
     }
 }
 impl Drop for WebQueue {
@@ -2667,21 +2753,13 @@ impl dispatch::BufferInterface for WebBuffer {
         sub_range: Range<crate::BufferAddress>,
     ) -> dispatch::DispatchBufferMappedRange {
         let actual_mapping = self.get_mapped_range(sub_range);
-        let temporary_mapping = actual_mapping.to_vec();
         WebBufferMappedRange {
             actual_mapping,
-            temporary_mapping,
+            temporary_mapping: OnceCell::new(),
             temporary_mapping_modified: false,
             ident: crate::cmp::Identifier::create(),
         }
         .into()
-    }
-
-    fn get_mapped_range_as_array_buffer(
-        &self,
-        sub_range: Range<wgt::BufferAddress>,
-    ) -> Option<js_sys::ArrayBuffer> {
-        Some(self.get_mapped_array_buffer(sub_range))
     }
 
     fn unmap(&self) {
@@ -2744,7 +2822,25 @@ impl Drop for WebTexture {
     }
 }
 
-impl dispatch::BlasInterface for WebBlas {}
+impl dispatch::ExternalTextureInterface for WebExternalTexture {
+    fn destroy(&self) {
+        unimplemented!("ExternalTexture not implemented for web");
+    }
+}
+impl Drop for WebExternalTexture {
+    fn drop(&mut self) {
+        unimplemented!("ExternalTexture not implemented for web");
+    }
+}
+
+impl dispatch::BlasInterface for WebBlas {
+    fn prepare_compact_async(&self, _callback: BlasCompactCallback) {
+        unimplemented!("Raytracing not implemented for web")
+    }
+    fn ready_for_compaction(&self) -> bool {
+        unimplemented!("Raytracing not implemented for web")
+    }
+}
 impl Drop for WebBlas {
     fn drop(&mut self) {
         // no-op
@@ -3107,18 +3203,10 @@ impl dispatch::CommandEncoderInterface for WebCommandEncoder {
         unimplemented!("Raytracing not implemented for web");
     }
 
-    fn build_acceleration_structures_unsafe_tlas<'a>(
-        &self,
-        _blas: &mut dyn Iterator<Item = &'a crate::BlasBuildEntry<'a>>,
-        _tlas: &mut dyn Iterator<Item = &'a crate::TlasBuildEntry<'a>>,
-    ) {
-        unimplemented!("Raytracing not implemented for web");
-    }
-
     fn build_acceleration_structures<'a>(
         &self,
         _blas: &mut dyn Iterator<Item = &'a crate::BlasBuildEntry<'a>>,
-        _tlas: &mut dyn Iterator<Item = &'a crate::TlasPackage>,
+        _tlas: &mut dyn Iterator<Item = &'a crate::Tlas>,
     ) {
         unimplemented!("Raytracing not implemented for web");
     }
@@ -3375,6 +3463,10 @@ impl dispatch::RenderPassInterface for WebRenderPassEncoder {
             )
     }
 
+    fn draw_mesh_tasks(&mut self, _group_count_x: u32, _group_count_y: u32, _group_count_z: u32) {
+        panic!("MESH_SHADER feature must be enabled to call draw_mesh_tasks")
+    }
+
     fn draw_indirect(
         &mut self,
         indirect_buffer: &dispatch::DispatchBuffer,
@@ -3393,6 +3485,14 @@ impl dispatch::RenderPassInterface for WebRenderPassEncoder {
         let buffer = indirect_buffer.as_webgpu();
         self.inner
             .draw_indexed_indirect_with_f64(&buffer.inner, indirect_offset as f64);
+    }
+
+    fn draw_mesh_tasks_indirect(
+        &mut self,
+        _indirect_buffer: &dispatch::DispatchBuffer,
+        _indirect_offset: crate::BufferAddress,
+    ) {
+        panic!("MESH_SHADER feature must be enabled to call draw_mesh_tasks_indirect")
     }
 
     fn multi_draw_indirect(
@@ -3425,6 +3525,15 @@ impl dispatch::RenderPassInterface for WebRenderPassEncoder {
         }
     }
 
+    fn multi_draw_mesh_tasks_indirect(
+        &mut self,
+        _indirect_buffer: &dispatch::DispatchBuffer,
+        _indirect_offset: crate::BufferAddress,
+        _count: u32,
+    ) {
+        panic!("MESH_SHADER feature must be enabled to call multi_draw_mesh_tasks_indirect")
+    }
+
     fn multi_draw_indirect_count(
         &mut self,
         _indirect_buffer: &dispatch::DispatchBuffer,
@@ -3447,6 +3556,17 @@ impl dispatch::RenderPassInterface for WebRenderPassEncoder {
         _max_count: u32,
     ) {
         panic!("MULTI_DRAW_INDIRECT_COUNT feature must be enabled to call multi_draw_indexed_indirect_count")
+    }
+
+    fn multi_draw_mesh_tasks_indirect_count(
+        &mut self,
+        _indirect_buffer: &dispatch::DispatchBuffer,
+        _indirect_offset: crate::BufferAddress,
+        _count_buffer: &dispatch::DispatchBuffer,
+        _count_buffer_offset: crate::BufferAddress,
+        _max_count: u32,
+    ) {
+        panic!("MESH_SHADER feature must be enabled to call multi_draw_mesh_tasks_indirect_count")
     }
 
     fn insert_debug_marker(&mut self, _label: &str) {
@@ -3794,13 +3914,22 @@ impl Drop for WebSurfaceOutputDetail {
 impl dispatch::BufferMappedRangeInterface for WebBufferMappedRange {
     #[inline]
     fn slice(&self) -> &[u8] {
-        &self.temporary_mapping
+        self.temporary_mapping
+            .get_or_init(|| self.actual_mapping.to_vec())
+            .as_slice()
     }
 
     #[inline]
     fn slice_mut(&mut self) -> &mut [u8] {
         self.temporary_mapping_modified = true;
-        &mut self.temporary_mapping
+        self.temporary_mapping
+            .get_or_init(|| self.actual_mapping.to_vec());
+        self.temporary_mapping.get_mut().unwrap()
+    }
+
+    #[inline]
+    fn as_uint8array(&self) -> &js_sys::Uint8Array {
+        &self.actual_mapping
     }
 }
 impl Drop for WebBufferMappedRange {
@@ -3813,7 +3942,7 @@ impl Drop for WebBufferMappedRange {
 
         // Copy from the temporary mapping back into the array buffer that was
         // originally provided by the browser
-        let temporary_mapping_slice = self.temporary_mapping.as_slice();
+        let temporary_mapping_slice = self.temporary_mapping.get().unwrap().as_slice();
         unsafe {
             // Note: no allocations can happen between `view` and `set`, or this
             // will break

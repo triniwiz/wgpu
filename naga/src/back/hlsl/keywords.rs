@@ -826,6 +826,7 @@ pub const RESERVED: &[&str] = &[
     super::writer::INSERT_BITS_FUNCTION,
     super::writer::SAMPLER_HEAP_VAR,
     super::writer::COMPARISON_SAMPLER_HEAP_VAR,
+    super::writer::SAMPLE_EXTERNAL_TEXTURE_FUNCTION,
     super::writer::ABS_FUNCTION,
     super::writer::DIV_FUNCTION,
     super::writer::MOD_FUNCTION,
@@ -834,6 +835,8 @@ pub const RESERVED: &[&str] = &[
     super::writer::F2U32_FUNCTION,
     super::writer::F2I64_FUNCTION,
     super::writer::F2U64_FUNCTION,
+    super::writer::IMAGE_LOAD_EXTERNAL_FUNCTION,
+    super::writer::IMAGE_SAMPLE_BASE_CLAMP_TO_EDGE_FUNCTION,
 ];
 
 // DXC scalar types, from https://github.com/microsoft/DirectXShaderCompiler/blob/18c9e114f9c314f93e68fbc72ce207d4ed2e65ae/tools/clang/lib/AST/ASTContextHLSL.cpp#L48-L254

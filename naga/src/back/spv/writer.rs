@@ -1,8 +1,4 @@
-use alloc::{
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
+use alloc::{string::String, vec, vec::Vec};
 
 use hashbrown::hash_map::Entry;
 use spirv::Word;
@@ -18,6 +14,7 @@ use super::{
 use crate::{
     arena::{Handle, HandleVec, UniqueArena},
     back::spv::{BindingInfo, WrappedFunction},
+    path_like::PathLike,
     proc::{Alignment, TypeResolution},
     valid::{FunctionInfo, ModuleInfo},
 };
@@ -81,6 +78,7 @@ impl Writer {
             bounds_check_policies: options.bounds_check_policies,
             zero_initialize_workgroup_memory: options.zero_initialize_workgroup_memory,
             force_loop_bounding: options.force_loop_bounding,
+            use_storage_input_output_16: options.use_storage_input_output_16,
             void_type,
             lookup_type: crate::FastHashMap::default(),
             lookup_function: crate::FastHashMap::default(),
@@ -95,6 +93,9 @@ impl Writer {
             temp_list: Vec::new(),
             ray_get_committed_intersection_function: None,
             ray_get_candidate_intersection_function: None,
+            io_f16_polyfills: super::f16_polyfill::F16IoPolyfill::new(
+                options.use_storage_input_output_16,
+            ),
         })
     }
 
@@ -128,6 +129,7 @@ impl Writer {
             bounds_check_policies: self.bounds_check_policies,
             zero_initialize_workgroup_memory: self.zero_initialize_workgroup_memory,
             force_loop_bounding: self.force_loop_bounding,
+            use_storage_input_output_16: self.use_storage_input_output_16,
             capabilities_available: take(&mut self.capabilities_available),
             binding_map: take(&mut self.binding_map),
 
@@ -154,6 +156,7 @@ impl Writer {
             temp_list: take(&mut self.temp_list).recycle(),
             ray_get_candidate_intersection_function: None,
             ray_get_committed_intersection_function: None,
+            io_f16_polyfills: take(&mut self.io_f16_polyfills).recycle(),
         };
 
         *self = fresh;
@@ -301,25 +304,9 @@ impl Writer {
         self.get_pointer_type_id(base_id, class)
     }
 
-    pub(super) fn get_ray_query_pointer_id(&mut self, module: &crate::Module) -> Word {
-        let rq_ty = module
-            .types
-            .get(&crate::Type {
-                name: None,
-                inner: crate::TypeInner::RayQuery {
-                    vertex_return: false,
-                },
-            })
-            .or_else(|| {
-                module.types.get(&crate::Type {
-                    name: None,
-                    inner: crate::TypeInner::RayQuery {
-                        vertex_return: true,
-                    },
-                })
-            })
-            .expect("ray_query type should have been populated by the variable passed into this!");
-        self.get_handle_pointer_type_id(rq_ty, spirv::StorageClass::Function)
+    pub(super) fn get_ray_query_pointer_id(&mut self) -> Word {
+        let rq_id = self.get_type_id(LookupType::Local(LocalType::RayQuery));
+        self.get_pointer_type_id(rq_id, spirv::StorageClass::Function)
     }
 
     /// Return a SPIR-V type for a pointer to `resolution`.
@@ -351,6 +338,13 @@ impl Writer {
         self.get_numeric_type_id(NumericType::Vector {
             size: crate::VectorSize::Bi,
             scalar: crate::Scalar::U32,
+        })
+    }
+
+    pub(super) fn get_vec2f_type_id(&mut self) -> Word {
+        self.get_numeric_type_id(NumericType::Vector {
+            size: crate::VectorSize::Bi,
+            scalar: crate::Scalar::F32,
         })
     }
 
@@ -738,10 +732,11 @@ impl Writer {
                         binding,
                     )?;
                     iface.varying_ids.push(varying_id);
-                    let id = self.id_gen.next();
-                    prelude
-                        .body
-                        .push(Instruction::load(argument_type_id, id, varying_id, None));
+                    let id = self.load_io_with_f16_polyfill(
+                        &mut prelude.body,
+                        varying_id,
+                        argument_type_id,
+                    );
 
                     if binding == &crate::Binding::BuiltIn(crate::BuiltIn::LocalInvocationId) {
                         local_invocation_id = Some(id);
@@ -766,13 +761,11 @@ impl Writer {
                             binding,
                         )?;
                         iface.varying_ids.push(varying_id);
-                        let id = self.id_gen.next();
-                        prelude
-                            .body
-                            .push(Instruction::load(type_id, id, varying_id, None));
+                        let id =
+                            self.load_io_with_f16_polyfill(&mut prelude.body, varying_id, type_id);
                         constituent_ids.push(id);
 
-                        if binding == &crate::Binding::BuiltIn(crate::BuiltIn::GlobalInvocationId) {
+                        if binding == &crate::Binding::BuiltIn(crate::BuiltIn::LocalInvocationId) {
                             local_invocation_id = Some(id);
                         }
                     }
@@ -1232,8 +1225,10 @@ impl Writer {
                         .insert(spirv::Capability::StorageBuffer16BitAccess);
                     self.capabilities_used
                         .insert(spirv::Capability::UniformAndStorageBuffer16BitAccess);
-                    self.capabilities_used
-                        .insert(spirv::Capability::StorageInputOutput16);
+                    if self.use_storage_input_output_16 {
+                        self.capabilities_used
+                            .insert(spirv::Capability::StorageInputOutput16);
+                    }
                 }
                 Instruction::type_float(id, bits)
             }
@@ -1258,6 +1253,7 @@ impl Writer {
                         self.request_image_format_capabilities(format.into())?;
                         false
                     }
+                    crate::ImageClass::External => unimplemented!(),
                 };
 
                 match dim {
@@ -1711,9 +1707,11 @@ impl Writer {
         Ok(id)
     }
 
-    pub(super) fn write_barrier(&mut self, flags: crate::Barrier, block: &mut Block) {
+    pub(super) fn write_control_barrier(&mut self, flags: crate::Barrier, block: &mut Block) {
         let memory_scope = if flags.contains(crate::Barrier::STORAGE) {
             spirv::Scope::Device
+        } else if flags.contains(crate::Barrier::SUB_GROUP) {
+            spirv::Scope::Subgroup
         } else {
             spirv::Scope::Workgroup
         };
@@ -1725,6 +1723,10 @@ impl Writer {
         semantics.set(
             spirv::MemorySemantics::WORKGROUP_MEMORY,
             flags.contains(crate::Barrier::WORK_GROUP),
+        );
+        semantics.set(
+            spirv::MemorySemantics::SUBGROUP_MEMORY,
+            flags.contains(crate::Barrier::SUB_GROUP),
         );
         semantics.set(
             spirv::MemorySemantics::IMAGE_MEMORY,
@@ -1742,6 +1744,37 @@ impl Writer {
             mem_scope_id,
             semantics_id,
         ));
+    }
+
+    pub(super) fn write_memory_barrier(&mut self, flags: crate::Barrier, block: &mut Block) {
+        let mut semantics = spirv::MemorySemantics::ACQUIRE_RELEASE;
+        semantics.set(
+            spirv::MemorySemantics::UNIFORM_MEMORY,
+            flags.contains(crate::Barrier::STORAGE),
+        );
+        semantics.set(
+            spirv::MemorySemantics::WORKGROUP_MEMORY,
+            flags.contains(crate::Barrier::WORK_GROUP),
+        );
+        semantics.set(
+            spirv::MemorySemantics::SUBGROUP_MEMORY,
+            flags.contains(crate::Barrier::SUB_GROUP),
+        );
+        semantics.set(
+            spirv::MemorySemantics::IMAGE_MEMORY,
+            flags.contains(crate::Barrier::TEXTURE),
+        );
+        let mem_scope_id = if flags.contains(crate::Barrier::STORAGE) {
+            self.get_index_constant(spirv::Scope::Device as u32)
+        } else if flags.contains(crate::Barrier::SUB_GROUP) {
+            self.get_index_constant(spirv::Scope::Subgroup as u32)
+        } else {
+            self.get_index_constant(spirv::Scope::Workgroup as u32)
+        };
+        let semantics_id = self.get_index_constant(semantics.bits());
+        block
+            .body
+            .push(Instruction::memory_barrier(mem_scope_id, semantics_id));
     }
 
     fn generate_workgroup_vars_init_block(
@@ -1844,7 +1877,7 @@ impl Writer {
 
         let mut post_if_block = Block::new(merge_id);
 
-        self.write_barrier(crate::Barrier::WORK_GROUP, &mut post_if_block);
+        self.write_control_barrier(crate::Barrier::WORK_GROUP, &mut post_if_block);
 
         let next_id = self.id_gen.next();
         function.consume(post_if_block, Instruction::branch(next_id));
@@ -1879,8 +1912,26 @@ impl Writer {
         ty: Handle<crate::Type>,
         binding: &crate::Binding,
     ) -> Result<Word, Error> {
+        use crate::TypeInner;
+
         let id = self.id_gen.next();
-        let pointer_type_id = self.get_handle_pointer_type_id(ty, class);
+        let ty_inner = &ir_module.types[ty].inner;
+        let needs_polyfill = self.needs_f16_polyfill(ty_inner);
+
+        let pointer_type_id = if needs_polyfill {
+            let f32_value_local =
+                super::f16_polyfill::F16IoPolyfill::create_polyfill_type(ty_inner)
+                    .expect("needs_polyfill returned true but create_polyfill_type returned None");
+
+            let f32_type_id = self.get_localtype_id(f32_value_local);
+            let ptr_id = self.get_pointer_type_id(f32_type_id, class);
+            self.io_f16_polyfills.register_io_var(id, f32_type_id);
+
+            ptr_id
+        } else {
+            self.get_handle_pointer_type_id(ty, class)
+        };
+
         Instruction::variable(pointer_type_id, id, class, None)
             .to_words(&mut self.logical_layout.declarations);
 
@@ -2063,8 +2114,9 @@ impl Writer {
                 // > shader, must be decorated Flat
                 if class == spirv::StorageClass::Input && stage == crate::ShaderStage::Fragment {
                     let is_flat = match ir_module.types[ty].inner {
-                        crate::TypeInner::Scalar(scalar)
-                        | crate::TypeInner::Vector { scalar, .. } => match scalar.kind {
+                        TypeInner::Scalar(scalar) | TypeInner::Vector { scalar, .. } => match scalar
+                            .kind
+                        {
                             Sk::Uint | Sk::Sint | Sk::Bool => true,
                             Sk::Float => false,
                             Sk::AbstractInt | Sk::AbstractFloat => {
@@ -2084,6 +2136,49 @@ impl Writer {
         }
 
         Ok(id)
+    }
+
+    /// Load an IO variable, converting from `f32` to `f16` if polyfill is active.
+    /// Returns the id of the loaded value matching `target_type_id`.
+    pub(super) fn load_io_with_f16_polyfill(
+        &mut self,
+        body: &mut Vec<Instruction>,
+        varying_id: Word,
+        target_type_id: Word,
+    ) -> Word {
+        let tmp = self.id_gen.next();
+        if let Some(f32_ty) = self.io_f16_polyfills.get_f32_io_type(varying_id) {
+            body.push(Instruction::load(f32_ty, tmp, varying_id, None));
+            let converted = self.id_gen.next();
+            super::f16_polyfill::F16IoPolyfill::emit_f32_to_f16_conversion(
+                tmp,
+                target_type_id,
+                converted,
+                body,
+            );
+            converted
+        } else {
+            body.push(Instruction::load(target_type_id, tmp, varying_id, None));
+            tmp
+        }
+    }
+
+    /// Store an IO variable, converting from `f16` to `f32` if polyfill is active.
+    pub(super) fn store_io_with_f16_polyfill(
+        &mut self,
+        body: &mut Vec<Instruction>,
+        varying_id: Word,
+        value_id: Word,
+    ) {
+        if let Some(f32_ty) = self.io_f16_polyfills.get_f32_io_type(varying_id) {
+            let converted = self.id_gen.next();
+            super::f16_polyfill::F16IoPolyfill::emit_f16_to_f32_conversion(
+                value_id, f32_ty, converted, body,
+            );
+            body.push(Instruction::store(varying_id, converted, None));
+        } else {
+            body.push(Instruction::store(varying_id, value_id, None));
+        }
     }
 
     fn write_global_variable(
@@ -2387,7 +2482,7 @@ impl Writer {
             if let Some(debug_info) = debug_info.as_ref() {
                 let source_file_id = self.id_gen.next();
                 self.debugs.push(Instruction::string(
-                    &debug_info.file_name.display().to_string(),
+                    &debug_info.file_name.to_string_lossy(),
                     source_file_id,
                 ));
 
@@ -2558,6 +2653,10 @@ impl Writer {
         self.use_extension("SPV_EXT_descriptor_indexing");
         self.decorate(id, spirv::Decoration::NonUniform, &[]);
         Ok(())
+    }
+
+    pub(super) fn needs_f16_polyfill(&self, ty_inner: &crate::TypeInner) -> bool {
+        self.io_f16_polyfills.needs_polyfill(ty_inner)
     }
 }
 

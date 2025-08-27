@@ -237,7 +237,7 @@ impl Writer {
                 }
             };
 
-            body.push(Instruction::store(res_member.id, member_value_id, None));
+            self.store_io_with_f16_polyfill(body, res_member.id, member_value_id);
 
             match res_member.built_in {
                 Some(crate::BuiltIn::Position { .. })
@@ -675,7 +675,7 @@ impl BlockContext<'_> {
                         load_id
                     }
                     ref other => {
-                        log::error!("Unable to access index of {:?}", other);
+                        log::error!("Unable to access index of {other:?}");
                         return Err(Error::FeatureNotImplemented("access index for type"));
                     }
                 }
@@ -1661,6 +1661,7 @@ impl BlockContext<'_> {
                 offset,
                 level,
                 depth_ref,
+                clamp_to_edge,
             } => self.write_image_sample(
                 result_type_id,
                 image,
@@ -1671,6 +1672,7 @@ impl BlockContext<'_> {
                 offset,
                 level,
                 depth_ref,
+                clamp_to_edge,
                 block,
             )?,
             crate::Expression::Select {
@@ -1891,7 +1893,7 @@ impl BlockContext<'_> {
             crate::TypeInner::Scalar(scalar) => (scalar, None),
             crate::TypeInner::Vector { scalar, size } => (scalar, Some(size)),
             ref other => {
-                log::error!("As source {:?}", other);
+                log::error!("As source {other:?}");
                 return Err(Error::Validation("Unexpected Expression::As source"));
             }
         };
@@ -2977,62 +2979,69 @@ impl BlockContext<'_> {
                     ref accept,
                     ref reject,
                 } => {
-                    let condition_id = self.cached[condition];
+                    // In spirv 1.6, in a conditional branch the two block ids
+                    // of the branches can't have the same label. If `accept`
+                    // and `reject` are both empty (e.g. in `if (condition) {}`)
+                    // merge id will be both labels. Because both branches are
+                    // empty, we can skip the if statement.
+                    if !(accept.is_empty() && reject.is_empty()) {
+                        let condition_id = self.cached[condition];
 
-                    let merge_id = self.gen_id();
-                    block.body.push(Instruction::selection_merge(
-                        merge_id,
-                        spirv::SelectionControl::NONE,
-                    ));
+                        let merge_id = self.gen_id();
+                        block.body.push(Instruction::selection_merge(
+                            merge_id,
+                            spirv::SelectionControl::NONE,
+                        ));
 
-                    let accept_id = if accept.is_empty() {
-                        None
-                    } else {
-                        Some(self.gen_id())
-                    };
-                    let reject_id = if reject.is_empty() {
-                        None
-                    } else {
-                        Some(self.gen_id())
-                    };
+                        let accept_id = if accept.is_empty() {
+                            None
+                        } else {
+                            Some(self.gen_id())
+                        };
+                        let reject_id = if reject.is_empty() {
+                            None
+                        } else {
+                            Some(self.gen_id())
+                        };
 
-                    self.function.consume(
-                        block,
-                        Instruction::branch_conditional(
-                            condition_id,
-                            accept_id.unwrap_or(merge_id),
-                            reject_id.unwrap_or(merge_id),
-                        ),
-                    );
+                        self.function.consume(
+                            block,
+                            Instruction::branch_conditional(
+                                condition_id,
+                                accept_id.unwrap_or(merge_id),
+                                reject_id.unwrap_or(merge_id),
+                            ),
+                        );
 
-                    if let Some(block_id) = accept_id {
-                        // We can ignore the `BlockExitDisposition` returned here because,
-                        // even if `merge_id` is not actually reachable, it is always
-                        // referred to by the `OpSelectionMerge` instruction we emitted
-                        // earlier.
-                        let _ = self.write_block(
-                            block_id,
-                            accept,
-                            BlockExit::Branch { target: merge_id },
-                            loop_context,
-                            debug_info,
-                        )?;
+                        if let Some(block_id) = accept_id {
+                            // We can ignore the `BlockExitDisposition` returned here because,
+                            // even if `merge_id` is not actually reachable, it is always
+                            // referred to by the `OpSelectionMerge` instruction we emitted
+                            // earlier.
+                            let _ = self.write_block(
+                                block_id,
+                                accept,
+                                BlockExit::Branch { target: merge_id },
+                                loop_context,
+                                debug_info,
+                            )?;
+                        }
+                        if let Some(block_id) = reject_id {
+                            // We can ignore the `BlockExitDisposition` returned here because,
+                            // even if `merge_id` is not actually reachable, it is always
+                            // referred to by the `OpSelectionMerge` instruction we emitted
+                            // earlier.
+                            let _ = self.write_block(
+                                block_id,
+                                reject,
+                                BlockExit::Branch { target: merge_id },
+                                loop_context,
+                                debug_info,
+                            )?;
+                        }
+
+                        block = Block::new(merge_id);
                     }
-                    if let Some(block_id) = reject_id {
-                        // We can ignore the `BlockExitDisposition` returned here because,
-                        // even if `merge_id` is not actually reachable, it is always
-                        // referred to by the `OpSelectionMerge` instruction we emitted
-                        // earlier.
-                        let _ = self.write_block(
-                            block_id,
-                            reject,
-                            BlockExit::Branch { target: merge_id },
-                            loop_context,
-                            debug_info,
-                        )?;
-                    }
-
-                    block = Block::new(merge_id);
                 }
                 Statement::Switch {
                     selector,
@@ -3240,8 +3249,11 @@ impl BlockContext<'_> {
                     self.function.consume(block, Instruction::kill());
                     return Ok(BlockExitDisposition::Discarded);
                 }
-                Statement::Barrier(flags) => {
-                    self.writer.write_barrier(flags, &mut block);
+                Statement::ControlBarrier(flags) => {
+                    self.writer.write_control_barrier(flags, &mut block);
+                }
+                Statement::MemoryBarrier(flags) => {
+                    self.writer.write_memory_barrier(flags, &mut block);
                 }
                 Statement::Store { pointer, value } => {
                     let value_id = self.cached[value];
@@ -3576,7 +3588,7 @@ impl BlockContext<'_> {
                 }
                 Statement::WorkGroupUniformLoad { pointer, result } => {
                     self.writer
-                        .write_barrier(crate::Barrier::WORK_GROUP, &mut block);
+                        .write_control_barrier(crate::Barrier::WORK_GROUP, &mut block);
                     let result_type_id = self.get_expression_type_id(&self.fun_info[result].ty);
                     // Embed the body of
                     match self.write_access_chain(
@@ -3616,7 +3628,7 @@ impl BlockContext<'_> {
                         }
                     }
                     self.writer
-                        .write_barrier(crate::Barrier::WORK_GROUP, &mut block);
+                        .write_control_barrier(crate::Barrier::WORK_GROUP, &mut block);
                 }
                 Statement::RayQuery { query, ref fun } => {
                     self.write_ray_query_function(query, fun, &mut block);

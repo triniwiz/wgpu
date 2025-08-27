@@ -4,16 +4,18 @@ use core::{
     ops::{Bound, Deref, DerefMut, Range, RangeBounds},
 };
 
-use parking_lot::Mutex;
-
+use crate::util::Mutex;
 use crate::*;
 
 /// Handle to a GPU-accessible buffer.
 ///
-/// Created with [`Device::create_buffer`] or
-/// [`DeviceExt::create_buffer_init`](util::DeviceExt::create_buffer_init).
-///
-/// Corresponds to [WebGPU `GPUBuffer`](https://gpuweb.github.io/gpuweb/#buffer-interface).
+/// A `Buffer` is a memory allocation for use by the GPU, somewhat analogous to
+/// <code>[Box]&lt;[\[u8\]][primitive@slice]&gt;</code> in Rust.
+/// The contents of buffers are untyped bytes; it is up to the application to
+/// specify the interpretation of the bytes when the buffer is used, in ways
+/// such as [`VertexBufferLayout`].
+/// A single buffer can be used to hold multiple independent pieces of data at
+/// different offsets (e.g. both vertices and indices for one or more meshes).
 ///
 /// A `Buffer`'s bytes have "interior mutability": functions like
 /// [`Queue::write_buffer`] or [mapping] a buffer for writing only require a
@@ -21,7 +23,48 @@ use crate::*;
 /// prevents simultaneous reads and writes of buffer contents using run-time
 /// checks.
 ///
+/// Created with [`Device::create_buffer()`] or
+/// [`DeviceExt::create_buffer_init()`].
+///
+/// Corresponds to [WebGPU `GPUBuffer`](https://gpuweb.github.io/gpuweb/#buffer-interface).
+///
 /// [mapping]: Buffer#mapping-buffers
+///
+/// # How to get your data into a buffer
+///
+/// Every `Buffer` starts with all bytes zeroed.
+/// There are many ways to load data into a `Buffer`:
+///
+/// - When creating a buffer, you may set the [`mapped_at_creation`][mac] flag,
+///   then write to its [`get_mapped_range_mut()`][Buffer::get_mapped_range_mut].
+///   This only works when the buffer is created and has not yet been used by
+///   the GPU, but it is all you need for buffers whose contents do not change
+///   after creation.
+///   - You may use [`DeviceExt::create_buffer_init()`] as a convenient way to
+///     do that and copy data from a `&[u8]` you provide.
+/// - After creation, you may use [`Buffer::map_async()`] to map it again;
+///   however, you then need to wait until the GPU is no longer using the buffer
+///   before you begin writing.
+/// - You may use [`CommandEncoder::copy_buffer_to_buffer()`] to copy data into
+///   this buffer from another buffer.
+/// - You may use [`Queue::write_buffer()`] to copy data into the buffer from a
+///   `&[u8]`. This uses a temporary “staging” buffer managed by `wgpu` to hold
+///   the data.
+///   - [`Queue::write_buffer_with()`] allows you to write directly into temporary
+///     storage instead of providing a slice you already prepared, which may
+///     allow *your* code to save the allocation of a [`Vec`] or such.
+/// - You may use [`util::StagingBelt`] to manage a set of temporary buffers.
+///   This may be more efficient than [`Queue::write_buffer_with()`] when you
+///   have many small copies to perform, but requires more steps to use, and
+///   tuning of the belt buffer size.
+/// - You may write your own staging buffer management customized to your
+///   application, based on mapped buffers and
+///   [`CommandEncoder::copy_buffer_to_buffer()`].
+/// - A GPU computation’s results can be stored in a buffer:
+///   - A [compute shader][ComputePipeline] may write to a buffer bound as a
+///     [storage buffer][BufferBindingType::Storage].
+///   - A render pass may render to a texture which is then copied to a buffer
+///     using [`CommandEncoder::copy_texture_to_buffer()`].
 ///
 /// # Mapping buffers
 ///
@@ -173,6 +216,7 @@ use crate::*;
 /// [mac]: BufferDescriptor::mapped_at_creation
 /// [`MAP_READ`]: BufferUsages::MAP_READ
 /// [`MAP_WRITE`]: BufferUsages::MAP_WRITE
+/// [`DeviceExt::create_buffer_init()`]: util::DeviceExt::create_buffer_init
 #[derive(Debug, Clone)]
 pub struct Buffer {
     pub(crate) inner: dispatch::DispatchBuffer,
@@ -201,26 +245,50 @@ impl Buffer {
         }
     }
 
-    /// Returns the inner hal Buffer using a callback. The hal buffer will be `None` if the
-    /// backend type argument does not match with this wgpu Buffer
+    /// Get the [`wgpu_hal`] buffer from this `Buffer`.
+    ///
+    /// Find the Api struct corresponding to the active backend in [`wgpu_hal::api`],
+    /// and pass that struct to the to the `A` type parameter.
+    ///
+    /// Returns a guard that dereferences to the type of the hal backend
+    /// which implements [`A::Buffer`].
+    ///
+    /// # Types
+    ///
+    /// The returned type depends on the backend:
+    ///
+    #[doc = crate::hal_type_vulkan!("Buffer")]
+    #[doc = crate::hal_type_metal!("Buffer")]
+    #[doc = crate::hal_type_dx12!("Buffer")]
+    #[doc = crate::hal_type_gles!("Buffer")]
+    ///
+    /// # Deadlocks
+    ///
+    /// - The returned guard holds a read-lock on a device-local "destruction"
+    ///   lock, which will cause all calls to `destroy` to block until the
+    ///   guard is released.
+    ///
+    /// # Errors
+    ///
+    /// This method will return None if:
+    /// - The buffer is not from the backend specified by `A`.
+    /// - The buffer is from the `webgpu` or `custom` backend.
+    /// - The buffer has had [`Self::destroy()`] called on it.
     ///
     /// # Safety
     ///
-    /// - The raw handle obtained from the hal Buffer must not be manually destroyed
+    /// - The returned resource must not be destroyed unless the guard
+    ///   is the last reference to it and it is not in use by the GPU.
+    ///   The guard and handle may be dropped at any time however.
+    /// - All the safety requirements of wgpu-hal must be upheld.
+    ///
+    /// [`A::Buffer`]: hal::Api::Buffer
     #[cfg(wgpu_core)]
-    pub unsafe fn as_hal<A: wgc::hal_api::HalApi, F: FnOnce(Option<&A::Buffer>) -> R, R>(
+    pub unsafe fn as_hal<A: hal::Api>(
         &self,
-        hal_buffer_callback: F,
-    ) -> R {
-        if let Some(buffer) = self.inner.as_core_opt() {
-            unsafe {
-                buffer
-                    .context
-                    .buffer_as_hal::<A, F, R>(buffer, hal_buffer_callback)
-            }
-        } else {
-            hal_buffer_callback(None)
-        }
+    ) -> Option<impl Deref<Target = A::Buffer> + WasmNotSendSync> {
+        let buffer = self.inner.as_core_opt()?;
+        unsafe { buffer.context.buffer_as_hal::<A>(buffer) }
     }
 
     /// Returns a [`BufferSlice`] referring to the portion of `self`'s contents
@@ -331,35 +399,8 @@ impl Buffer {
     /// - If you try to create overlapping views of a buffer, mutable or otherwise.
     ///
     /// [mapped]: Buffer#mapping-buffers
-    pub fn get_mapped_range<S: RangeBounds<BufferAddress>>(&self, bounds: S) -> BufferView<'_> {
+    pub fn get_mapped_range<S: RangeBounds<BufferAddress>>(&self, bounds: S) -> BufferView {
         self.slice(bounds).get_mapped_range()
-    }
-
-    /// Synchronously and immediately map a buffer for reading. If the buffer is not immediately mappable
-    /// through [`BufferDescriptor::mapped_at_creation`] or [`BufferSlice::map_async`], will fail.
-    ///
-    /// This is useful when targeting WebGPU and you want to pass mapped data directly to js.
-    /// Unlike `get_mapped_range` which unconditionally copies mapped data into the wasm heap,
-    /// this function directly hands you the ArrayBuffer that we mapped the data into in js.
-    ///
-    /// This is only available on WebGPU, on any other backends this will return `None`.
-    ///
-    /// `bounds` may be less than the bounds passed to [`Self::map_async()`],
-    /// and multiple views may be obtained and used simultaneously as long as they do not overlap.
-    ///
-    /// This can also be performed using [`BufferSlice::get_mapped_range_as_array_buffer()`].
-    ///
-    /// # Panics
-    ///
-    /// - If `bounds` is outside of the bounds of `self`.
-    /// - If `bounds` has a length less than 1.
-    /// - If the start and end of `bounds` are not aligned to [`MAP_ALIGNMENT`].
-    #[cfg(webgpu)]
-    pub fn get_mapped_range_as_array_buffer<S: RangeBounds<BufferAddress>>(
-        &self,
-        bounds: S,
-    ) -> Option<js_sys::ArrayBuffer> {
-        self.slice(bounds).get_mapped_range_as_array_buffer()
     }
 
     /// Gain write access to the bytes of a [mapped] [`Buffer`].
@@ -381,10 +422,7 @@ impl Buffer {
     /// - If you try to create overlapping views of a buffer, mutable or otherwise.
     ///
     /// [mapped]: Buffer#mapping-buffers
-    pub fn get_mapped_range_mut<S: RangeBounds<BufferAddress>>(
-        &self,
-        bounds: S,
-    ) -> BufferViewMut<'_> {
+    pub fn get_mapped_range_mut<S: RangeBounds<BufferAddress>>(&self, bounds: S) -> BufferViewMut {
         self.slice(bounds).get_mapped_range_mut()
     }
 
@@ -522,39 +560,15 @@ impl<'a> BufferSlice<'a> {
     /// - If you try to create overlapping views of a buffer, mutable or otherwise.
     ///
     /// [mapped]: Buffer#mapping-buffers
-    pub fn get_mapped_range(&self) -> BufferView<'a> {
+    pub fn get_mapped_range(&self) -> BufferView {
         let end = self.buffer.map_context.lock().add(self.offset, self.size);
         let range = self.buffer.inner.get_mapped_range(self.offset..end);
         BufferView {
-            slice: *self,
+            buffer: self.buffer.clone(),
+            size: self.size,
+            offset: self.offset,
             inner: range,
         }
-    }
-
-    /// Synchronously and immediately map a buffer for reading. If the buffer is not immediately mappable
-    /// through [`BufferDescriptor::mapped_at_creation`] or [`BufferSlice::map_async`], will fail.
-    ///
-    /// This is useful when targeting WebGPU and you want to pass mapped data directly to js.
-    /// Unlike `get_mapped_range` which unconditionally copies mapped data into the wasm heap,
-    /// this function directly hands you the ArrayBuffer that we mapped the data into in js.
-    ///
-    /// This is only available on WebGPU, on any other backends this will return `None`.
-    ///
-    /// Multiple views may be obtained and used simultaneously as long as they are from
-    /// non-overlapping slices.
-    ///
-    /// This can also be performed using [`Buffer::get_mapped_range_as_array_buffer()`].
-    ///
-    /// # Panics
-    ///
-    /// - If the endpoints of this slice are not aligned to [`MAP_ALIGNMENT`] within the buffer.
-    #[cfg(webgpu)]
-    pub fn get_mapped_range_as_array_buffer(&self) -> Option<js_sys::ArrayBuffer> {
-        let end = self.buffer.map_context.lock().add(self.offset, self.size);
-
-        self.buffer
-            .inner
-            .get_mapped_range_as_array_buffer(self.offset..end)
     }
 
     /// Gain write access to the bytes of a [mapped] [`Buffer`].
@@ -574,11 +588,13 @@ impl<'a> BufferSlice<'a> {
     /// - If you try to create overlapping views of a buffer, mutable or otherwise.
     ///
     /// [mapped]: Buffer#mapping-buffers
-    pub fn get_mapped_range_mut(&self) -> BufferViewMut<'a> {
+    pub fn get_mapped_range_mut(&self) -> BufferViewMut {
         let end = self.buffer.map_context.lock().add(self.offset, self.size);
         let range = self.buffer.inner.get_mapped_range(self.offset..end);
         BufferViewMut {
-            slice: *self,
+            buffer: self.buffer.clone(),
+            size: self.size,
+            offset: self.offset,
             inner: range,
             readable: self.buffer.usage.contains(BufferUsages::MAP_READ),
         }
@@ -755,12 +771,25 @@ static_assertions::assert_impl_all!(MapMode: Send, Sync);
 /// [map]: Buffer#mapping-buffers
 /// [`map_async`]: BufferSlice::map_async
 #[derive(Debug)]
-pub struct BufferView<'a> {
-    slice: BufferSlice<'a>,
+pub struct BufferView {
+    // `buffer, offset, size` are similar to `BufferSlice`, except that they own the buffer.
+    buffer: Buffer,
+    offset: BufferAddress,
+    size: BufferSize,
     inner: dispatch::DispatchBufferMappedRange,
 }
 
-impl core::ops::Deref for BufferView<'_> {
+#[cfg(webgpu)]
+impl BufferView {
+    /// Provides the same data as dereferencing the view, but as a `Uint8Array` in js.
+    /// This can be MUCH faster than dereferencing the view which copies the data into
+    /// the Rust / wasm heap.
+    pub fn as_uint8array(&self) -> &js_sys::Uint8Array {
+        self.inner.as_uint8array()
+    }
+}
+
+impl core::ops::Deref for BufferView {
     type Target = [u8];
 
     #[inline]
@@ -769,7 +798,7 @@ impl core::ops::Deref for BufferView<'_> {
     }
 }
 
-impl AsRef<[u8]> for BufferView<'_> {
+impl AsRef<[u8]> for BufferView {
     #[inline]
     fn as_ref(&self) -> &[u8] {
         self.inner.slice()
@@ -795,20 +824,23 @@ impl AsRef<[u8]> for BufferView<'_> {
 ///
 /// [map]: Buffer#mapping-buffers
 #[derive(Debug)]
-pub struct BufferViewMut<'a> {
-    slice: BufferSlice<'a>,
+pub struct BufferViewMut {
+    // `buffer, offset, size` are similar to `BufferSlice`, except that they own the buffer.
+    buffer: Buffer,
+    offset: BufferAddress,
+    size: BufferSize,
     inner: dispatch::DispatchBufferMappedRange,
     readable: bool,
 }
 
-impl AsMut<[u8]> for BufferViewMut<'_> {
+impl AsMut<[u8]> for BufferViewMut {
     #[inline]
     fn as_mut(&mut self) -> &mut [u8] {
         self.inner.slice_mut()
     }
 }
 
-impl Deref for BufferViewMut<'_> {
+impl Deref for BufferViewMut {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
@@ -820,29 +852,27 @@ impl Deref for BufferViewMut<'_> {
     }
 }
 
-impl DerefMut for BufferViewMut<'_> {
+impl DerefMut for BufferViewMut {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.inner.slice_mut()
     }
 }
 
-impl Drop for BufferView<'_> {
+impl Drop for BufferView {
     fn drop(&mut self) {
-        self.slice
-            .buffer
+        self.buffer
             .map_context
             .lock()
-            .remove(self.slice.offset, self.slice.size);
+            .remove(self.offset, self.size);
     }
 }
 
-impl Drop for BufferViewMut<'_> {
+impl Drop for BufferViewMut {
     fn drop(&mut self) {
-        self.slice
-            .buffer
+        self.buffer
             .map_context
             .lock()
-            .remove(self.slice.offset, self.slice.size);
+            .remove(self.offset, self.size);
     }
 }
 

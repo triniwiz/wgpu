@@ -1,8 +1,4 @@
-use alloc::{
-    string::{String, ToString as _},
-    vec,
-    vec::Vec,
-};
+use alloc::{string::String, vec::Vec};
 use core::{future::Future, marker::PhantomData};
 
 use crate::*;
@@ -98,6 +94,7 @@ impl From<crate::naga::error::ShaderError<crate::naga::front::wgsl::ParseError>>
     for CompilationInfo
 {
     fn from(value: crate::naga::error::ShaderError<crate::naga::front::wgsl::ParseError>) -> Self {
+        use alloc::{string::ToString, vec};
         CompilationInfo {
             messages: vec![CompilationMessage {
                 message: value.to_string(),
@@ -110,6 +107,7 @@ impl From<crate::naga::error::ShaderError<crate::naga::front::wgsl::ParseError>>
 #[cfg(feature = "glsl")]
 impl From<naga::error::ShaderError<naga::front::glsl::ParseErrors>> for CompilationInfo {
     fn from(value: naga::error::ShaderError<naga::front::glsl::ParseErrors>) -> Self {
+        use alloc::string::ToString;
         let messages = value
             .inner
             .errors
@@ -127,6 +125,7 @@ impl From<naga::error::ShaderError<naga::front::glsl::ParseErrors>> for Compilat
 #[cfg(feature = "spirv")]
 impl From<naga::error::ShaderError<naga::front::spv::Error>> for CompilationInfo {
     fn from(value: naga::error::ShaderError<naga::front::spv::Error>) -> Self {
+        use alloc::{string::ToString, vec};
         CompilationInfo {
             messages: vec![CompilationMessage {
                 message: value.to_string(),
@@ -148,6 +147,7 @@ impl
             crate::naga::WithSpan<crate::naga::valid::ValidationError>,
         >,
     ) -> Self {
+        use alloc::{string::ToString, vec};
         CompilationInfo {
             messages: vec![CompilationMessage {
                 message: value.to_string(),
@@ -228,22 +228,10 @@ pub struct ShaderModuleDescriptor<'a> {
 }
 static_assertions::assert_impl_all!(ShaderModuleDescriptor<'_>: Send, Sync);
 
-/// Descriptor for a shader module that will bypass wgpu's shader tooling, for use with
-/// [`Device::create_shader_module_passthrough`].
+/// Descriptor for a shader module given by any of several sources.
+/// At least one of the shader types that may be used by the backend must be `Some`
 ///
 /// This type is unique to the Rust API of `wgpu`. In the WebGPU specification,
 /// only WGSL source code strings are accepted.
 pub type ShaderModuleDescriptorPassthrough<'a> =
     wgt::CreateShaderModuleDescriptorPassthrough<'a, Label<'a>>;
-
-/// Descriptor for a shader module given by Metal MSL source.
-///
-/// This type is unique to the Rust API of `wgpu`. In the WebGPU specification,
-/// only WGSL source code strings are accepted.
-pub type ShaderModuleDescriptorMsl<'a> = wgt::ShaderModuleDescriptorMsl<'a, Label<'a>>;
-
-/// Descriptor for a shader module given by SPIR-V binary.
-///
-/// This type is unique to the Rust API of `wgpu`. In the WebGPU specification,
-/// only WGSL source code strings are accepted.
-pub type ShaderModuleDescriptorSpirV<'a> = wgt::ShaderModuleDescriptorSpirV<'a, Label<'a>>;

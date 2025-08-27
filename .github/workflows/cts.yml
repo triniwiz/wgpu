@@ -1,23 +1,33 @@
 name: CTS
 
 on:
+  push:
+    branches-ignore: [
+        # Renovate branches are always PRs, so they will be covered
+        # by the pull_request event.
+        "renovate/**",
+        # Branches with the `gh-readonly-queue` prefix are used by the
+        # merge queue, so they are already covered by the `merge_group` event.
+        "gh-readonly-queue/**",
+      ]
   pull_request:
-    types: [labeled, opened, synchronize]
-  schedule:
-    - cron: '33 2 * * *'
-  workflow_dispatch:
+  merge_group:
 
 env:
   CARGO_INCREMENTAL: false
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: full
-  MSRV: "1.84"
+  MSRV: "1.88"
+
+# Every time a PR is pushed to, cancel any previous jobs. This
+# makes us behave nicer to github and get faster turnaround times
+# on PRs that are pushed to multiple times in rapid succession.
+concurrency:
+  group: ${{github.workflow}}-${{github.ref}}
+  cancel-in-progress: ${{github.event_name == 'pull_request'}}
 
 jobs:
   cts:
-    # For pull requests, only run if we add the "PR: run CTS" label
-    if: "github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'PR: run CTS')"
-
     strategy:
       fail-fast: false
       matrix:
@@ -26,63 +36,84 @@ jobs:
           - name: Windows x86_64
             os: windows-2022
             target: x86_64-pc-windows-msvc
-            backends: dx12
+            backend: dx12
+
+          # Mac
+          - name: Mac aarch64
+            os: macos-14
+            target: x86_64-apple-darwin
+            backend: metal
 
           # Linux
-          #- name: Linux x86_64
-          #  os: ubuntu-20.04
-          #  target: x86_64-unknown-linux-gnu
-          #  backends: vulkan # gl
+          - name: Linux x86_64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            backend: vulkan
 
     name: CTS ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
 
     steps:
       - name: checkout repo
-        uses: actions/checkout@v4
-        with:
-          path: wgpu
-
-      - name: checkout cts
-        run: |
-          git clone https://github.com/gpuweb/cts.git
-          cd cts
-          git checkout $(cat ../wgpu/cts_runner/revision.txt)
+        uses: actions/checkout@v5
 
       - name: Install Repo MSRV toolchain
         run: |
-          rustup toolchain install ${{ env.MSRV }} --no-self-update --profile=minimal --target ${{ matrix.target }}
+          rustup toolchain install ${{ env.MSRV }} --no-self-update --profile=minimal --target ${{ matrix.target }} --component llvm-tools
           rustup override set ${{ env.MSRV }}
           cargo -V
+
+      - name: Install `cargo-llvm-cov`
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
 
       - name: caching
         uses: Swatinem/rust-cache@v2
         with:
-          key: cts-b # suffix for cache busting
-          workspaces: wgpu
+          prefix-key: v2-rust # Increment version for cache busting
+          cache-directories: cts
 
       # We enable line numbers for panics, but that's it
       - name: disable debug
         shell: bash
         run: |
-          mkdir -p wgpu/.cargo
-          echo """[profile.dev]
-          debug = 1" > wgpu/.cargo/config.toml
+          mkdir -p .cargo
+          cat <<EOF >> .cargo/config.toml
+          [profile.dev]
+          debug = "line-tables-only"
+          EOF
 
-      - name: build CTS runner
-        run: |
-          cargo build --manifest-path wgpu/cts_runner/Cargo.toml
+      - name: (Windows) Install DXC
+        if: matrix.os == 'windows-2022'
+        uses: ./.github/actions/install-dxc
+
+      - name: (Windows) Install WARP
+        if: matrix.os == 'windows-2022'
+        uses: ./.github/actions/install-warp
+        with:
+          target-dirs: "target/llvm-cov-target/debug"
+
+      - name: (Linux) Install Mesa
+        if: matrix.os == 'ubuntu-24.04'
+        uses: ./.github/actions/install-mesa
 
       - name: run CTS
         shell: bash
+        run: cargo xtask cts --llvm-cov --backend ${{ matrix.backend }}
+
+      - name: Generate coverage report
+        id: coverage
+        shell: bash
+        continue-on-error: true
         run: |
-          cd cts;
-          for backend in ${{ matrix.backends }}; do
-            echo "======= CTS TESTS $backend ======";
-            grep -v '^//' ../wgpu/cts_runner/test.lst | while IFS=$' \t\r\n' read test; do
-              echo "=== Running $test ===";
-              DENO_WEBGPU_BACKEND=$backend cargo run --manifest-path ../wgpu/cts_runner/Cargo.toml --frozen -- ./tools/run_deno --verbose "$test";
-            done
-          done
-          echo;
-          echo "Note: Summary reflects only the last test suite, not the entire run."
+          set -e
+
+          cargo llvm-cov report --lcov --output-path lcov.info
+
+      - name: Upload coverage report to Codecov
+        uses: codecov/codecov-action@v5
+        if: steps.coverage.outcome == 'success'
+        with:
+          files: lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
