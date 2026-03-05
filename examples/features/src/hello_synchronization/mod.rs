@@ -16,6 +16,7 @@ async fn run() {
             label: None,
             required_features: wgpu::Features::empty(),
             required_limits: wgpu::Limits::downlevel_defaults(),
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
             memory_hints: wgpu::MemoryHints::Performance,
             trace: wgpu::Trace::Off,
         })
@@ -89,8 +90,8 @@ async fn execute(
 
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: None,
-        bind_group_layouts: &[&bind_group_layout],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(&bind_group_layout)],
+        immediate_size: 0,
     });
     let patient_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: None,
@@ -181,7 +182,7 @@ async fn get_data<T: bytemuck::Pod>(
     let buffer_slice = staging_buffer.slice(..);
     let (sender, receiver) = flume::bounded(1);
     buffer_slice.map_async(wgpu::MapMode::Read, move |r| sender.send(r).unwrap());
-    device.poll(wgpu::PollType::wait()).unwrap();
+    device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
     receiver.recv_async().await.unwrap().unwrap();
     output.copy_from_slice(bytemuck::cast_slice(&buffer_slice.get_mapped_range()[..]));
     staging_buffer.unmap();

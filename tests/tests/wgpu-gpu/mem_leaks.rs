@@ -91,8 +91,8 @@ async fn draw_test_with_reports(
         .device
         .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
-            bind_group_layouts: &[&bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
         });
 
     let global_report = ctx.instance.generate_report().unwrap();
@@ -126,7 +126,7 @@ async fn draw_test_with_reports(
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -207,6 +207,7 @@ async fn draw_test_with_reports(
         depth_stencil_attachment: None,
         timestamp_writes: None,
         occlusion_query_set: None,
+        multiview_mask: None,
     });
 
     rpass.set_pipeline(&pipeline);
@@ -267,9 +268,12 @@ async fn draw_test_with_reports(
     let report = global_report.hub_report();
     assert_eq!(report.command_buffers.num_allocated, 0);
 
-    ctx.async_poll(wgpu::PollType::wait_for(submit_index))
-        .await
-        .unwrap();
+    ctx.async_poll(wgpu::PollType::Wait {
+        submission_index: Some(submit_index),
+        timeout: None,
+    })
+    .await
+    .unwrap();
 
     let global_report = ctx.instance.generate_report().unwrap();
     let report = global_report.hub_report();

@@ -1,18 +1,31 @@
-This document is a guide for contributions to the WGPU project.
+This document is a guide for contributions to the wgpu project.
 
 ## Welcome!
 
-First of all, welcome to the WGPU community! 👋 We're glad you want to
-contribute. If you are unfamiliar with the WGPU project, we recommend you read
+First of all, welcome to the wgpu community! 👋 We're glad you want to
+contribute. If you are unfamiliar with the wgpu project, we recommend you read
 [`GOVERNANCE.md`] for an overview of its goals, and how it's governed.
+
+## Table of Contents
+- [Documentation Overview](#documentation-overview)
+- [Talking to other humans in the wgpu project](#talking-to-other-humans-in-the-wgpu-project)
+- ["What can I work on?" as a new contributor](#what-can-i-work-on-as-a-new-contributor)
+- [Setting up a wgpu development environment](#setting-up-a-wgpu-development-environment)
+- [What to expect when you file an issue](#what-to-expect-when-you-file-an-issue)
+- [Pull requests](#pull-requests)
+  - [Change Ownership](#change-ownership)
+  - [LLMs (AI)](#llms-ai)
+  - [Designing new features](#designing-new-features)
+  - [Undue Burden](#undue-burden)
+  - [Large pull requests are risky](#large-pull-requests-are-risky)
 
 ## Documentation Overview:
 
-- [`GOVERNANCE.md`]: An overview of the WGPU project's goals and governance.
-- [`CODE_OF_CONDUCT.md`]: The code of conduct for the WGPU project.
-- [`docs/release-checklist.md`]: Checklist for creating a new release of WGPU.
-- [`docs/review-checklist.md`]: Checklist for reviewing a pull request in WGPU.
-- [`docs/testing.md`]: Information on the test suites in WGPU and Naga.
+- [`GOVERNANCE.md`]: An overview of the wgpu project's goals and governance.
+- [`CODE_OF_CONDUCT.md`]: The code of conduct for the wgpu project.
+- [`docs/release-checklist.md`]: Checklist for creating a new release of wgpu.
+- [`docs/review-checklist.md`]: Checklist for reviewing a pull request in wgpu.
+- [`docs/testing.md`]: Information on the test suites in wgpu and naga.
 
 [`GOVERNANCE.md`]: ./GOVERNANCE.md
 [`CODE_OF_CONDUCT.md`]: ./CODE_OF_CONDUCT.md
@@ -20,9 +33,9 @@ contribute. If you are unfamiliar with the WGPU project, we recommend you read
 [`docs/review-checklist.md`]: ./docs/review-checklist.md
 [`docs/testing.md`]: ./docs/testing.md
 
-## Talking to other humans in the WGPU project
+## Talking to other humans in the wgpu project
 
-The WGPU project has multiple official platforms for community engagement:
+The wgpu project has multiple official platforms for community engagement:
 
 - The Matrix channel [`wgpu:matrix.org`](https://matrix.to/#/#wgpu:matrix.org)
   is dedicated to informal chat about contributions the project. It is
@@ -37,6 +50,11 @@ The WGPU project has multiple official platforms for community engagement:
   Notification in Matrix can sometimes be unreliable. Feel free to explicitly
   tag people from whom you would like attention, esp. to follow-up after a day
   or so if you do not get a response to your contributions.
+
+- The [#wgpu channel on the Rust Gamedev Discord](https://discord.gg/X3MYBNXUMJ)
+  is dedicated to information chat about both contributing and using the project. Not
+  all of the developers are on Discord, but this is monitored by the maintainers. Similar
+  in place to the Matrix channels.
 
 - [GitHub issues] are used to discuss open development questions and track work
   the community intends to complete; this might include:
@@ -73,35 +91,29 @@ The WGPU project has multiple official platforms for community engagement:
 [Meeting Link]: https://meet.google.com/ubo-ztcw-gwf
 [`CODE_OF_CONDUCT.md`]: ./CODE_OF_CONDUCT.md
 
-## Contributing to WGPU
-
-Community response to contributions are, in general, prioritized based on their
-relevance to WGPU's mission and decision-making groups' interest (see
-[`GOVERNANCE.md`]).
-
 ### "What can I work on?" as a new contributor
 
 TODO
 
 We discourage new contributors from submitting large changes or opinionated
-refactors unless they have been specifically validated by WGPU maintainership.
+refactors unless they have been specifically validated by wgpu maintainership.
 These are likely to be rejected on basis of needing discussion before a formal
 review.
 
-### Setting up a WGPU development environment
+### Setting up a wgpu development environment
 
-We use the following components in a WGPU development environment:
+We use the following components in a wgpu development environment:
 
 - [A Rust toolchain][install-rust] matching the version specified in
-  [`rust-toolchain.toml`](./rust-toolchain.toml), to compile WGPU's code. If you
+  [`rust-toolchain.toml`](./rust-toolchain.toml), to compile wgpu's code. If you
   use `rustup`, this will be automatically installed when you first run a
   `cargo` command in the repository.
 - [Taplo](https://taplo.tamasfe.dev/) to keep TOML files formatted.
 - [Vulkan SDK](https://vulkan.lunarg.com/) to provide Vulkan validation layers
   and other Vulkan/SPIR-V tools for testing.
 
-Once these are done, you should be ready to hack on WGPU! Drop into your
-favorite editor, make some changes to the repository's code, and test that WGPU
+Once these are done, you should be ready to hack on wgpu! Drop into your
+favorite editor, make some changes to the repository's code, and test that wgpu
 has been changed the way you expect. Take a look at [`docs/testing.md`] for more
 info on testing.
 
@@ -111,8 +123,8 @@ and a [`git` dependency][git-deps] pointing to your own fork to share changes
 with other contributors.
 
 Once you are ready to request a review of your changes so they become part of
-WGPU public history, create a pull request with your changes committed to a
-branch in your own fork of WGPU in GitHub. See documentation for that
+wgpu public history, create a pull request with your changes committed to a
+branch in your own fork of wgpu in GitHub. See documentation for that
 [here](https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/proposing-changes-to-your-work-with-pull-requests/creating-a-pull-request-from-a-fork).
 
 [install-rust]: https://www.rust-lang.org/tools/install
@@ -146,8 +158,9 @@ TODO
 You can see some common things that PR reviewers are going to look for in
 [`docs/review-checklist.md`].
 
-A draft pull request is taken to be not yet ready for review. Marking
-drafts as such helps the maintainers triage review work.
+A draft pull request is taken to be not yet ready for review and as such
+is not included in our weekly triage meetings. If you need a review before
+being taken out of draft, please let one of us know.
 
 The `Assigned` field on a pull request indicates who has taken
 responsibility for shepherding it through the review process, not who
@@ -155,11 +168,24 @@ is responsible for authoring it. The assignee is usually the reviewer,
 but they can also delegate the review to someone else. The intent of
 assignment is simply to ensure that pull requests don't get neglected.
 
+#### Change Ownership
+
+PR authors must be able to understand, justify, and explain all proposed
+changes. After a PR is accepted, both the reviewer and author must
+understand it as a positive change to the codebase.
+
+#### LLMs (AI)
+
+Using LLMs and AIs to generate code that is part of a contribution is allowed.
+However, the author submitting the PR must fully adhere to [Change Ownership](#change-ownership) rules.
+The author is responsible for the code, regardless of how it was created. 
+Do not use "LLM generated" as a justification for low quality code.
+
 #### Designing new features
 
-As an open source project, WGPU wants to serve a broad audience. This
+As an open source project, wgpu wants to serve a broad audience. This
 helps us cast a wide net for contributors, and widens the impact of
-their work. However, WGPU does not promise to incorporate every
+their work. However, wgpu does not promise to incorporate every
 proposed feature.
 
 Large efforts that are ultimately rejected tend to burn contributors
@@ -170,17 +196,23 @@ consensus on the approach, including API changes, shader language
 extensions, implementation architecture, error handling, testing
 plans, benchmarking, and so on.
 
+#### Undue Burden
+
+We reserve the right to close any PRs that cause an undue burden on
+the maintainership. This could include, but is not limited to, [massive PRs](#large-pull-requests-are-risky),
+[LLM slop](#llms-ai), or contributions not in good faith.
+
 #### Large pull requests are risky
 
 Contributors should anticipate that the larger and more complex a pull
 request is, the less likely it is that reviewers will accept it,
 regardless of its merits.
 
-The WGPU project has had poor experiences with large, complex pull
+The wgpu project has had poor experiences with large, complex pull
 requests:
 
 - Complex pull requests are difficult to review effectively. It is
-  common for us to debug a problem in WGPU and find that it was
+  common for us to debug a problem in wgpu and find that it was
   introduced by some massive pull request that we had reviewed and
   accepted, showing that we obviously hadn't understood it as well as
   we'd thought.
@@ -190,7 +222,7 @@ requests:
   stressful to question its design decisions, knowing that changing
   them will require the author to essentially reimplement the project
   from scratch. Such pull requests make it hard for maintainers to
-  uphold their responsibility to keep WGPU maintainable. Incremental
+  uphold their responsibility to keep wgpu maintainable. Incremental
   changes are easier to discuss and revise without drama.
 
 These problems are serious enough that maintainers may choose to
@@ -199,7 +231,7 @@ feature or the technical merit of the code.
 
 The problem isn't really the *size* of the pull request: a simple
 rename, with no changes to functionality, might touch hundreds of
-files, but be easy to review. Or, a change to Naga might affect dozens
+files, but be easy to review. Or, a change to naga might affect dozens
 of snapshot test output files, without being hard to understand.
 
 Rather, the problem is the *complexity* of the pull request: how many

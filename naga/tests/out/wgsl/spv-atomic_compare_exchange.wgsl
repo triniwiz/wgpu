@@ -16,7 +16,7 @@ var<storage, read_write> global: type_5;
 @group(0) @binding(1) 
 var<storage> global_1: type_3;
 
-fn function() {
+fn function_() {
     var phi_28_: type_2;
     var phi_29_: type_2;
     var phi_43_: type_2;
@@ -61,6 +61,6 @@ fn function() {
 }
 
 @compute @workgroup_size(32, 1, 1) 
-fn stagetest_atomic_compare_exchange() {
-    function();
+fn stage_test_atomic_compare_exchange() {
+    function_();
 }

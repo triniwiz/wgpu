@@ -1,4 +1,3 @@
-#[cfg(wgpu_core)]
 use alloc::vec::Vec;
 use core::future::Future;
 
@@ -48,7 +47,7 @@ impl Default for Instance {
     /// If no backend feature for the active target platform is enabled,
     /// this method will panic, see [`Instance::enabled_backend_features()`].
     fn default() -> Self {
-        Self::new(&InstanceDescriptor::default())
+        Self::new(InstanceDescriptor::default())
     }
 }
 
@@ -60,7 +59,7 @@ impl Instance {
     /// - If no backend feature for the active target platform is enabled,
     ///   this method will panic; see [`Instance::enabled_backend_features()`].
     #[allow(clippy::allow_attributes, unreachable_code)]
-    pub fn new(desc: &InstanceDescriptor) -> Self {
+    pub fn new(desc: InstanceDescriptor) -> Self {
         if Self::enabled_backend_features().is_empty() {
             panic!(
                 "No wgpu backend feature that is implemented for the target platform was enabled. \
@@ -142,23 +141,18 @@ impl Instance {
     /// # Arguments
     ///
     /// - `backends` - Backends from which to enumerate adapters.
-    #[cfg(wgpu_core)]
-    pub fn enumerate_adapters(&self, backends: Backends) -> Vec<Adapter> {
-        let Some(core_instance) = self.inner.as_core_opt() else {
-            return Vec::new();
-        };
+    pub fn enumerate_adapters(&self, backends: Backends) -> impl Future<Output = Vec<Adapter>> {
+        let future = self.inner.enumerate_adapters(backends);
 
-        core_instance
-            .enumerate_adapters(backends)
-            .into_iter()
-            .map(|adapter| {
-                let core = backend::wgpu_core::CoreAdapter {
-                    context: core_instance.clone(),
-                    id: adapter,
-                };
-                crate::Adapter { inner: core.into() }
-            })
-            .collect()
+        async move {
+            future
+                .await
+                .iter()
+                .map(|adapter| Adapter {
+                    inner: adapter.clone(),
+                })
+                .collect()
+        }
     }
 
     /// Retrieves an [`Adapter`] which matches the given [`RequestAdapterOptions`].
@@ -315,10 +309,10 @@ impl Instance {
     ///
     /// The type of `A::Instance` depends on the backend:
     ///
-    #[doc = crate::hal_type_vulkan!("Instance")]
-    #[doc = crate::hal_type_metal!("Instance")]
-    #[doc = crate::hal_type_dx12!("Instance")]
-    #[doc = crate::hal_type_gles!("Instance")]
+    #[doc = crate::macros::hal_type_vulkan!("Instance")]
+    #[doc = crate::macros::hal_type_metal!("Instance")]
+    #[doc = crate::macros::hal_type_dx12!("Instance")]
+    #[doc = crate::macros::hal_type_gles!("Instance")]
     ///
     /// # Safety
     ///
@@ -343,10 +337,10 @@ impl Instance {
     ///
     /// # Types
     ///
-    #[doc = crate::hal_type_vulkan!("Instance")]
-    #[doc = crate::hal_type_metal!("Instance")]
-    #[doc = crate::hal_type_dx12!("Instance")]
-    #[doc = crate::hal_type_gles!("Instance")]
+    #[doc = crate::macros::hal_type_vulkan!("Instance")]
+    #[doc = crate::macros::hal_type_metal!("Instance")]
+    #[doc = crate::macros::hal_type_dx12!("Instance")]
+    #[doc = crate::macros::hal_type_gles!("Instance")]
     ///
     /// # Errors
     ///
@@ -374,10 +368,10 @@ impl Instance {
     ///
     /// The type of `hal_adapter.adapter` depends on the backend:
     ///
-    #[doc = crate::hal_type_vulkan!("Adapter")]
-    #[doc = crate::hal_type_metal!("Adapter")]
-    #[doc = crate::hal_type_dx12!("Adapter")]
-    #[doc = crate::hal_type_gles!("Adapter")]
+    #[doc = crate::macros::hal_type_vulkan!("Adapter")]
+    #[doc = crate::macros::hal_type_metal!("Adapter")]
+    #[doc = crate::macros::hal_type_dx12!("Adapter")]
+    #[doc = crate::macros::hal_type_gles!("Adapter")]
     ///
     /// # Safety
     ///

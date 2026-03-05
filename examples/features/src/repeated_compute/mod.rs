@@ -105,7 +105,10 @@ async fn compute(local_buffer: &mut [u32], context: &WgpuContext) {
     // One of those can be calling `Device::poll`. This isn't necessary on the web as devices
     // are polled automatically but natively, we need to make sure this happens manually.
     // `PollType::Wait` will cause the thread to wait on native but not on WebGpu.
-    context.device.poll(wgpu::PollType::wait()).unwrap();
+    context
+        .device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .unwrap();
     log::info!("Device polled.");
     // Now we await the receiving and panic if anything went wrong because we're lazy.
     receiver.recv_async().await.unwrap().unwrap();
@@ -164,6 +167,7 @@ impl WgpuContext {
                 label: None,
                 required_features: wgpu::Features::empty(),
                 required_limits: wgpu::Limits::downlevel_defaults(),
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
                 memory_hints: wgpu::MemoryHints::Performance,
                 trace: wgpu::Trace::Off,
             })
@@ -224,8 +228,8 @@ impl WgpuContext {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: None,

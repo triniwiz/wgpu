@@ -44,8 +44,6 @@ static COMPUTE_PIPELINE_DEFAULT_LAYOUT_BAD_MODULE: GpuTestConfiguration =
     GpuTestConfiguration::new()
         .parameters(TestParameters::default().enable_noop())
         .run_sync(|ctx| {
-            ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
-
             fail(
                 &ctx.device,
                 || {
@@ -78,8 +76,6 @@ static COMPUTE_PIPELINE_DEFAULT_LAYOUT_BAD_BGL_INDEX: GpuTestConfiguration =
                 .enable_noop(),
         )
         .run_sync(|ctx| {
-            ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
-
             fail(
                 &ctx.device,
                 || {
@@ -96,9 +92,9 @@ static COMPUTE_PIPELINE_DEFAULT_LAYOUT_BAD_BGL_INDEX: GpuTestConfiguration =
                                 cache: None,
                             });
 
-                    pipeline.get_bind_group_layout(0);
+                    pipeline.get_bind_group_layout(u32::MAX);
                 },
-                Some("Invalid group index 0"),
+                Some("Bind group layout index 4294967295 is greater than the device's configured `max_bind_groups` limit"),
             );
         });
 
@@ -107,8 +103,6 @@ static RENDER_PIPELINE_DEFAULT_LAYOUT_BAD_MODULE: GpuTestConfiguration =
     GpuTestConfiguration::new()
         .parameters(TestParameters::default().enable_noop())
         .run_sync(|ctx| {
-            ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
-
             fail(
                 &ctx.device,
                 || {
@@ -129,7 +123,7 @@ static RENDER_PIPELINE_DEFAULT_LAYOUT_BAD_MODULE: GpuTestConfiguration =
                                 depth_stencil: None,
                                 multisample: Default::default(),
                                 fragment: None,
-                                multiview: None,
+                                multiview_mask: None,
                                 cache: None,
                             });
 
@@ -148,8 +142,6 @@ static RENDER_PIPELINE_DEFAULT_LAYOUT_BAD_BGL_INDEX: GpuTestConfiguration =
                 .enable_noop(),
         )
         .run_sync(|ctx| {
-            ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
-
             fail(
                 &ctx.device,
                 || {
@@ -182,13 +174,13 @@ static RENDER_PIPELINE_DEFAULT_LAYOUT_BAD_BGL_INDEX: GpuTestConfiguration =
                                         write_mask: wgpu::ColorWrites::ALL,
                                     })],
                                 }),
-                                multiview: None,
+                                multiview_mask: None,
                                 cache: None,
                             });
 
-                    pipeline.get_bind_group_layout(0);
+                    pipeline.get_bind_group_layout(u32::MAX);
                 },
-                Some("Invalid group index 0"),
+                Some("Bind group layout index 4294967295 is greater than the device's configured `max_bind_groups` limit"),
             );
         });
 
@@ -223,7 +215,7 @@ static NO_TARGETLESS_RENDER: GpuTestConfiguration = GpuTestConfiguration::new()
                                 ..Default::default()
                             },
                             fragment: None,
-                            multiview: None,
+                            multiview_mask: None,
                             cache: None,
                         });
                 }

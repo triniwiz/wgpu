@@ -31,10 +31,10 @@ impl Texture {
     ///
     /// The returned type depends on the backend:
     ///
-    #[doc = crate::hal_type_vulkan!("Texture")]
-    #[doc = crate::hal_type_metal!("Texture")]
-    #[doc = crate::hal_type_dx12!("Texture")]
-    #[doc = crate::hal_type_gles!("Texture")]
+    #[doc = crate::macros::hal_type_vulkan!("Texture")]
+    #[doc = crate::macros::hal_type_metal!("Texture")]
+    #[doc = crate::macros::hal_type_dx12!("Texture")]
+    #[doc = crate::macros::hal_type_gles!("Texture")]
     ///
     /// # Deadlocks
     ///
@@ -67,6 +67,22 @@ impl Texture {
     /// Returns custom implementation of Texture (if custom backend and is internally T)
     pub fn as_custom<T: custom::TextureInterface>(&self) -> Option<&T> {
         self.inner.as_custom()
+    }
+
+    #[cfg(custom)]
+    /// Creates a texture from already created custom implementation with the given description
+    pub fn from_custom<T: custom::TextureInterface>(
+        texture: T,
+        desc: &TextureDescriptor<'_>,
+    ) -> Self {
+        Self {
+            inner: dispatch::DispatchTexture::custom(texture),
+            descriptor: TextureDescriptor {
+                label: None,
+                view_formats: &[],
+                ..desc.clone()
+            },
+        }
     }
 
     /// Creates a view of this texture, specifying an interpretation of its texels and

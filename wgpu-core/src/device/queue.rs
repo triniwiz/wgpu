@@ -15,15 +15,15 @@ use wgt::{
 
 use super::{life::LifetimeTracker, Device};
 #[cfg(feature = "trace")]
-use crate::device::trace::Action;
+use crate::device::trace::{Action, IntoTrace};
 use crate::{
     api_log,
     command::{
         extract_texture_selector, validate_linear_texture_data, validate_texture_buffer_copy,
-        validate_texture_copy_range, ClearError, CommandAllocator, CommandBuffer, CommandEncoder,
-        CommandEncoderError, CopySide, TexelCopyTextureInfo, TransferError,
+        validate_texture_copy_dst_format, validate_texture_copy_range, ClearError,
+        CommandAllocator, CommandBuffer, CommandEncoder, CommandEncoderError, CopySide,
+        TransferError,
     },
-    conv,
     device::{DeviceError, WaitIdleError},
     get_lowest_common_denom,
     global::Global,
@@ -183,9 +183,9 @@ impl Drop for Queue {
                     fence.as_ref(),
                     last_successful_submission_index,
                     #[cfg(not(target_arch = "wasm32"))]
-                    timeout_ms,
+                    Some(core::time::Duration::from_millis(timeout_ms)),
                     #[cfg(target_arch = "wasm32")]
-                    0, // WebKit and Chromium don't support a non-0 timeout
+                    Some(core::time::Duration::ZERO), // WebKit and Chromium don't support a non-0 timeout
                 )
             };
             // Note: If we don't panic below we are in UB land (destroying resources while they are still in use by the GPU).
@@ -406,6 +406,7 @@ impl PendingWrites {
                     list: vec![cmd_buf],
                     device: device.clone(),
                     is_open: false,
+                    api: crate::command::EncodingApi::InternalUse,
                     label: "(wgpu internal) PendingWrites command encoder".into(),
                 },
                 trackers: Tracker::new(),
@@ -469,14 +470,13 @@ pub enum QueueWriteError {
 
 impl WebGpuError for QueueWriteError {
     fn webgpu_error_type(&self) -> ErrorType {
-        let e: &dyn WebGpuError = match self {
-            Self::Queue(e) => e,
-            Self::Transfer(e) => e,
-            Self::MemoryInitFailure(e) => e,
-            Self::DestroyedResource(e) => e,
-            Self::InvalidResource(e) => e,
-        };
-        e.webgpu_error_type()
+        match self {
+            Self::Queue(e) => e.webgpu_error_type(),
+            Self::Transfer(e) => e.webgpu_error_type(),
+            Self::MemoryInitFailure(e) => e.webgpu_error_type(),
+            Self::DestroyedResource(e) => e.webgpu_error_type(),
+            Self::InvalidResource(e) => e.webgpu_error_type(),
+        }
     }
 }
 
@@ -501,17 +501,14 @@ pub enum QueueSubmitError {
 
 impl WebGpuError for QueueSubmitError {
     fn webgpu_error_type(&self) -> ErrorType {
-        let e: &dyn WebGpuError = match self {
-            Self::Queue(e) => e,
-            Self::Unmap(e) => e,
-            Self::CommandEncoder(e) => e,
-            Self::ValidateAsActionsError(e) => e,
-            Self::InvalidResource(e) => e,
-            Self::DestroyedResource(_) | Self::BufferStillMapped(_) => {
-                return ErrorType::Validation
-            }
-        };
-        e.webgpu_error_type()
+        match self {
+            Self::Queue(e) => e.webgpu_error_type(),
+            Self::Unmap(e) => e.webgpu_error_type(),
+            Self::CommandEncoder(e) => e.webgpu_error_type(),
+            Self::ValidateAsActionsError(e) => e.webgpu_error_type(),
+            Self::InvalidResource(e) => e.webgpu_error_type(),
+            Self::DestroyedResource(_) | Self::BufferStillMapped(_) => ErrorType::Validation,
+        }
     }
 }
 
@@ -520,7 +517,7 @@ impl WebGpuError for QueueSubmitError {
 impl Queue {
     pub fn write_buffer(
         &self,
-        buffer: Fallible<Buffer>,
+        buffer: Arc<Buffer>,
         buffer_offset: wgt::BufferAddress,
         data: &[u8],
     ) -> Result<(), QueueWriteError> {
@@ -529,8 +526,6 @@ impl Queue {
 
         self.device.check_is_valid()?;
 
-        let buffer = buffer.get()?;
-
         let data_size = data.len() as wgt::BufferAddress;
 
         self.same_device_as(buffer.as_ref())?;
@@ -538,6 +533,8 @@ impl Queue {
         let data_size = if let Some(data_size) = wgt::BufferSize::new(data_size) {
             data_size
         } else {
+            // This must happen after parameter validation (so that errors are reported
+            // as required by the spec), but before any side effects.
             log::trace!("Ignoring write_buffer of size 0");
             return Ok(());
         };
@@ -649,17 +646,28 @@ impl Queue {
         buffer_offset: u64,
         buffer_size: wgt::BufferSize,
     ) -> Result<(), TransferError> {
+        if !matches!(&*buffer.map_state.lock(), BufferMapState::Idle) {
+            return Err(TransferError::BufferNotAvailable);
+        }
         buffer.check_usage(wgt::BufferUsages::COPY_DST)?;
-        if buffer_size.get() % wgt::COPY_BUFFER_ALIGNMENT != 0 {
+        if !buffer_size.get().is_multiple_of(wgt::COPY_BUFFER_ALIGNMENT) {
             return Err(TransferError::UnalignedCopySize(buffer_size.get()));
         }
-        if buffer_offset % wgt::COPY_BUFFER_ALIGNMENT != 0 {
+        if !buffer_offset.is_multiple_of(wgt::COPY_BUFFER_ALIGNMENT) {
             return Err(TransferError::UnalignedBufferOffset(buffer_offset));
         }
-        if buffer_offset + buffer_size.get() > buffer.size {
-            return Err(TransferError::BufferOverrun {
+
+        if buffer_offset > buffer.size {
+            return Err(TransferError::BufferStartOffsetOverrun {
                 start_offset: buffer_offset,
-                end_offset: buffer_offset + buffer_size.get(),
+                buffer_size: buffer.size,
+                side: CopySide::Destination,
+            });
+        }
+        if buffer_size.get() > buffer.size - buffer_offset {
+            return Err(TransferError::BufferEndOffsetOverrun {
+                start_offset: buffer_offset,
+                size: buffer_size.get(),
                 buffer_size: buffer.size,
                 side: CopySide::Destination,
             });
@@ -727,7 +735,7 @@ impl Queue {
 
     pub fn write_texture(
         &self,
-        destination: wgt::TexelCopyTextureInfo<Fallible<Texture>>,
+        destination: wgt::TexelCopyTextureInfo<Arc<Texture>>,
         data: &[u8],
         data_layout: &wgt::TexelCopyBufferLayout,
         size: &wgt::Extent3d,
@@ -737,7 +745,7 @@ impl Queue {
 
         self.device.check_is_valid()?;
 
-        let dst = destination.texture.get()?;
+        let dst = destination.texture;
         let destination = wgt::TexelCopyTextureInfo {
             texture: (),
             mip_level: destination.mip_level,
@@ -757,33 +765,27 @@ impl Queue {
 
         let (selector, dst_base) = extract_texture_selector(&destination, size, &dst)?;
 
-        if !conv::is_valid_copy_dst_texture_format(dst.desc.format, destination.aspect) {
-            return Err(TransferError::CopyToForbiddenTextureFormat {
-                format: dst.desc.format,
-                aspect: destination.aspect,
-            }
-            .into());
-        }
+        validate_texture_copy_dst_format(dst.desc.format, destination.aspect)?;
 
         validate_texture_buffer_copy(
             &destination,
             dst_base.aspect,
             &dst.desc,
-            data_layout.offset,
-            false, // alignment not required for buffer offset
+            data_layout,
+            false, // alignment not required for buffer offset or bytes per row
         )?;
 
         // Note: `_source_bytes_per_array_layer` is ignored since we
         // have a staging copy, and it can have a different value.
-        let (required_bytes_in_copy, _source_bytes_per_array_layer) = validate_linear_texture_data(
-            data_layout,
-            dst.desc.format,
-            destination.aspect,
-            data.len() as wgt::BufferAddress,
-            CopySide::Source,
-            size,
-            false,
-        )?;
+        let (required_bytes_in_copy, _source_bytes_per_array_layer, _) =
+            validate_linear_texture_data(
+                data_layout,
+                dst.desc.format,
+                destination.aspect,
+                data.len() as wgt::BufferAddress,
+                CopySide::Source,
+                size,
+            )?;
 
         if dst.desc.format.is_depth_stencil_format() {
             self.device
@@ -795,6 +797,8 @@ impl Queue {
 
         let dst_raw = dst.try_raw(&snatch_guard)?;
 
+        // This must happen after parameter validation (so that errors are reported
+        // as required by the spec), but before any side effects.
         if size.width == 0 || size.height == 0 || size.depth_or_array_layers == 0 {
             log::trace!("Ignoring write_texture of size 0");
             return Ok(());
@@ -961,14 +965,11 @@ impl Queue {
         destination: wgt::CopyExternalImageDestInfo<Fallible<Texture>>,
         size: wgt::Extent3d,
     ) -> Result<(), QueueWriteError> {
+        use crate::conv;
+
         profiling::scope!("Queue::copy_external_image_to_texture");
 
         self.device.check_is_valid()?;
-
-        if size.width == 0 || size.height == 0 || size.depth_or_array_layers == 0 {
-            log::trace!("Ignoring write_texture of size 0");
-            return Ok(());
-        }
 
         let mut needs_flag = false;
         needs_flag |= matches!(source.source, wgt::ExternalImageSource::OffscreenCanvas(_));
@@ -1052,6 +1053,13 @@ impl Queue {
             validate_texture_copy_range(&destination, &dst.desc, CopySide::Destination, &size)?;
 
         let (selector, dst_base) = extract_texture_selector(&destination, &size, &dst)?;
+
+        // This must happen after parameter validation (so that errors are reported
+        // as required by the spec), but before any side effects.
+        if size.width == 0 || size.height == 0 || size.depth_or_array_layers == 0 {
+            log::trace!("Ignoring copy_external_image_to_texture of size 0");
+            return Ok(());
+        }
 
         let mut pending_writes = self.pending_writes.lock();
         let encoder = pending_writes.activate();
@@ -1151,6 +1159,33 @@ impl Queue {
         Ok(())
     }
 
+    #[cfg(feature = "trace")]
+    fn trace_submission(
+        &self,
+        submit_index: SubmissionIndex,
+        commands: Vec<crate::command::Command<crate::command::PointerReferences>>,
+    ) {
+        if let Some(ref mut trace) = *self.device.trace.lock() {
+            trace.add(Action::Submit(submit_index, commands));
+        }
+    }
+
+    #[cfg(feature = "trace")]
+    fn trace_failed_submission(
+        &self,
+        submit_index: SubmissionIndex,
+        commands: Option<Vec<crate::command::Command<crate::command::PointerReferences>>>,
+        error: alloc::string::String,
+    ) {
+        if let Some(ref mut trace) = *self.device.trace.lock() {
+            trace.add(Action::FailedCommands {
+                commands,
+                failed_at_submit: Some(submit_index),
+                error,
+            });
+        }
+    }
+
     pub fn submit(
         &self,
         command_buffers: &[Arc<CommandBuffer>],
@@ -1205,19 +1240,15 @@ impl Queue {
                         #[allow(unused_mut)]
                         let mut cmd_buf_data = command_buffer.take_finished();
 
-                        #[cfg(feature = "trace")]
-                        if let Some(ref mut trace) = *self.device.trace.lock() {
-                            if let Ok(ref mut cmd_buf_data) = cmd_buf_data {
-                                trace.add(Action::Submit(
-                                    submit_index,
-                                    cmd_buf_data.commands.take().unwrap(),
-                                ));
-                            }
-                        }
-
                         if first_error.is_some() {
                             continue;
                         }
+
+                        #[cfg(feature = "trace")]
+                        let trace_commands = cmd_buf_data
+                            .as_mut()
+                            .ok()
+                            .and_then(|data| mem::take(&mut data.trace_commands));
 
                         let mut baked = match cmd_buf_data {
                             Ok(cmd_buf_data) => {
@@ -1231,12 +1262,31 @@ impl Queue {
                                     &mut command_index_guard,
                                 );
                                 if let Err(err) = res {
+                                    #[cfg(feature = "trace")]
+                                    self.trace_failed_submission(
+                                        submit_index,
+                                        trace_commands,
+                                        err.to_string(),
+                                    );
                                     first_error.get_or_insert(err);
                                     continue;
                                 }
+
+                                #[cfg(feature = "trace")]
+                                if let Some(commands) = trace_commands {
+                                    self.trace_submission(submit_index, commands);
+                                }
+
+                                cmd_buf_data.set_acceleration_structure_dependencies(&snatch_guard);
                                 cmd_buf_data.into_baked_commands()
                             }
                             Err(err) => {
+                                #[cfg(feature = "trace")]
+                                self.trace_failed_submission(
+                                    submit_index,
+                                    trace_commands,
+                                    err.to_string(),
+                                );
                                 first_error.get_or_insert(err.into());
                                 continue;
                             }
@@ -1562,19 +1612,22 @@ impl Global {
         data: &[u8],
     ) -> Result<(), QueueWriteError> {
         let queue = self.hub.queues.get(queue_id);
+        let buffer = self.hub.buffers.get(buffer_id).get()?;
 
         #[cfg(feature = "trace")]
         if let Some(ref mut trace) = *queue.device.trace.lock() {
-            let data_path = trace.make_binary("bin", data);
+            use crate::device::trace::DataKind;
+            let size = data.len() as u64;
+            let data = trace.make_binary(DataKind::Bin, data);
             trace.add(Action::WriteBuffer {
-                id: buffer_id,
-                data: data_path,
-                range: buffer_offset..buffer_offset + data.len() as u64,
+                id: buffer.to_trace(),
+                data,
+                offset: buffer_offset,
+                size,
                 queued: true,
             });
         }
 
-        let buffer = self.hub.buffers.get(buffer_id);
         queue.write_buffer(buffer, buffer_offset, data)
     }
 
@@ -1621,30 +1674,32 @@ impl Global {
     pub fn queue_write_texture(
         &self,
         queue_id: QueueId,
-        destination: &TexelCopyTextureInfo,
+        destination: &wgt::TexelCopyTextureInfo<id::TextureId>,
         data: &[u8],
         data_layout: &wgt::TexelCopyBufferLayout,
         size: &wgt::Extent3d,
     ) -> Result<(), QueueWriteError> {
         let queue = self.hub.queues.get(queue_id);
+        let texture = self.hub.textures.get(destination.texture).get()?;
+        let destination = wgt::TexelCopyTextureInfo {
+            texture,
+            mip_level: destination.mip_level,
+            origin: destination.origin,
+            aspect: destination.aspect,
+        };
 
         #[cfg(feature = "trace")]
         if let Some(ref mut trace) = *queue.device.trace.lock() {
-            let data_path = trace.make_binary("bin", data);
+            use crate::device::trace::DataKind;
+            let data = trace.make_binary(DataKind::Bin, data);
             trace.add(Action::WriteTexture {
-                to: *destination,
-                data: data_path,
+                to: destination.to_trace(),
+                data,
                 layout: *data_layout,
                 size: *size,
             });
         }
 
-        let destination = wgt::TexelCopyTextureInfo {
-            texture: self.hub.textures.get(destination.texture),
-            mip_level: destination.mip_level,
-            origin: destination.origin,
-            aspect: destination.aspect,
-        };
         queue.write_texture(destination, data, data_layout, size)
     }
 
@@ -1800,6 +1855,16 @@ fn validate_command_buffer(
                             .unwrap();
                     };
                 }
+            }
+        }
+        // WebGPU requires that we check every bind group referenced during
+        // encoding, even ones that may have been replaced before being used.
+        // TODO(<https://github.com/gfx-rs/wgpu/issues/8510>): Optimize this.
+        {
+            profiling::scope!("bind groups");
+            for bind_group in &cmd_buf_data.trackers.bind_groups {
+                // This checks the bind group and all resources it references.
+                bind_group.try_raw(snatch_guard)?;
             }
         }
 

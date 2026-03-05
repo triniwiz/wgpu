@@ -120,7 +120,7 @@ impl crate::framework::Example for Example {
         });
 
         let index_buffer = device.create_buffer_init(&BufferInitDescriptor {
-            label: Some("vertex buffer"),
+            label: Some("index buffer"),
             contents: bytemuck::cast_slice(&indices),
             usage: BufferUsages::BLAS_INPUT,
         });
@@ -257,7 +257,7 @@ impl crate::framework::Example for Example {
             address_mode_w: Default::default(),
             mag_filter: wgpu::FilterMode::Nearest,
             min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             lod_min_clamp: 1.0,
             lod_max_clamp: 1.0,
             compare: None,
@@ -268,8 +268,8 @@ impl crate::framework::Example for Example {
         let compute_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("pipeline layout for shader.wgsl"),
-                bind_group_layouts: &[&bgl],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&bgl)],
+                immediate_size: 0,
             });
 
         let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -283,8 +283,8 @@ impl crate::framework::Example for Example {
 
         let blit_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("pipeline layout for blit.wgsl"),
-            bind_group_layouts: &[&blit_bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&blit_bgl)],
+            immediate_size: 0,
         });
 
         let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -309,7 +309,7 @@ impl crate::framework::Example for Example {
                     write_mask: Default::default(),
                 })],
             }),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -414,6 +414,7 @@ impl crate::framework::Example for Example {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
 
             rpass.set_pipeline(&self.blit_pipeline);

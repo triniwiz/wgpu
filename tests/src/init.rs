@@ -40,7 +40,7 @@ pub fn initialize_instance(backends: wgpu::Backends, params: &TestParameters) ->
         .with_env()
         .union(params.required_instance_flags);
 
-    Instance::new(&wgpu::InstanceDescriptor {
+    Instance::new(wgpu::InstanceDescriptor {
         backends,
         flags,
         memory_budget_thresholds: wgpu::MemoryBudgetThresholds {
@@ -76,6 +76,7 @@ pub fn initialize_instance(backends: wgpu::Backends, params: &TestParameters) ->
                 enable: !cfg!(target_arch = "wasm32"),
             },
         },
+        display: None,
     })
 }
 
@@ -122,7 +123,7 @@ pub async fn initialize_adapter(
 
     cfg_if::cfg_if! {
         if #[cfg(not(target_arch = "wasm32"))] {
-            let adapter_iter = instance.enumerate_adapters(backends);
+            let adapter_iter = instance.enumerate_adapters(backends).await;
             let adapter = adapter_iter.into_iter()
                 // If we have a report, we only want to match the adapter with the same info.
                 //
@@ -136,7 +137,7 @@ pub async fn initialize_adapter(
                 panic!(
                     "Could not find adapter with info {:#?} in {:#?}",
                     adapter_report.map(|r| &r.info),
-                    instance.enumerate_adapters(backends).into_iter().map(|a| a.get_info()).collect::<Vec<_>>(),
+                    instance.enumerate_adapters(backends).await.into_iter().map(|a| a.get_info()).collect::<Vec<_>>(),
                 );
             };
         } else {
@@ -163,6 +164,7 @@ pub async fn initialize_device(
             label: None,
             required_features: features,
             required_limits: limits,
+            experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
             memory_hints: wgpu::MemoryHints::MemoryUsage,
             trace: wgpu::Trace::Off,
         })

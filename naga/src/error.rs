@@ -109,7 +109,7 @@ impl DiagnosticBuffer {
         Self { inner }
     }
 
-    pub fn inner_mut(&mut self) -> &mut DiagnosticBufferInner {
+    pub const fn inner_mut(&mut self) -> &mut DiagnosticBufferInner {
         &mut self.inner
     }
 
@@ -134,7 +134,7 @@ where
     E: Error + 'static,
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
-        Some(&self.inner)
+        self.inner.source()
     }
 }
 

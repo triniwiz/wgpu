@@ -38,7 +38,7 @@ fn main() {
     // We first initialize an wgpu `Instance`, which contains any "global" state wgpu needs.
     //
     // This is what loads the vulkan/dx12/metal/opengl libraries.
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
 
     // We then create an `Adapter` which represents a physical gpu in the system. It allows
     // us to query information about it and create a `Device` from it.
@@ -70,6 +70,7 @@ fn main() {
         label: None,
         required_features: wgpu::Features::empty(),
         required_limits: wgpu::Limits::downlevel_defaults(),
+        experimental_features: wgpu::ExperimentalFeatures::disabled(),
         memory_hints: wgpu::MemoryHints::MemoryUsage,
         trace: wgpu::Trace::Off,
     }))
@@ -166,8 +167,8 @@ fn main() {
     // The pipeline layout describes the bind groups that a pipeline expects
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: None,
-        bind_group_layouts: &[&bind_group_layout],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(&bind_group_layout)],
+        immediate_size: 0,
     });
 
     // The pipeline is the ready-to-go program state for the GPU. It contains the shader modules,
@@ -241,7 +242,7 @@ fn main() {
 
     // Wait for the GPU to finish working on the submitted work. This doesn't work on WebGPU, so we would need
     // to rely on the callback to know when the buffer is mapped.
-    device.poll(wgpu::PollType::Wait).unwrap();
+    device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
 
     // We can now read the data from the buffer.
     let data = buffer_slice.get_mapped_range();

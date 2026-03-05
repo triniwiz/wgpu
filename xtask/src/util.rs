@@ -1,6 +1,8 @@
-use std::{io, process::Command};
+use std::{ffi::OsString, io, process::Command};
 
 use anyhow::Context;
+use pico_args::Arguments;
+use serde_json::{json, Value};
 use xshell::Shell;
 
 pub(crate) struct Program {
@@ -10,6 +12,26 @@ pub(crate) struct Program {
 
 pub(crate) fn looks_like_git_sha(input: &str) -> bool {
     input.len() == 40 && input.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+pub(crate) fn flatten_args(
+    args: Arguments,
+    passthrough_args: Option<Vec<OsString>>,
+) -> Vec<OsString> {
+    if let Some(passthrough_args) = passthrough_args {
+        let mut args = args.finish();
+        // The following matches the historical behavior of our xtasks, however,
+        // it would be more general not to re-insert the terminator here, so
+        // that arguments can be passed either to cargo or to tests. i.e., with
+        // the next line, the args are interpreted as `xtask test <xtask args>
+        // -- <test args>`, without it the args would be interpreted as `xtask
+        // test <xtask args> -- <cargo args> -- <test args>`.
+        args.push(OsString::from("--"));
+        args.extend(passthrough_args);
+        args
+    } else {
+        args.finish()
+    }
 }
 
 pub(crate) fn check_all_programs(programs: &[Program]) -> anyhow::Result<()> {
@@ -105,6 +127,21 @@ fn parse_git_version_output(output: &str) -> anyhow::Result<GitVersion> {
     log::debug!("detected Git version {raw_version}");
 
     Ok(parsed)
+}
+
+pub(crate) fn parse_binary_from_cargo_json(jsonl: &str) -> Option<String> {
+    jsonl
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|json| {
+            json.get("reason") == Some(&json!("compiler-artifact"))
+                && json.get("target").and_then(|obj| obj.get("kind")) == Some(&json!(["bin"]))
+        })
+        .find_map(|json| {
+            json.get("executable")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
 }
 
 #[test]

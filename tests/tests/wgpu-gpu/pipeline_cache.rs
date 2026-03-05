@@ -97,8 +97,8 @@ async fn pipeline_cache_test(ctx: TestingContext) {
         .device
         .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("pipeline_layout"),
-            bind_group_layouts: &[&bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
         });
 
     let first_cache_data;
@@ -179,7 +179,9 @@ async fn validate_pipeline(
     encoder.copy_buffer_to_buffer(gpu_buffer, 0, cpu_buffer, 0, ARRAY_SIZE * 4);
     ctx.queue.submit([encoder.finish()]);
     cpu_buffer.slice(..).map_async(wgpu::MapMode::Read, |_| ());
-    ctx.async_poll(wgpu::PollType::wait()).await.unwrap();
+    ctx.async_poll(wgpu::PollType::wait_indefinitely())
+        .await
+        .unwrap();
 
     let data = cpu_buffer.slice(..).get_mapped_range();
 

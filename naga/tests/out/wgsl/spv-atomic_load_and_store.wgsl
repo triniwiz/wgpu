@@ -16,7 +16,7 @@ var<storage, read_write> global: type_5;
 @group(0) @binding(1) 
 var<storage> global_1: type_3;
 
-fn function() {
+fn function_() {
     var phi_25_: type_2;
     var phi_40_: type_2;
     var phi_41_: type_2;
@@ -67,6 +67,6 @@ fn function() {
 }
 
 @compute @workgroup_size(32, 1, 1) 
-fn stagetest_atomic_load_and_store() {
-    function();
+fn stage_test_atomic_load_and_store() {
+    function_();
 }

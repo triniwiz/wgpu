@@ -37,7 +37,7 @@ fn sampler_deduplication(ctx: TestingContext) {
         address_mode_w: wgpu::AddressMode::ClampToEdge,
         mag_filter: wgpu::FilterMode::Nearest,
         min_filter: wgpu::FilterMode::Nearest,
-        mipmap_filter: wgpu::FilterMode::Nearest,
+        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
         lod_min_clamp: 0.0,
         lod_max_clamp: 100.0,
         compare: None,
@@ -52,7 +52,7 @@ fn sampler_deduplication(ctx: TestingContext) {
         address_mode_w: wgpu::AddressMode::ClampToEdge,
         mag_filter: wgpu::FilterMode::Linear,
         min_filter: wgpu::FilterMode::Linear,
-        mipmap_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Linear,
         lod_min_clamp: 0.0,
         lod_max_clamp: 100.0,
         compare: None,
@@ -96,7 +96,7 @@ fn sampler_creation_failure(ctx: TestingContext) {
         address_mode_w: wgpu::AddressMode::ClampToEdge,
         mag_filter: wgpu::FilterMode::Nearest,
         min_filter: wgpu::FilterMode::Nearest,
-        mipmap_filter: wgpu::FilterMode::Nearest,
+        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
         lod_min_clamp: 0.0,
         lod_max_clamp: 100.0,
         compare: None,
@@ -124,7 +124,9 @@ fn sampler_creation_failure(ctx: TestingContext) {
     let failed_count = sampler_storage.len();
 
     sampler_storage.clear();
-    ctx.device.poll(wgpu::PollType::Wait).unwrap();
+    ctx.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .unwrap();
 
     for i in 0..failed_count {
         valid(&ctx.device, || {
@@ -324,16 +326,16 @@ fn sampler_bind_group(ctx: TestingContext, group_type: GroupType) {
             }],
         });
 
-    let mut bgl_references: Vec<_> = bind_group_layouts.iter().collect();
+    let mut bgl_references: Vec<_> = bind_group_layouts.iter().map(Some).collect();
 
-    bgl_references.push(&output_bgl);
+    bgl_references.push(Some(&output_bgl));
 
     let pipeline_layout = ctx
         .device
         .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("pipeline_layout"),
             bind_group_layouts: &bgl_references,
-            push_constant_ranges: &[],
+            immediate_size: 0,
         });
 
     let input_image = ctx.device.create_texture(&wgpu::TextureDescriptor {
@@ -395,7 +397,7 @@ fn sampler_bind_group(ctx: TestingContext, group_type: GroupType) {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             lod_min_clamp: 0.0,
             lod_max_clamp: 100.0,
             compare: None,
@@ -539,7 +541,9 @@ fn sampler_bind_group(ctx: TestingContext, group_type: GroupType) {
     let buffer_slice = transfer_buffer.slice(..);
     buffer_slice.map_async(wgpu::MapMode::Read, |_| {});
 
-    ctx.device.poll(wgpu::PollType::Wait).unwrap();
+    ctx.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .unwrap();
 
     let buffer_data = buffer_slice.get_mapped_range();
 

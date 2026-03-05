@@ -1,4 +1,7 @@
-use crate::*;
+use crate::{
+    api::{impl_deferred_command_buffer_actions, SharedDeferredCommandBufferActions},
+    *,
+};
 
 /// In-progress recording of a compute pass.
 ///
@@ -9,6 +12,9 @@ use crate::*;
 #[derive(Debug)]
 pub struct ComputePass<'encoder> {
     pub(crate) inner: dispatch::DispatchComputePass,
+
+    /// Shared with CommandEncoder to enqueue deferred actions from within a pass.
+    pub(crate) actions: SharedDeferredCommandBufferActions,
 
     /// This lifetime is used to protect the [`CommandEncoder`] from being used
     /// while the pass is alive. This needs to be PhantomDrop to prevent the lifetime
@@ -37,6 +43,7 @@ impl ComputePass<'_> {
     pub fn forget_lifetime(self) -> ComputePass<'static> {
         ComputePass {
             inner: self.inner,
+            actions: self.actions,
             _encoder_guard: crate::api::PhantomDrop::default(),
         }
     }
@@ -95,6 +102,8 @@ impl ComputePass<'_> {
             .dispatch_workgroups_indirect(&indirect_buffer.inner, indirect_offset);
     }
 
+    impl_deferred_command_buffer_actions!();
+
     #[cfg(custom)]
     /// Returns custom implementation of ComputePass (if custom backend and is internally T)
     pub fn as_custom<T: custom::ComputePassInterface>(&self) -> Option<&T> {
@@ -102,18 +111,18 @@ impl ComputePass<'_> {
     }
 }
 
-/// [`Features::PUSH_CONSTANTS`] must be enabled on the device in order to call these functions.
+/// [`Features::IMMEDIATES`] must be enabled on the device in order to call these functions.
 impl ComputePass<'_> {
-    /// Set push constant data for subsequent dispatch calls.
+    /// Set immediate data for subsequent dispatch calls.
     ///
-    /// Write the bytes in `data` at offset `offset` within push constant
+    /// Write the bytes in `data` at offset `offset` within immediate data
     /// storage.  Both `offset` and the length of `data` must be
-    /// multiples of [`PUSH_CONSTANT_ALIGNMENT`], which is always 4.
+    /// multiples of [`crate::IMMEDIATE_DATA_ALIGNMENT`], which is always 4.
     ///
     /// For example, if `offset` is `4` and `data` is eight bytes long, this
-    /// call will write `data` to bytes `4..12` of push constant storage.
-    pub fn set_push_constants(&mut self, offset: u32, data: &[u8]) {
-        self.inner.set_push_constants(offset, data);
+    /// call will write `data` to bytes `4..12` of immediate data storage.
+    pub fn set_immediates(&mut self, offset: u32, data: &[u8]) {
+        self.inner.set_immediates(offset, data);
     }
 }
 
@@ -134,6 +143,11 @@ impl ComputePass<'_> {
 impl ComputePass<'_> {
     /// Start a pipeline statistics query on this compute pass. It can be ended with
     /// `end_pipeline_statistics_query`. Pipeline statistics queries may not be nested.
+    ///
+    /// The amount of information collected by this query, and the space occupied in the query set,
+    /// is determined by the [`PipelineStatisticsTypes`] the query set was created with.
+    /// `query_index` is the index of the first query result slot that will be written to, and
+    /// `query_set` must have sufficient size to hold all results written starting at that slot.
     pub fn begin_pipeline_statistics_query(&mut self, query_set: &QuerySet, query_index: u32) {
         self.inner
             .begin_pipeline_statistics_query(&query_set.inner, query_index);

@@ -135,7 +135,7 @@ pub trait DynDevice: DynResource {
         &self,
         fence: &dyn DynFence,
         value: FenceValue,
-        timeout_ms: u32,
+        timeout: Option<core::time::Duration>,
     ) -> Result<bool, DeviceError>;
 
     unsafe fn start_graphics_debugger_capture(&self) -> bool;
@@ -290,12 +290,12 @@ impl<D: Device + DynResource> DynDevice for D {
         let bind_group_layouts: Vec<_> = desc
             .bind_group_layouts
             .iter()
-            .map(|bgl| bgl.expect_downcast_ref())
+            .map(|bgl| bgl.map(|bgl| bgl.expect_downcast_ref()))
             .collect();
         let desc = PipelineLayoutDescriptor {
             label: desc.label,
             bind_group_layouts: &bind_group_layouts,
-            push_constant_ranges: desc.push_constant_ranges,
+            immediate_size: desc.immediate_size,
             flags: desc.flags,
         };
 
@@ -407,7 +407,7 @@ impl<D: Device + DynResource> DynDevice for D {
             multisample: desc.multisample,
             fragment_stage: desc.fragment_stage.clone().map(|f| f.expect_downcast()),
             color_targets: desc.color_targets,
-            multiview: desc.multiview,
+            multiview_mask: desc.multiview_mask,
             cache: desc.cache.map(|c| c.expect_downcast_ref()),
         };
 
@@ -486,10 +486,10 @@ impl<D: Device + DynResource> DynDevice for D {
         &self,
         fence: &dyn DynFence,
         value: FenceValue,
-        timeout_ms: u32,
+        timeout: Option<core::time::Duration>,
     ) -> Result<bool, DeviceError> {
         let fence = fence.expect_downcast_ref();
-        unsafe { D::wait(self, fence, value, timeout_ms) }
+        unsafe { D::wait(self, fence, value, timeout) }
     }
 
     unsafe fn start_graphics_debugger_capture(&self) -> bool {

@@ -9,11 +9,11 @@ repository.workspace = true
 keywords.workspace = true
 license.workspace = true
 
-# Override the workspace's `rust-version` key. Firefox uses `cargo vendor` to
-# copy the crates it actually uses out of the workspace, so it's meaningful for
-# them to have less restrictive MSRVs individually than the workspace as a
-# whole, if their code permits. See `../README.md` for details.
-rust-version = "1.82.0"
+# Override the workspace's `rust-version` key. `wgpu-core` and its dependencies
+# have a less strict MSRV, to allow firefox more leeway in updating their Rust toolchain.
+#
+# See the repo README for more information on MSRV policy.
+rust-version = "1.87"
 
 [package.metadata.docs.rs]
 all-features = true
@@ -37,7 +37,7 @@ alloc_instead_of_core = "warn"
 
 [features]
 default = ["std"]
-std = ["js-sys?/std", "web-sys?/std", "thiserror/std"]
+std = ["js-sys?/std", "web-sys?/std"]
 strict_asserts = []
 fragile-send-sync-non-atomic-wasm = []
 serde = ["dep:serde", "bitflags/serde"]
@@ -49,10 +49,10 @@ trace = ["std"]
 web = ["dep:js-sys", "dep:web-sys"]
 
 [dependencies]
-bitflags = { workspace = true, features = ["serde"] }
+bitflags.workspace = true
 bytemuck = { workspace = true, features = ["derive"] }
 log.workspace = true
-thiserror = { workspace = true, optional = true }
+raw-window-handle.workspace = true
 serde = { workspace = true, default-features = false, features = [
     "alloc",
     "derive",

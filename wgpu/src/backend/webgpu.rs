@@ -15,8 +15,7 @@ use alloc::{
     vec::Vec,
 };
 use core::{
-    cell::OnceCell,
-    cell::RefCell,
+    cell::{Cell, OnceCell, RefCell},
     fmt,
     future::Future,
     ops::Range,
@@ -51,6 +50,7 @@ macro_rules! impl_send_sync {
     };
 }
 
+#[derive(Clone)]
 pub struct ContextWebGpu {
     /// `None` if browser does not advertise support for WebGPU.
     gpu: Option<DefinedNonNullJsValue<webgpu_sys::Gpu>>,
@@ -86,7 +86,7 @@ impl crate::Error {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WebShaderModule {
     module: webgpu_sys::GpuShaderModule,
     compilation_info: WebShaderCompilationInfo,
@@ -234,9 +234,7 @@ fn map_texture_format(texture_format: wgt::TextureFormat) -> webgpu_sys::GpuText
         TextureFormat::Bgra8UnormSrgb => tf::Bgra8unormSrgb,
         // Packed 32-bit formats
         TextureFormat::Rgb9e5Ufloat => tf::Rgb9e5ufloat,
-        TextureFormat::Rgb10a2Uint => {
-            unimplemented!("Current version of web_sys is missing {texture_format:?}")
-        }
+        TextureFormat::Rgb10a2Uint => tf::Rgb10a2uint,
         TextureFormat::Rgb10a2Unorm => tf::Rgb10a2unorm,
         TextureFormat::Rg11b10Ufloat => tf::Rg11b10ufloat,
         // 64-bit formats
@@ -435,8 +433,12 @@ fn map_stencil_state_face(desc: &wgt::StencilFaceState) -> webgpu_sys::GpuStenci
 
 fn map_depth_stencil_state(desc: &wgt::DepthStencilState) -> webgpu_sys::GpuDepthStencilState {
     let mapped = webgpu_sys::GpuDepthStencilState::new(map_texture_format(desc.format));
-    mapped.set_depth_compare(map_compare_function(desc.depth_compare));
-    mapped.set_depth_write_enabled(desc.depth_write_enabled);
+    if let Some(compare) = desc.depth_compare {
+        mapped.set_depth_compare(map_compare_function(compare));
+    }
+    if let Some(write_enabled) = desc.depth_write_enabled {
+        mapped.set_depth_write_enabled(write_enabled);
+    }
     mapped.set_depth_bias(desc.bias.constant);
     mapped.set_depth_bias_clamp(desc.bias.clamp);
     mapped.set_depth_bias_slope_scale(desc.bias.slope_scale);
@@ -631,6 +633,7 @@ fn map_texture_copy_view(
     let mapped = webgpu_sys::GpuTexelCopyTextureInfo::new(&texture.inner);
     mapped.set_mip_level(view.mip_level);
     mapped.set_origin(&map_origin_3d(view.origin));
+    mapped.set_aspect(map_texture_aspect(view.aspect));
     mapped
 }
 
@@ -674,10 +677,10 @@ fn map_filter_mode(mode: wgt::FilterMode) -> webgpu_sys::GpuFilterMode {
     }
 }
 
-fn map_mipmap_filter_mode(mode: wgt::FilterMode) -> webgpu_sys::GpuMipmapFilterMode {
+fn map_mipmap_filter_mode(mode: wgt::MipmapFilterMode) -> webgpu_sys::GpuMipmapFilterMode {
     match mode {
-        wgt::FilterMode::Nearest => webgpu_sys::GpuMipmapFilterMode::Nearest,
-        wgt::FilterMode::Linear => webgpu_sys::GpuMipmapFilterMode::Linear,
+        wgt::MipmapFilterMode::Nearest => webgpu_sys::GpuMipmapFilterMode::Nearest,
+        wgt::MipmapFilterMode::Linear => webgpu_sys::GpuMipmapFilterMode::Linear,
     }
 }
 
@@ -772,8 +775,7 @@ const FEATURES_MAPPING: [(wgt::Features, webgpu_sys::GpuFeatureName); 15] = [
 ];
 
 fn map_wgt_features(supported_features: webgpu_sys::GpuSupportedFeatures) -> wgt::Features {
-    // We emulate MDI.
-    let mut features = wgt::Features::MULTI_DRAW_INDIRECT;
+    let mut features = wgt::Features::empty();
     for (wgpu_feat, web_feat) in FEATURES_MAPPING {
         match wasm_bindgen::JsValue::from(web_feat).as_string() {
             Some(value) if supported_features.has(&value) => features |= wgpu_feat,
@@ -808,6 +810,7 @@ fn map_wgt_limits(limits: webgpu_sys::GpuSupportedLimits) -> wgt::Limits {
         max_buffer_size: limits.max_buffer_size() as u64,
         max_vertex_attributes: limits.max_vertex_attributes(),
         max_vertex_buffer_array_stride: limits.max_vertex_buffer_array_stride(),
+        max_inter_stage_shader_variables: limits.max_inter_stage_shader_variables(),
         min_uniform_buffer_offset_alignment: limits.min_uniform_buffer_offset_alignment(),
         min_storage_buffer_offset_alignment: limits.min_storage_buffer_offset_alignment(),
         max_color_attachments: limits.max_color_attachments(),
@@ -818,23 +821,51 @@ fn map_wgt_limits(limits: webgpu_sys::GpuSupportedLimits) -> wgt::Limits {
         max_compute_workgroup_size_y: limits.max_compute_workgroup_size_y(),
         max_compute_workgroup_size_z: limits.max_compute_workgroup_size_z(),
         max_compute_workgroups_per_dimension: limits.max_compute_workgroups_per_dimension(),
-        // The following are not part of WebGPU
-        min_subgroup_size: wgt::Limits::default().min_subgroup_size,
-        max_subgroup_size: wgt::Limits::default().max_subgroup_size,
-        max_push_constant_size: wgt::Limits::default().max_push_constant_size,
+        max_immediate_size: wgt::Limits::default().max_immediate_size,
         max_non_sampler_bindings: wgt::Limits::default().max_non_sampler_bindings,
-        max_inter_stage_shader_components: wgt::Limits::default().max_inter_stage_shader_components,
 
-        max_task_workgroup_total_count: wgt::Limits::default().max_task_workgroup_total_count,
-        max_task_workgroups_per_dimension: wgt::Limits::default().max_task_workgroups_per_dimension,
+        max_task_mesh_workgroup_total_count: wgt::Limits::default()
+            .max_task_mesh_workgroup_total_count,
+        max_task_mesh_workgroups_per_dimension: wgt::Limits::default()
+            .max_task_mesh_workgroups_per_dimension,
+        max_task_invocations_per_workgroup: wgt::Limits::default()
+            .max_task_invocations_per_workgroup,
+        max_task_invocations_per_dimension: wgt::Limits::default()
+            .max_task_invocations_per_dimension,
+        max_mesh_invocations_per_workgroup: wgt::Limits::default()
+            .max_mesh_invocations_per_workgroup,
+        max_mesh_invocations_per_dimension: wgt::Limits::default()
+            .max_mesh_invocations_per_dimension,
+        max_task_payload_size: wgt::Limits::default().max_task_payload_size,
+        max_mesh_output_vertices: wgt::Limits::default().max_mesh_output_vertices,
+        max_mesh_output_primitives: wgt::Limits::default().max_mesh_output_primitives,
         max_mesh_output_layers: wgt::Limits::default().max_mesh_output_layers,
-        max_mesh_multiview_count: wgt::Limits::default().max_mesh_multiview_count,
+        max_mesh_multiview_view_count: wgt::Limits::default().max_mesh_multiview_view_count,
 
         max_blas_primitive_count: wgt::Limits::default().max_blas_primitive_count,
         max_blas_geometry_count: wgt::Limits::default().max_blas_geometry_count,
         max_tlas_instance_count: wgt::Limits::default().max_tlas_instance_count,
         max_acceleration_structures_per_shader_stage: wgt::Limits::default()
             .max_acceleration_structures_per_shader_stage,
+
+        max_multiview_view_count: wgt::Limits::default().max_multiview_view_count,
+    }
+}
+
+fn map_adapter_info(adapter_info: &webgpu_sys::GpuAdapterInfo) -> wgt::AdapterInfo {
+    // TODO(https://github.com/gfx-rs/wgpu/issues/8819): populate more fields if/when possible
+    wgt::AdapterInfo {
+        name: adapter_info.description().to_string(),
+        vendor: 0,
+        device: 0,
+        device_type: wgt::DeviceType::Other,
+        device_pci_bus_id: String::new(),
+        driver: String::new(),
+        driver_info: String::new(),
+        backend: wgt::Backend::BrowserWebGpu,
+        subgroup_min_size: wgt::MINIMUM_SUBGROUP_MIN_SIZE,
+        subgroup_max_size: wgt::MAXIMUM_SUBGROUP_MAX_SIZE,
+        transient_saves_memory: false,
     }
 }
 
@@ -858,6 +889,7 @@ fn map_js_sys_limits(limits: &wgt::Limits) -> js_sys::Object {
         }
     }
 
+    // https://gpuweb.github.io/gpuweb/#gpusupportedlimits
     set_properties![
         (limits) => (object):
         (maxTextureDimension1D, max_texture_dimension_1d),
@@ -865,6 +897,7 @@ fn map_js_sys_limits(limits: &wgt::Limits) -> js_sys::Object {
         (maxTextureDimension3D, max_texture_dimension_3d),
         (maxTextureArrayLayers, max_texture_array_layers),
         (maxBindGroups, max_bind_groups),
+        // TODO: (maxBindGroupsPlusVertexBuffers, max_bind_groups_plus_vertex_buffers),
         (maxBindingsPerBindGroup, max_bindings_per_bind_group),
         (maxDynamicUniformBuffersPerPipelineLayout, max_dynamic_uniform_buffers_per_pipeline_layout),
         (maxDynamicStorageBuffersPerPipelineLayout, max_dynamic_storage_buffers_per_pipeline_layout),
@@ -881,6 +914,9 @@ fn map_js_sys_limits(limits: &wgt::Limits) -> js_sys::Object {
         (maxBufferSize, max_buffer_size),
         (maxVertexAttributes, max_vertex_attributes),
         (maxVertexBufferArrayStride, max_vertex_buffer_array_stride),
+        (maxInterStageShaderVariables, max_inter_stage_shader_variables),
+        (maxColorAttachments, max_color_attachments),
+        (maxColorAttachmentBytesPerSample, max_color_attachment_bytes_per_sample),
         (maxComputeWorkgroupStorageSize, max_compute_workgroup_storage_size),
         (maxComputeInvocationsPerWorkgroup, max_compute_invocations_per_workgroup),
         (maxComputeWorkgroupSizeX, max_compute_workgroup_size_x),
@@ -937,6 +973,7 @@ fn future_request_device(
                 WebDevice {
                     inner: device,
                     ident: crate::cmp::Identifier::create(),
+                    error_scope_count: Rc::new(Cell::new(0)),
                 }
                 .into(),
                 WebQueue {
@@ -1108,7 +1145,7 @@ extern "C" {
     fn worker(this: &Global) -> JsValue;
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Canvas {
     Canvas(web_sys::HtmlCanvasElement),
     Offscreen(web_sys::OffscreenCanvas),
@@ -1148,49 +1185,51 @@ pub fn get_browser_gpu_property(
     Ok(DefinedNonNullJsValue::new(maybe_undefined_gpu))
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WebAdapter {
     pub(crate) inner: webgpu_sys::GpuAdapter,
     /// Unique identifier for this Adapter.
     ident: crate::cmp::Identifier,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WebDevice {
     pub(crate) inner: webgpu_sys::GpuDevice,
     /// Unique identifier for this Device.
     ident: crate::cmp::Identifier,
+    /// Current number of error scopes that have been pushed on the device.
+    error_scope_count: Rc<Cell<u32>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WebQueue {
     pub(crate) inner: webgpu_sys::GpuQueue,
     /// Unique identifier for this Queue.
     ident: crate::cmp::Identifier,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WebBindGroupLayout {
     pub(crate) inner: webgpu_sys::GpuBindGroupLayout,
     /// Unique identifier for this BindGroupLayout.
     ident: crate::cmp::Identifier,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WebBindGroup {
     pub(crate) inner: webgpu_sys::GpuBindGroup,
     /// Unique identifier for this BindGroup.
     ident: crate::cmp::Identifier,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WebTextureView {
     pub(crate) inner: webgpu_sys::GpuTextureView,
     /// Unique identifier for this TextureView.
     ident: crate::cmp::Identifier,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WebSampler {
     pub(crate) inner: webgpu_sys::GpuSampler,
     /// Unique identifier for this Sampler.
@@ -1199,7 +1238,7 @@ pub struct WebSampler {
 
 /// Remembers which portion of a buffer has been mapped, along with a reference
 /// to the mapped portion.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct WebBufferMapState {
     /// The mapped memory of the buffer.
     pub mapped_buffer: Option<js_sys::ArrayBuffer>,
@@ -1211,12 +1250,12 @@ struct WebBufferMapState {
 /// The WebGPU specification forbids calling `getMappedRange` on a `webgpu_sys::GpuBuffer` more than
 /// once, so this struct stores the initial mapped range and re-uses it, allowing for multiple `get_mapped_range`
 /// calls on the Rust-side.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WebBuffer {
     /// The associated GPU buffer.
     inner: webgpu_sys::GpuBuffer,
     /// The mapped array buffer and mapped range.
-    mapping: RefCell<WebBufferMapState>,
+    mapping: Rc<RefCell<WebBufferMapState>>,
     /// Unique identifier for this Buffer.
     ident: crate::cmp::Identifier,
 }
@@ -1226,10 +1265,10 @@ impl WebBuffer {
     fn new(inner: webgpu_sys::GpuBuffer, desc: &crate::BufferDescriptor<'_>) -> Self {
         Self {
             inner,
-            mapping: RefCell::new(WebBufferMapState {
+            mapping: Rc::new(RefCell::new(WebBufferMapState {
                 mapped_buffer: None,
                 range: 0..desc.size,
-            }),
+            })),
             ident: crate::cmp::Identifier::create(),
         }
     }
@@ -1259,66 +1298,66 @@ impl WebBuffer {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WebTexture {
     pub(crate) inner: webgpu_sys::GpuTexture,
     /// Unique identifier for this Texture.
     ident: crate::cmp::Identifier,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WebExternalTexture {
     /// Unique identifier for this ExternalTexture.
     ident: crate::cmp::Identifier,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WebBlas {
     /// Unique identifier for this Blas.
     ident: crate::cmp::Identifier,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WebTlas {
     /// Unique identifier for this Blas.
     ident: crate::cmp::Identifier,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WebQuerySet {
     pub(crate) inner: webgpu_sys::GpuQuerySet,
     /// Unique identifier for this QuerySet.
     ident: crate::cmp::Identifier,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WebPipelineLayout {
     pub(crate) inner: webgpu_sys::GpuPipelineLayout,
     /// Unique identifier for this PipelineLayout.
     ident: crate::cmp::Identifier,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WebRenderPipeline {
     pub(crate) inner: webgpu_sys::GpuRenderPipeline,
     /// Unique identifier for this RenderPipeline.
     ident: crate::cmp::Identifier,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WebComputePipeline {
     pub(crate) inner: webgpu_sys::GpuComputePipeline,
     /// Unique identifier for this ComputePipeline.
     ident: crate::cmp::Identifier,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WebPipelineCache {
     /// Unique identifier for this PipelineCache.
     ident: crate::cmp::Identifier,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WebCommandEncoder {
     pub(crate) inner: webgpu_sys::GpuCommandEncoder,
     /// Unique identifier for this CommandEncoder.
@@ -1346,21 +1385,21 @@ pub struct WebCommandBuffer {
     ident: crate::cmp::Identifier,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WebRenderBundleEncoder {
     pub(crate) inner: webgpu_sys::GpuRenderBundleEncoder,
     /// Unique identifier for this RenderBundleEncoder.
     ident: crate::cmp::Identifier,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WebRenderBundle {
     pub(crate) inner: webgpu_sys::GpuRenderBundle,
     /// Unique identifier for this RenderBundle.
     ident: crate::cmp::Identifier,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WebSurface {
     gpu: Option<DefinedNonNullJsValue<webgpu_sys::Gpu>>,
     canvas: Canvas,
@@ -1369,7 +1408,7 @@ pub struct WebSurface {
     ident: crate::cmp::Identifier,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WebSurfaceOutputDetail {
     /// Unique identifier for this SurfaceOutputDetail.
     ident: crate::cmp::Identifier,
@@ -1455,7 +1494,7 @@ crate::cmp::impl_eq_ord_hash_proxy!(WebQueueWriteBuffer => .ident);
 crate::cmp::impl_eq_ord_hash_proxy!(WebBufferMappedRange => .ident);
 
 impl dispatch::InstanceInterface for ContextWebGpu {
-    fn new(desc: &crate::InstanceDescriptor) -> Self
+    fn new(desc: crate::InstanceDescriptor) -> Self
     where
         Self: Sized,
     {
@@ -1569,6 +1608,20 @@ impl dispatch::InstanceInterface for ContextWebGpu {
             ))))
         }
     }
+    fn enumerate_adapters(
+        &self,
+        _backends: crate::Backends,
+    ) -> Pin<Box<dyn dispatch::EnumerateAdapterFuture>> {
+        let future = self.request_adapter(&crate::RequestAdapterOptions::default());
+        let enumerate_future = async move {
+            let adapter = future.await;
+            match adapter {
+                Ok(a) => vec![a],
+                Err(_) => vec![],
+            }
+        };
+        Box::pin(enumerate_future)
+    }
 
     fn poll_all_devices(&self, _force_wait: bool) -> bool {
         // Devices are automatically polled.
@@ -1627,16 +1680,8 @@ impl dispatch::AdapterInterface for WebAdapter {
 
         let mapped_desc = webgpu_sys::GpuDeviceDescriptor::new();
 
-        // TODO: Migrate to a web_sys api.
-        // See https://github.com/rustwasm/wasm-bindgen/issues/3587
-        let limits_object = map_js_sys_limits(&desc.required_limits);
-
-        js_sys::Reflect::set(
-            &mapped_desc,
-            &JsValue::from("requiredLimits"),
-            &limits_object,
-        )
-        .expect("Setting Object properties should never fail.");
+        let required_limits = map_js_sys_limits(&desc.required_limits);
+        mapped_desc.set_required_limits(&required_limits);
 
         let required_features = FEATURES_MAPPING
             .iter()
@@ -1682,16 +1727,7 @@ impl dispatch::AdapterInterface for WebAdapter {
     }
 
     fn get_info(&self) -> crate::AdapterInfo {
-        // TODO: web-sys has no way of getting information on adapters
-        wgt::AdapterInfo {
-            name: String::new(),
-            vendor: 0,
-            device: 0,
-            device_type: wgt::DeviceType::Other,
-            driver: String::new(),
-            driver_info: String::new(),
-            backend: wgt::Backend::BrowserWebGpu,
-        }
+        map_adapter_info(&self.inner.info())
     }
 
     fn get_texture_format_features(
@@ -1703,6 +1739,10 @@ impl dispatch::AdapterInterface for WebAdapter {
 
     fn get_presentation_timestamp(&self) -> crate::PresentationTimestamp {
         crate::PresentationTimestamp::INVALID_TIMESTAMP
+    }
+
+    fn cooperative_matrix_properties(&self) -> Vec<wgt::CooperativeMatrixProperties> {
+        Vec::new()
     }
 }
 impl Drop for WebAdapter {
@@ -1718,6 +1758,10 @@ impl dispatch::DeviceInterface for WebDevice {
 
     fn limits(&self) -> crate::Limits {
         map_wgt_limits(self.inner.limits())
+    }
+
+    fn adapter_info(&self) -> crate::AdapterInfo {
+        map_adapter_info(&self.inner.adapter_info())
     }
 
     fn create_shader_module(
@@ -1876,7 +1920,7 @@ impl dispatch::DeviceInterface for WebDevice {
             Err(crate::CompilationInfo {
                 messages: vec![crate::CompilationMessage {
                     message:
-                        "Passthrough shader not compiled for WGSL on WebGPU backend (WGPU error)"
+                        "Passthrough shader not compiled for WGSL on WebGPU backend (wgpu error)"
                             .to_string(),
                     location: None,
                     message_type: crate::CompilationMessageType::Error,
@@ -2085,10 +2129,14 @@ impl dispatch::DeviceInterface for WebDevice {
         &self,
         desc: &crate::PipelineLayoutDescriptor<'_>,
     ) -> dispatch::DispatchPipelineLayout {
+        let null = wasm_bindgen::JsValue::NULL;
         let temp_layouts = desc
             .bind_group_layouts
             .iter()
-            .map(|bgl| &bgl.inner.as_webgpu().inner)
+            .map(|bgl| match bgl {
+                Some(bgl) => bgl.inner.as_webgpu().inner.as_ref(),
+                None => &null,
+            })
             .collect::<js_sys::Array>();
         let mapped_desc = webgpu_sys::GpuPipelineLayoutDescriptor::new(&temp_layouts);
         if let Some(label) = desc.label {
@@ -2279,7 +2327,7 @@ impl dispatch::DeviceInterface for WebDevice {
         let mapped_desc = webgpu_sys::GpuTextureDescriptor::new(
             map_texture_format(desc.format),
             &map_extent_3d(desc.size),
-            desc.usage.bits(),
+            (desc.usage - crate::TextureUsages::TRANSIENT).bits(),
         );
         if let Some(label) = desc.label {
             mapped_desc.set_label(label);
@@ -2456,15 +2504,36 @@ impl dispatch::DeviceInterface for WebDevice {
         f.forget();
     }
 
-    fn push_error_scope(&self, filter: crate::ErrorFilter) {
+    fn push_error_scope(&self, filter: crate::ErrorFilter) -> u32 {
+        let index = self.error_scope_count.get();
+        self.error_scope_count.set(
+            index
+                .checked_add(1)
+                .expect("Greater than 2^32 nested error scopes"),
+        );
         self.inner.push_error_scope(match filter {
             crate::ErrorFilter::OutOfMemory => webgpu_sys::GpuErrorFilter::OutOfMemory,
             crate::ErrorFilter::Validation => webgpu_sys::GpuErrorFilter::Validation,
             crate::ErrorFilter::Internal => webgpu_sys::GpuErrorFilter::Internal,
         });
+        index
     }
 
-    fn pop_error_scope(&self) -> Pin<Box<dyn dispatch::PopErrorScopeFuture>> {
+    fn pop_error_scope(&self, index: u32) -> Pin<Box<dyn dispatch::PopErrorScopeFuture>> {
+        let current_scope_count = self.error_scope_count.get();
+        let is_panicking = crate::util::is_panicking();
+        if current_scope_count == 0 && !is_panicking {
+            panic!("Mismatched pop_error_scope call: no error scope for this thread. Error scopes are thread-local.");
+        }
+        if index + 1 != current_scope_count && !is_panicking {
+            panic!(
+                "Mismatched pop_error_scope call: error scopes must be popped in reverse order."
+            );
+        }
+        // Decrement the error scope count. We've asserted that the current
+        // size is `index + 1` above.
+        self.error_scope_count.set(index);
+
         let error_promise = self.inner.pop_error_scope();
         Box::pin(MakeSendFuture::new(
             wasm_bindgen_futures::JsFuture::from(error_promise),
@@ -2497,6 +2566,7 @@ impl dispatch::DeviceInterface for WebDevice {
         self.inner.destroy();
     }
 }
+
 impl Drop for WebDevice {
     fn drop(&mut self) {
         // no-op
@@ -2511,20 +2581,11 @@ impl dispatch::QueueInterface for WebQueue {
         data: &[u8],
     ) {
         let buffer = buffer.as_webgpu();
-        /* Skip the copy once gecko allows BufferSource instead of ArrayBuffer
-        self.inner.write_buffer_with_f64_and_u8_array_and_f64_and_f64(
-            &buffer.buffer,
-            offset as f64,
-            data,
-            0f64,
-            data.len() as f64,
-        );
-        */
         self.inner
-            .write_buffer_with_f64_and_buffer_source_and_f64_and_f64(
+            .write_buffer_with_f64_and_u8_slice_and_f64_and_f64(
                 &buffer.inner,
                 offset as f64,
-                &js_sys::Uint8Array::from(data).buffer(),
+                data,
                 0f64,
                 data.len() as f64,
             )
@@ -2559,11 +2620,11 @@ impl dispatch::QueueInterface for WebQueue {
             return None;
         }
         let write_size = u64::from(size);
-        if write_size % wgt::COPY_BUFFER_ALIGNMENT != 0 {
+        if !write_size.is_multiple_of(wgt::COPY_BUFFER_ALIGNMENT) {
             log::error!("Copy size {size} does not respect `COPY_BUFFER_ALIGNMENT`");
             return None;
         }
-        if offset % wgt::COPY_BUFFER_ALIGNMENT != 0 {
+        if !offset.is_multiple_of(wgt::COPY_BUFFER_ALIGNMENT) {
             log::error!(
                 "Buffer offset {offset} is not aligned to block size or `COPY_BUFFER_ALIGNMENT`"
             );
@@ -2603,18 +2664,10 @@ impl dispatch::QueueInterface for WebQueue {
         }
         mapped_data_layout.set_offset(data_layout.offset as f64);
 
-        /* Skip the copy once gecko allows BufferSource instead of ArrayBuffer
-        self.inner.write_texture_with_u8_array_and_gpu_extent_3d_dict(
-            &map_texture_copy_view(texture),
-            data,
-            &mapped_data_layout,
-            &map_extent_3d(size),
-        );
-        */
         self.inner
-            .write_texture_with_buffer_source_and_gpu_extent_3d_dict(
+            .write_texture_with_u8_slice_and_gpu_extent_3d_dict(
                 &map_texture_copy_view(texture),
-                &js_sys::Uint8Array::from(data).buffer(),
+                data,
                 &mapped_data_layout,
                 &map_extent_3d(size),
             )
@@ -3026,6 +3079,13 @@ impl dispatch::CommandEncoderInterface for WebCommandEncoder {
                             clear_value = Some(wasm_bindgen::JsValue::from(map_color(color)));
                             webgpu_sys::GpuLoadOp::Clear
                         }
+                        crate::LoadOp::DontCare(_token) => {
+                            // WebGPU can't safely have a ClearOp::DontCare, so we clear to black
+                            // which is ideal for most GPUs.
+                            clear_value =
+                                Some(wasm_bindgen::JsValue::from(map_color(crate::Color::BLACK)));
+                            webgpu_sys::GpuLoadOp::Clear
+                        }
                         crate::LoadOp::Load => webgpu_sys::GpuLoadOp::Load,
                     };
 
@@ -3067,6 +3127,11 @@ impl dispatch::CommandEncoderInterface for WebCommandEncoder {
                         mapped_depth_stencil_attachment.set_depth_clear_value(v);
                         webgpu_sys::GpuLoadOp::Clear
                     }
+                    crate::LoadOp::DontCare(_token) => {
+                        // WebGPU can't safely have a ClearOp::DontCare, so we clear to 1.0
+                        mapped_depth_stencil_attachment.set_depth_clear_value(1.0);
+                        webgpu_sys::GpuLoadOp::Clear
+                    }
                     crate::LoadOp::Load => webgpu_sys::GpuLoadOp::Load,
                 };
                 mapped_depth_stencil_attachment.set_depth_load_op(load_op);
@@ -3077,6 +3142,11 @@ impl dispatch::CommandEncoderInterface for WebCommandEncoder {
                 let load_op = match ops.load {
                     crate::LoadOp::Clear(v) => {
                         mapped_depth_stencil_attachment.set_stencil_clear_value(v);
+                        webgpu_sys::GpuLoadOp::Clear
+                    }
+                    crate::LoadOp::DontCare(_token) => {
+                        // WebGPU can't safely have a ClearOp::DontCare, so we clear to 0
+                        mapped_depth_stencil_attachment.set_stencil_clear_value(0);
                         webgpu_sys::GpuLoadOp::Clear
                     }
                     crate::LoadOp::Load => webgpu_sys::GpuLoadOp::Load,
@@ -3154,19 +3224,16 @@ impl dispatch::CommandEncoderInterface for WebCommandEncoder {
         }
     }
 
-    fn insert_debug_marker(&self, _label: &str) {
-        // Not available in gecko yet
-        // self.insert_debug_marker(label);
+    fn insert_debug_marker(&self, label: &str) {
+        self.inner.insert_debug_marker(label)
     }
 
-    fn push_debug_group(&self, _label: &str) {
-        // Not available in gecko yet
-        // self.push_debug_group(label);
+    fn push_debug_group(&self, group_label: &str) {
+        self.inner.push_debug_group(group_label)
     }
 
     fn pop_debug_group(&self) {
-        // Not available in gecko yet
-        // self.pop_debug_group();
+        self.inner.pop_debug_group()
     }
 
     fn write_timestamp(&self, _query_set: &dispatch::DispatchQuerySet, _query_index: u32) {
@@ -3252,18 +3319,15 @@ impl dispatch::ComputePassInterface for WebComputePassEncoder {
         bind_group: Option<&dispatch::DispatchBindGroup>,
         offsets: &[crate::DynamicOffset],
     ) {
-        let Some(bind_group) = bind_group else {
-            return;
-        };
-        let bind_group = &bind_group.as_webgpu().inner;
+        let bind_group = bind_group.map(|bind_group| &bind_group.as_webgpu().inner);
 
         if offsets.is_empty() {
-            self.inner.set_bind_group(index, Some(bind_group));
+            self.inner.set_bind_group(index, bind_group);
         } else {
             self.inner
                 .set_bind_group_with_u32_slice_and_f64_and_dynamic_offsets_data_length(
                     index,
-                    Some(bind_group),
+                    bind_group,
                     offsets,
                     0f64,
                     offsets.len() as u32,
@@ -3272,23 +3336,20 @@ impl dispatch::ComputePassInterface for WebComputePassEncoder {
         }
     }
 
-    fn set_push_constants(&mut self, _offset: u32, _data: &[u8]) {
-        panic!("PUSH_CONSTANTS feature must be enabled to call multi_draw_indexed_indirect")
+    fn set_immediates(&mut self, _offset: u32, _data: &[u8]) {
+        panic!("IMMEDIATES feature must be enabled to call set_immediates")
     }
 
-    fn insert_debug_marker(&mut self, _label: &str) {
-        // Not available in gecko yet
-        // self.inner.insert_debug_marker(label);
+    fn insert_debug_marker(&mut self, label: &str) {
+        self.inner.insert_debug_marker(label);
     }
 
-    fn push_debug_group(&mut self, _group_label: &str) {
-        // Not available in gecko yet
-        // self.inner.push_debug_group(group_label);
+    fn push_debug_group(&mut self, group_label: &str) {
+        self.inner.push_debug_group(group_label);
     }
 
     fn pop_debug_group(&mut self) {
-        // Not available in gecko yet
-        // self.inner.pop_debug_group();
+        self.inner.pop_debug_group();
     }
 
     fn write_timestamp(&mut self, _query_set: &dispatch::DispatchQuerySet, _query_index: u32) {
@@ -3322,14 +3383,10 @@ impl dispatch::ComputePassInterface for WebComputePassEncoder {
         self.inner
             .dispatch_workgroups_indirect_with_f64(&indirect_buffer.inner, indirect_offset as f64);
     }
-
-    fn end(&mut self) {
-        self.inner.end();
-    }
 }
 impl Drop for WebComputePassEncoder {
     fn drop(&mut self) {
-        dispatch::ComputePassInterface::end(self);
+        self.inner.end();
     }
 }
 
@@ -3346,18 +3403,15 @@ impl dispatch::RenderPassInterface for WebRenderPassEncoder {
         bind_group: Option<&dispatch::DispatchBindGroup>,
         offsets: &[crate::DynamicOffset],
     ) {
-        let Some(bind_group) = bind_group else {
-            return;
-        };
-        let bind_group = &bind_group.as_webgpu().inner;
+        let bind_group = bind_group.map(|bind_group| &bind_group.as_webgpu().inner);
 
         if offsets.is_empty() {
-            self.inner.set_bind_group(index, Some(bind_group));
+            self.inner.set_bind_group(index, bind_group);
         } else {
             self.inner
                 .set_bind_group_with_u32_slice_and_f64_and_dynamic_offsets_data_length(
                     index,
-                    Some(bind_group),
+                    bind_group,
                     offsets,
                     0f64,
                     offsets.len() as u32,
@@ -3411,8 +3465,8 @@ impl dispatch::RenderPassInterface for WebRenderPassEncoder {
         }
     }
 
-    fn set_push_constants(&mut self, _stages: crate::ShaderStages, _offset: u32, _data: &[u8]) {
-        panic!("PUSH_CONSTANTS feature must be enabled to call multi_draw_indexed_indirect")
+    fn set_immediates(&mut self, _offset: u32, _data: &[u8]) {
+        panic!("IMMEDIATES feature must be enabled to call set_immediates")
     }
 
     fn set_blend_constant(&mut self, color: crate::Color) {
@@ -3569,33 +3623,28 @@ impl dispatch::RenderPassInterface for WebRenderPassEncoder {
         panic!("MESH_SHADER feature must be enabled to call multi_draw_mesh_tasks_indirect_count")
     }
 
-    fn insert_debug_marker(&mut self, _label: &str) {
-        // Not available in gecko yet
-        // self.inner.insert_debug_marker(label);
+    fn insert_debug_marker(&mut self, label: &str) {
+        self.inner.insert_debug_marker(label);
     }
 
-    fn push_debug_group(&mut self, _group_label: &str) {
-        // Not available in gecko yet
-        // self.inner.push_debug_group(group_label);
+    fn push_debug_group(&mut self, group_label: &str) {
+        self.inner.push_debug_group(group_label);
     }
 
     fn pop_debug_group(&mut self) {
-        // Not available in gecko yet
-        // self.inner.pop_debug_group();
+        self.inner.pop_debug_group();
     }
 
     fn write_timestamp(&mut self, _query_set: &dispatch::DispatchQuerySet, _query_index: u32) {
         panic!("TIMESTAMP_QUERY_INSIDE_PASSES feature must be enabled to call write_timestamp in a render pass.")
     }
 
-    fn begin_occlusion_query(&mut self, _query_index: u32) {
-        // Not available in gecko yet
-        // self.inner.begin_occlusion_query(query_index);
+    fn begin_occlusion_query(&mut self, query_index: u32) {
+        self.inner.begin_occlusion_query(query_index);
     }
 
     fn end_occlusion_query(&mut self) {
-        // Not available in gecko yet
-        // self.inner.end_occlusion_query();
+        self.inner.end_occlusion_query();
     }
 
     fn begin_pipeline_statistics_query(
@@ -3603,14 +3652,11 @@ impl dispatch::RenderPassInterface for WebRenderPassEncoder {
         _query_set: &dispatch::DispatchQuerySet,
         _query_index: u32,
     ) {
-        // Not available in gecko yet
-        // let query_set = query_set.as_webgpu();
-        // self.inner.begin_pipeline_statistics_query(query_set, query_index);
+        // Removed from WebGPU in https://github.com/gpuweb/gpuweb/pull/2296
     }
 
     fn end_pipeline_statistics_query(&mut self) {
-        // Not available in gecko yet
-        // self.inner.end_pipeline_statistics_query();
+        // Removed from WebGPU https://github.com/gpuweb/gpuweb/pull/2296
     }
 
     fn execute_bundles(
@@ -3622,14 +3668,10 @@ impl dispatch::RenderPassInterface for WebRenderPassEncoder {
             .collect::<js_sys::Array>();
         self.inner.execute_bundles(&mapped);
     }
-
-    fn end(&mut self) {
-        self.inner.end();
-    }
 }
 impl Drop for WebRenderPassEncoder {
     fn drop(&mut self) {
-        dispatch::RenderPassInterface::end(self);
+        self.inner.end();
     }
 }
 
@@ -3652,18 +3694,15 @@ impl dispatch::RenderBundleEncoderInterface for WebRenderBundleEncoder {
         bind_group: Option<&dispatch::DispatchBindGroup>,
         offsets: &[crate::DynamicOffset],
     ) {
-        let Some(bind_group) = bind_group else {
-            return;
-        };
-        let bind_group = &bind_group.as_webgpu().inner;
+        let bind_group = bind_group.map(|bind_group| &bind_group.as_webgpu().inner);
 
         if offsets.is_empty() {
-            self.inner.set_bind_group(index, Some(bind_group));
+            self.inner.set_bind_group(index, bind_group);
         } else {
             self.inner
                 .set_bind_group_with_u32_slice_and_f64_and_dynamic_offsets_data_length(
                     index,
-                    Some(bind_group),
+                    bind_group,
                     offsets,
                     0f64,
                     offsets.len() as u32,
@@ -3717,8 +3756,8 @@ impl dispatch::RenderBundleEncoderInterface for WebRenderBundleEncoder {
         }
     }
 
-    fn set_push_constants(&mut self, _stages: crate::ShaderStages, _offset: u32, _data: &[u8]) {
-        panic!("PUSH_CONSTANTS feature must be enabled to call multi_draw_indexed_indirect")
+    fn set_immediates(&mut self, _offset: u32, _data: &[u8]) {
+        panic!("IMMEDIATES feature must be enabled to call set_immediates")
     }
 
     fn draw(&mut self, vertices: Range<u32>, instances: Range<u32>) {

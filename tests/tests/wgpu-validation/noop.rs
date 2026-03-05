@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 #[test]
 fn device_is_not_available_by_default() {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::NOOP,
         ..Default::default()
     });
@@ -16,7 +16,7 @@ fn device_is_not_available_by_default() {
 
 #[test]
 fn device_is_available_when_requested() {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::NOOP,
         backend_options: wgpu::BackendOptions {
             noop: wgpu::NoopBackendOptions { enable: true },
@@ -53,6 +53,6 @@ fn device_and_buffers() {
         assert_eq!(*result.unwrap(), [1, 2, 3, 4, 5, 6, 7, 8],);
         done.store(true, Relaxed);
     });
-    device.poll(wgpu::PollType::Wait).unwrap();
+    device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
     assert!(done2.load(Relaxed));
 }

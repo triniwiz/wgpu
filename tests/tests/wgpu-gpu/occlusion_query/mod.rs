@@ -50,13 +50,13 @@ static OCCLUSION_QUERY: GpuTestConfiguration = GpuTestConfiguration::new()
                 primitive: wgpu::PrimitiveState::default(),
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: true,
-                    depth_compare: wgpu::CompareFunction::Less,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
                 }),
                 multisample: wgpu::MultisampleState::default(),
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             });
 
@@ -84,6 +84,7 @@ static OCCLUSION_QUERY: GpuTestConfiguration = GpuTestConfiguration::new()
                 }),
                 timestamp_writes: None,
                 occlusion_query_set: Some(&query_set),
+                multiview_mask: None,
             });
             render_pass.set_pipeline(&pipeline);
 
@@ -125,7 +126,9 @@ static OCCLUSION_QUERY: GpuTestConfiguration = GpuTestConfiguration::new()
         mapping_buffer
             .slice(..)
             .map_async(wgpu::MapMode::Read, |_| ());
-        ctx.async_poll(wgpu::PollType::wait()).await.unwrap();
+        ctx.async_poll(wgpu::PollType::wait_indefinitely())
+            .await
+            .unwrap();
         let query_buffer_view = mapping_buffer.slice(..).get_mapped_range();
         let query_data: &[u64; 3] = bytemuck::from_bytes(&query_buffer_view);
 

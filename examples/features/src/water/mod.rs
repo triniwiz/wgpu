@@ -217,7 +217,7 @@ impl Example {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Nearest,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
 
@@ -427,15 +427,15 @@ impl crate::framework::Example for Example {
         let water_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("water"),
-                bind_group_layouts: &[&water_bind_group_layout],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&water_bind_group_layout)],
+                immediate_size: 0,
             });
 
         let terrain_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("terrain"),
-                bind_group_layouts: &[&terrain_bind_group_layout],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&terrain_bind_group_layout)],
+                immediate_size: 0,
             });
 
         let water_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -555,19 +555,18 @@ impl crate::framework::Example for Example {
             // will work. Since this is water, we need to read from the
             // depth buffer both as a texture in the shader, and as an
             // input attachment to do depth-testing. We don't write, so
-            // depth_write_enabled is set to false. This is called
-            // RODS or read-only depth stencil.
+            // depth_write_enabled is set to false. This is called RODS,
+            // or read-only depth stencil. Here, we don't use stencil.
             depth_stencil: Some(wgpu::DepthStencilState {
-                // We don't use stencil.
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::Less,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
             // No multisampling is used.
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             // No pipeline caching is used
             cache: None,
         });
@@ -599,13 +598,13 @@ impl crate::framework::Example for Example {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None
         });
 
@@ -750,6 +749,7 @@ impl crate::framework::Example for Example {
                 }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
 
             rpass.execute_bundles([&self.terrain_bundle]);
@@ -778,6 +778,7 @@ impl crate::framework::Example for Example {
                 }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             rpass.set_pipeline(&self.terrain_pipeline);
             rpass.set_bind_group(0, &self.terrain_normal_bind_group, &[]);
@@ -805,6 +806,7 @@ impl crate::framework::Example for Example {
                 }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
 
             rpass.set_pipeline(&self.water_pipeline);
@@ -839,6 +841,6 @@ pub static TEST: crate::framework::ExampleTestParams = crate::framework::Example
             behavior: wgpu_test::FailureBehavior::AssertFailure,
             ..Default::default()
         }),
-    comparisons: &[wgpu_test::ComparisonType::Mean(0.01)],
+    comparisons: &[wgpu_test::ComparisonType::Mean(0.018)], // Bounded by Apple A9
     _phantom: std::marker::PhantomData::<Example>,
 };

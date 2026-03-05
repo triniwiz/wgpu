@@ -138,10 +138,6 @@ class Navigator {
   constructor() {
     webidl.illegalConstructor();
   }
-
-  [Symbol.for("Deno.customInspect")](inspect) {
-    return `${this.constructor.name} ${inspect({})}`;
-  }
 }
 const NavigatorPrototype = Navigator.prototype;
 
@@ -203,6 +199,7 @@ const windowOrWorkerGlobalScope = {
   GPUExternalTexture: util.nonEnumerable(webgpu.GPUExternalTexture),
   GPUSampler: util.nonEnumerable(webgpu.GPUSampler),
   GPUBindGroupLayout: util.nonEnumerable(webgpu.GPUBindGroupLayout),
+  GPUPipelineError: util.nonEnumerable(webgpu.GPUPipelineError),
   GPUPipelineLayout: util.nonEnumerable(webgpu.GPUPipelineLayout),
   GPUBindGroup: util.nonEnumerable(webgpu.GPUBindGroup),
   GPUCompilationInfo: util.nonEnumerable(webgpu.GPUCompilationInfo),
@@ -227,6 +224,39 @@ const windowOrWorkerGlobalScope = {
 };
 
 windowOrWorkerGlobalScope.console.enumerable = false;
+
+// Print uncaptured WebGPU errors to stderr. This is useful when running
+// standalone JavaScript test snippets. It isn't needed for the CTS, because the
+// CTS uses error scopes. (The CTS also installs its own error handler with
+// `addEventListener`, so having this here may result in printing duplicate
+// errors from the CTS in some cases.) Printing uncaptured errors to stderr
+// isn't desired as built-in behavior in Deno, because the console is reserved
+// for the application.
+//
+// Note that catching an error here _does not_ result in a non-zero exit status.
+let enableExternalTexture_ = false;
+const requestDevice = webgpu.GPUAdapter.prototype.requestDevice;
+webgpu.GPUAdapter.prototype.requestDevice = function(desc) {
+    if (enableExternalTexture_) {
+        // Deno doesn't meaningfully support external textures, but we provide
+        // an option to enable it anyways to allow running some CTS tests that
+        // do pass.
+        if (!desc) {
+            desc = { requiredFeatures: ['external-texture'] };
+        } else if (!desc.requiredFeatures) {
+            desc.requiredFeatures = ['external-texture'];
+        } else {
+            desc.requiredFeatures.push('external-texture');
+        }
+    }
+
+    return requestDevice.call(this, desc).then((device) => {
+        device.onuncapturederror = (event) => {
+            core.print("cts_runner caught WebGPU error: " + event.error.message + "\n", true);
+        };
+        return device;
+    })
+};
 
 const mainRuntimeGlobalProperties = {
   Window: globalInterfaces.windowConstructorDescriptor,
@@ -285,12 +315,13 @@ core.registerErrorBuilder(
 
 let hasBootstrapped = false;
 
-function bootstrapRuntime({ args, cwd }) {
+function bootstrapRuntime({ args, cwd, enableExternalTexture = false }) {
   if (hasBootstrapped) {
     throw new Error("Runtime has already been bootstrapped.");
   }
   performance.setTimeOrigin(DateNow());
   globalThis_ = globalThis;
+  enableExternalTexture_ = enableExternalTexture;
 
   // Remove bootstrapping data from the global scope
   delete globalThis.__bootstrap;

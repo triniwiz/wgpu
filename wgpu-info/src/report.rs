@@ -19,13 +19,14 @@ pub struct GpuReport {
 
 impl GpuReport {
     pub fn generate() -> Self {
-        let instance = wgpu::Instance::new(&{
+        let instance = wgpu::Instance::new({
             let mut desc = wgpu::InstanceDescriptor::default();
             desc.backend_options.dx12.shader_compiler = Dx12Compiler::StaticDxc;
             desc.flags = wgpu::InstanceFlags::debugging();
             desc.with_env()
         });
-        let adapters = instance.enumerate_adapters(wgpu::Backends::all());
+
+        let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
 
         let mut devices = Vec::with_capacity(adapters.len());
         for adapter in adapters {

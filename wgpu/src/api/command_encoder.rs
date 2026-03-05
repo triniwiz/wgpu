@@ -1,7 +1,11 @@
+use alloc::sync::Arc;
 use core::ops::Range;
 
 use crate::{
-    api::{blas::BlasBuildEntry, tlas::Tlas},
+    api::{
+        blas::BlasBuildEntry, impl_deferred_command_buffer_actions, tlas::Tlas,
+        SharedDeferredCommandBufferActions,
+    },
     *,
 };
 
@@ -17,6 +21,7 @@ use crate::{
 #[derive(Debug)]
 pub struct CommandEncoder {
     pub(crate) inner: dispatch::DispatchCommandEncoder,
+    pub(crate) actions: SharedDeferredCommandBufferActions,
 }
 #[cfg(send_sync)]
 static_assertions::assert_impl_all!(CommandEncoder: Send, Sync);
@@ -52,10 +57,10 @@ static_assertions::assert_impl_all!(TexelCopyTextureInfo<'_>: Send, Sync);
 
 impl CommandEncoder {
     /// Finishes recording and returns a [`CommandBuffer`] that can be submitted for execution.
-    pub fn finish(mut self) -> CommandBuffer {
-        let buffer = self.inner.finish();
-
-        CommandBuffer { buffer }
+    pub fn finish(self) -> CommandBuffer {
+        let Self { mut inner, actions } = self;
+        let buffer = inner.finish();
+        CommandBuffer { buffer, actions }
     }
 
     /// Begins recording of a render pass.
@@ -75,6 +80,7 @@ impl CommandEncoder {
         let rpass = self.inner.begin_render_pass(desc);
         RenderPass {
             inner: rpass,
+            actions: Arc::clone(&self.actions),
             _encoder_guard: api::PhantomDrop::default(),
         }
     }
@@ -96,6 +102,7 @@ impl CommandEncoder {
         let cpass = self.inner.begin_compute_pass(desc);
         ComputePass {
             inner: cpass,
+            actions: Arc::clone(&self.actions),
             _encoder_guard: api::PhantomDrop::default(),
         }
     }
@@ -210,12 +217,19 @@ impl CommandEncoder {
         self.inner.pop_debug_group();
     }
 
-    /// Resolves a query set, writing the results into the supplied destination buffer.
+    /// Copies query results stored in `query_set` into `destination` so that they can be read
+    /// by compute shaders or buffer operations.
     ///
-    /// Occlusion and timestamp queries are 8 bytes each (see [`crate::QUERY_SIZE`]). For pipeline statistics queries,
-    /// see [`PipelineStatisticsTypes`] for more information.
+    /// * `query_range` is the range of query result indices to copy from `query_set`.
+    ///   Occlusion and timestamp queries occupy 1 result index each;
+    ///   for pipeline statistics queries, see [`PipelineStatisticsTypes`].
+    /// * `destination_offset` is the offset within `destination` to start writing at.
+    ///   It must be a multiple of [`QUERY_RESOLVE_BUFFER_ALIGNMENT`].
     ///
-    /// `destination_offset` must be aligned to [`QUERY_RESOLVE_BUFFER_ALIGNMENT`].
+    /// The length of the data written to `destination` will be 8 bytes ([`QUERY_SIZE`])
+    /// times the number of elements in `query_range`.
+    ///
+    /// For further information about using queries, see [`QuerySet`].
     pub fn resolve_query_set(
         &mut self,
         query_set: &QuerySet,
@@ -232,6 +246,8 @@ impl CommandEncoder {
         );
     }
 
+    impl_deferred_command_buffer_actions!();
+
     /// Get the [`wgpu_hal`] command encoder from this `CommandEncoder`.
     ///
     /// The returned command encoder will be ready to record onto.
@@ -246,10 +262,10 @@ impl CommandEncoder {
     ///
     /// The callback argument depends on the backend:
     ///
-    #[doc = crate::hal_type_vulkan!("CommandEncoder")]
-    #[doc = crate::hal_type_metal!("CommandEncoder")]
-    #[doc = crate::hal_type_dx12!("CommandEncoder")]
-    #[doc = crate::hal_type_gles!("CommandEncoder")]
+    #[doc = crate::macros::hal_type_vulkan!("CommandEncoder")]
+    #[doc = crate::macros::hal_type_metal!("CommandEncoder")]
+    #[doc = crate::macros::hal_type_dx12!("CommandEncoder")]
+    #[doc = crate::macros::hal_type_gles!("CommandEncoder")]
     ///
     /// # Safety
     ///
@@ -301,8 +317,16 @@ impl CommandEncoder {
 
 /// [`Features::EXPERIMENTAL_RAY_QUERY`] must be enabled on the device in order to call these functions.
 impl CommandEncoder {
-    /// Mark acceleration structures as being built. ***Should only*** be used with wgpu-hal
-    /// functions, all wgpu functions already mark acceleration structures as built.
+    /// When encoding the acceleration structure build with the raw Hal encoder
+    /// (obtained from [`CommandEncoder::as_hal_mut`]), this function marks the
+    /// acceleration structures as having been built.
+    ///
+    /// This function must only be used with the raw encoder API. When using the
+    /// wgpu encoding API, acceleration structure build is tracked automatically.
+    ///
+    /// # Panics
+    ///
+    /// - If the encoder is being used with the wgpu encoding API.
     ///
     /// # Safety
     ///

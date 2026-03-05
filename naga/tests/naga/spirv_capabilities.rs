@@ -6,7 +6,6 @@ Test SPIR-V backend capability checks.
 
 use spirv::Capability as Ca;
 
-#[cfg(spv_out)]
 use rspirv::binary::Disassemble;
 
 fn capabilities_used(source: &str) -> naga::FastIndexSet<Ca> {
@@ -150,10 +149,22 @@ fn sample_rate_shading() {
 }
 
 #[test]
+fn barycentrics() {
+    require(
+        &[Ca::FragmentBarycentricKHR],
+        r#"
+        @fragment
+        fn f(@builtin(barycentric) x: vec3<f32>) { }
+    "#,
+    );
+}
+
+#[test]
 fn geometry() {
     require(
         &[Ca::Geometry],
         r#"
+        enable primitive_index;
         @fragment
         fn f(@builtin(primitive_index) x: u32) { }
     "#,
@@ -276,7 +287,6 @@ fn f16_io_capabilities() {
     assert!(caps_polyfill.contains(&Ca::Float16));
 }
 
-#[cfg(spv_out)]
 #[test]
 fn f16_io_polyfill_codegen() {
     let source = r#"

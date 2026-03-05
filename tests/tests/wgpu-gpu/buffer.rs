@@ -27,7 +27,9 @@ async fn test_empty_buffer_range(ctx: &TestingContext, buffer_size: u64, label: 
         b0.slice(0..0)
             .map_async(wgpu::MapMode::Read, Result::unwrap);
 
-        ctx.async_poll(wgpu::PollType::wait()).await.unwrap();
+        ctx.async_poll(wgpu::PollType::wait_indefinitely())
+            .await
+            .unwrap();
 
         {
             let view = b0.slice(0..0).get_mapped_range();
@@ -61,7 +63,9 @@ async fn test_empty_buffer_range(ctx: &TestingContext, buffer_size: u64, label: 
             b0.slice(0..0)
                 .map_async(wgpu::MapMode::Write, Result::unwrap);
 
-            ctx.async_poll(wgpu::PollType::wait()).await.unwrap();
+            ctx.async_poll(wgpu::PollType::wait_indefinitely())
+                .await
+                .unwrap();
 
             //{
             //    let view = b0.slice(0..0).get_mapped_range_mut();
@@ -90,7 +94,9 @@ async fn test_empty_buffer_range(ctx: &TestingContext, buffer_size: u64, label: 
 
     b1.unmap();
 
-    ctx.async_poll(wgpu::PollType::wait()).await.unwrap();
+    ctx.async_poll(wgpu::PollType::wait_indefinitely())
+        .await
+        .unwrap();
 }
 
 #[gpu_test]
@@ -135,7 +141,9 @@ static MAP_OFFSET: GpuTestConfiguration = GpuTestConfiguration::new()
                 result.unwrap();
             });
 
-        ctx.async_poll(wgpu::PollType::wait()).await.unwrap();
+        ctx.async_poll(wgpu::PollType::wait_indefinitely())
+            .await
+            .unwrap();
 
         {
             let slice = write_buf.slice(32..48);
@@ -159,7 +167,9 @@ static MAP_OFFSET: GpuTestConfiguration = GpuTestConfiguration::new()
             .slice(..)
             .map_async(wgpu::MapMode::Read, Result::unwrap);
 
-        ctx.async_poll(wgpu::PollType::wait()).await.unwrap();
+        ctx.async_poll(wgpu::PollType::wait_indefinitely())
+            .await
+            .unwrap();
 
         let slice = read_buf.slice(..);
         let view = slice.get_mapped_range();
@@ -222,8 +232,8 @@ static MINIMUM_BUFFER_BINDING_SIZE_LAYOUT: GpuTestConfiguration = GpuTestConfigu
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: None,
-                bind_group_layouts: &[&bind_group_layout],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&bind_group_layout)],
+                immediate_size: 0,
             });
 
         wgpu_test::fail(
@@ -296,8 +306,8 @@ static MINIMUM_BUFFER_BINDING_SIZE_DISPATCH: GpuTestConfiguration = GpuTestConfi
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: None,
-                bind_group_layouts: &[&bind_group_layout],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&bind_group_layout)],
+                immediate_size: 0,
             });
 
         let pipeline = ctx
@@ -344,7 +354,7 @@ static MINIMUM_BUFFER_BINDING_SIZE_DISPATCH: GpuTestConfiguration = GpuTestConfi
                 drop(pass);
                 let _ = encoder.finish();
             },
-            Some("buffer is bound with size 16 where the shader expects 32 in group[0] compact index 0"),
+            Some("In bind group index 0, the buffer bound at binding index 0 is bound with size 16 where the shader expects 32"),
         );
     });
 

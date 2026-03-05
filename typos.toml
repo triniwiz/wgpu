@@ -17,8 +17,12 @@ extend-exclude = [
 
 [default.extend-words]
 # Things that aren't typos
+consts = "consts"
 lod = "lod"
 metalness = "metalness"
+
+# A DXC command line argument
+Fo = "Fo"
 
 # Usernames
 Healthire = "Healthire"

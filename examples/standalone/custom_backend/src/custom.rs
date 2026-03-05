@@ -25,7 +25,7 @@ impl Counter {
 pub struct CustomInstance(pub Counter);
 
 impl InstanceInterface for CustomInstance {
-    fn new(__desc: &wgpu::InstanceDescriptor) -> Self
+    fn new(__desc: wgpu::InstanceDescriptor) -> Self
     where
         Self: Sized,
     {
@@ -55,6 +55,13 @@ impl InstanceInterface for CustomInstance {
     fn wgsl_language_features(&self) -> wgpu::WgslLanguageFeatures {
         unimplemented!()
     }
+
+    fn enumerate_adapters(
+        &self,
+        _backends: wgpu::Backends,
+    ) -> Pin<Box<dyn wgpu::custom::EnumerateAdapterFuture>> {
+        unimplemented!()
+    }
 }
 
 #[derive(Debug)]
@@ -71,6 +78,10 @@ impl AdapterInterface for CustomAdapter {
             DispatchQueue::custom(CustomQueue(self.0.clone())),
         ));
         Box::pin(std::future::ready(res))
+    }
+
+    fn cooperative_matrix_properties(&self) -> Vec<wgpu::CooperativeMatrixProperties> {
+        Vec::new()
     }
 
     fn is_surface_supported(&self, _surface: &DispatchSurface) -> bool {
@@ -114,6 +125,10 @@ impl DeviceInterface for CustomDevice {
     }
 
     fn limits(&self) -> wgpu::Limits {
+        unimplemented!()
+    }
+
+    fn adapter_info(&self) -> wgpu::AdapterInfo {
         unimplemented!()
     }
 
@@ -244,11 +259,11 @@ impl DeviceInterface for CustomDevice {
         unimplemented!()
     }
 
-    fn push_error_scope(&self, _filter: wgpu::ErrorFilter) {
+    fn push_error_scope(&self, _filter: wgpu::ErrorFilter) -> u32 {
         unimplemented!()
     }
 
-    fn pop_error_scope(&self) -> Pin<Box<dyn wgpu::custom::PopErrorScopeFuture>> {
+    fn pop_error_scope(&self, _index: u32) -> Pin<Box<dyn wgpu::custom::PopErrorScopeFuture>> {
         unimplemented!()
     }
 

@@ -30,7 +30,7 @@ pub(crate) fn validate(cmd: ValidateSubcommand) -> anyhow::Result<()> {
                     Ok(result) => result,
                     Err(payload) => Err(match payload.downcast_ref::<&str>() {
                         Some(message) => {
-                            anyhow::anyhow!("Validation job thread panicked: {}", message)
+                            anyhow::anyhow!("Validation job thread panicked: {message}")
                         }
                         None => anyhow::anyhow!("Validation job thread panicked"),
                     }),
@@ -60,7 +60,7 @@ pub(crate) fn validate(cmd: ValidateSubcommand) -> anyhow::Result<()> {
     );
 
     if let Err(error) = enqueuing_thread.join().unwrap() {
-        bail!("Error enqueuing jobs:\n{:#}", error);
+        bail!("Error enqueuing jobs:\n{error:#}");
     }
 
     Ok(())
@@ -83,7 +83,7 @@ fn collect_validation_jobs(jobs: &mut Vec<Job>, cmd: ValidateSubcommand) -> anyh
         ValidateSubcommand::Metal => {
             let xcrun = "xcrun";
             which(xcrun)?;
-            push_job_for_each_file(snapshots_base_out, "msl/*.msl", jobs, |path| {
+            push_job_for_each_file(snapshots_base_out, "msl/*.metal", jobs, |path| {
                 validate_metal(&path, xcrun)
             });
         }
