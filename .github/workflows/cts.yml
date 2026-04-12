@@ -14,10 +14,13 @@ on:
   merge_group:
 
 env:
+  REPO_MSRV: "1.93"
   CARGO_INCREMENTAL: false
   CARGO_TERM_COLOR: always
+  DENO_WEBGPU_DX12_COMPILER: dynamicdxc
   RUST_BACKTRACE: full
-  MSRV: "1.93"
+  RUSTFLAGS: -D warnings
+  RUSTDOCFLAGS: -D warnings
 
 # Every time a PR is pushed to, cancel any previous jobs. This
 # makes us behave nicer to github and get faster turnaround times
@@ -83,8 +86,8 @@ jobs:
 
       - name: Install Repo MSRV toolchain
         run: |
-          rustup toolchain install ${{ env.MSRV }} --no-self-update --profile=minimal --target ${{ matrix.target }} --component llvm-tools
-          rustup override set ${{ env.MSRV }}
+          rustup toolchain install ${{ env.REPO_MSRV }} --no-self-update --profile=minimal --target ${{ matrix.target }} --component llvm-tools
+          rustup override set ${{ env.REPO_MSRV }}
           cargo -V
 
       - name: Install `cargo-llvm-cov`
@@ -96,8 +99,11 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           # The version number can be incremented for cache busting.
-          prefix-key: v2-rust-${{ hashFiles('cts_runner/revision.txt') }}
+          prefix-key: v3-rust-${{ hashFiles('cts_runner/revision.txt') }}
           cache-directories: cts
+          # Save the cache from the `other` job because it also runs the cts_runner
+          # integration tests.
+          save-if: ${{ github.ref == 'refs/heads/trunk' && matrix.suite == 'other' }}
 
       # We enable line numbers for panics, but that's it
       - name: disable debug
@@ -151,7 +157,7 @@ jobs:
           cargo --locked llvm-cov report --lcov --output-path lcov.info
 
       - name: Upload coverage report to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v6
         if: steps.coverage.outcome == 'success'
         with:
           files: lcov.info

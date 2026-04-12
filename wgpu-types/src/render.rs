@@ -192,6 +192,20 @@ impl BlendState {
         color: BlendComponent::OVER,
         alpha: BlendComponent::OVER,
     };
+
+    /// Blend mode that does standard additive blending.
+    pub const ADDITIVE: Self = Self {
+        color: BlendComponent {
+            src_factor: BlendFactor::One,
+            dst_factor: BlendFactor::One,
+            operation: BlendOperation::Add,
+        },
+        alpha: BlendComponent {
+            src_factor: BlendFactor::One,
+            dst_factor: BlendFactor::One,
+            operation: BlendOperation::Add,
+        },
+    };
 }
 
 /// Describes the color state of a render pipeline.
@@ -808,12 +822,17 @@ pub struct DepthStencilState {
     ///
     #[doc = link_to_wgpu_docs!(["CEbrp"]: "struct.CommandEncoder.html#method.begin_render_pass")]
     pub format: crate::TextureFormat,
-    /// If disabled, depth will not be written to. Must be `Some` if `format` is
-    /// a depth format.
+    /// Whether to write updated depth values to the depth attachment.
+    ///
+    /// If `format` is a depth or depth/stencil format, then this must be `Some`.
+    /// Otherwise, specifying `None` is preferred, but `Some(false)` is also
+    /// accepted.
     pub depth_write_enabled: Option<bool>,
     /// Comparison function used to compare depth values in the depth test.
-    /// Must be `Some` if `depth_write_enabled` is `true` or either stencil face
-    /// `depth_fail_op` is not `Keep`.
+    ///
+    /// If `depth_write_enabled` is `Some(true)` or if `depth_fail_op` for either
+    /// stencil face is not `Keep`, then this must be `Some`. Otherwise, specifying
+    /// `None` is preferred, but `Some(CompareFunction::Always)` is also accepted.
     pub depth_compare: Option<CompareFunction>,
     /// Stencil state.
     #[cfg_attr(feature = "serde", serde(default))]
@@ -972,7 +991,7 @@ impl DrawIndexedIndirectArgs {
     }
 }
 
-/// Argument buffer layout for `dispatch_indirect` commands.
+/// Argument buffer layout for `dispatch_workgroups_indirect` commands.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
 pub struct DispatchIndirectArgs {

@@ -78,6 +78,7 @@ mod conv;
 mod dcomp;
 mod descriptor;
 mod device;
+mod device_creation;
 mod instance;
 mod pipeline_desc;
 mod sampler;
@@ -266,7 +267,54 @@ impl D3D12Lib {
 
         result__.ok_or(crate::DeviceError::Unexpected).map(Some)
     }
+
+    /// Calls D3D12GetInterface to obtain a COM interface by CLSID and IID.
+    ///
+    /// This is used by the Independent Devices API to obtain `ID3D12SDKConfiguration1`.
+    fn get_interface<T: Interface>(
+        &self,
+        clsid: &windows_core::GUID,
+    ) -> Result<T, GetInterfaceError> {
+        // Calls windows::Win32::Graphics::Direct3D12::D3D12GetInterface on d3d12.dll
+        type Fun = extern "system" fn(
+            rclsid: *const windows_core::GUID,
+            riid: *const windows_core::GUID,
+            ppvdebug: *mut *mut ffi::c_void,
+        ) -> windows_core::HRESULT;
+        let func: libloading::Symbol<Fun> =
+            unsafe { self.lib.get(c"D3D12GetInterface".to_bytes()) }
+                .map_err(|_| GetInterfaceError::GetProcAddress)?;
+
+        let mut result__: Option<T> = None;
+
+        let res = (func)(clsid, &T::IID, <*mut _>::cast(&mut result__));
+
+        if res.is_err() {
+            return Err(GetInterfaceError::D3D12GetInterface(res));
+        }
+
+        result__.ok_or(GetInterfaceError::RetIsNull)
+    }
 }
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum GetInterfaceError {
+    GetProcAddress,
+    D3D12GetInterface(windows_core::HRESULT),
+    RetIsNull,
+}
+
+impl fmt::Display for GetInterfaceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::GetProcAddress => write!(f, "D3D12GetInterface not found in d3d12.dll"),
+            Self::D3D12GetInterface(hr) => write!(f, "D3D12GetInterface failed: {hr}"),
+            Self::RetIsNull => write!(f, "D3D12GetInterface returned null"),
+        }
+    }
+}
+
+impl core::error::Error for GetInterfaceError {}
 
 #[derive(Debug)]
 pub(super) struct DxgiLib {
@@ -466,6 +514,11 @@ const ZERO_BUFFER_SIZE: wgt::BufferAddress = 256 << 10;
 pub struct Instance {
     factory: DxgiFactory,
     factory_media: Option<Dxgi::IDXGIFactoryMedia>,
+    // `device_factory` must be dropped before `library` because the COM
+    // object's Release call goes through the d3d12.dll vtable.  If
+    // `library` (which unloads d3d12.dll) is dropped first the Release
+    // segfaults.
+    device_factory: Arc<device_creation::DeviceFactory>,
     library: Arc<D3D12Lib>,
     dcomp_lib: Arc<DCompLib>,
     supports_allow_tearing: bool,
@@ -712,6 +765,7 @@ pub struct Device {
     compiler_container: Arc<shader_compilation::CompilerContainer>,
     shader_cache: Mutex<ShaderCache>,
     counters: Arc<wgt::HalCounters>,
+    limits: wgt::Limits,
 }
 
 impl Drop for Device {
@@ -901,6 +955,12 @@ pub struct Buffer {
     // as the allocation size varies for assorted reasons.
     size: wgt::BufferAddress,
     allocation: suballocation::Allocation,
+}
+
+impl Buffer {
+    pub unsafe fn raw_resource(&self) -> &Direct3D12::ID3D12Resource {
+        &self.resource
+    }
 }
 
 unsafe impl Send for Buffer {}
@@ -1500,7 +1560,7 @@ impl crate::Surface for Surface {
         &self,
         timeout: Option<core::time::Duration>,
         _fence: &Fence,
-    ) -> Result<Option<crate::AcquiredSurfaceTexture<Api>>, crate::SurfaceError> {
+    ) -> Result<crate::AcquiredSurfaceTexture<Api>, crate::SurfaceError> {
         let mut swapchain = self.swap_chain.write();
         let sc = swapchain.as_mut().unwrap();
 
@@ -1528,10 +1588,10 @@ impl crate::Surface for Surface {
                 sc.format.theoretical_memory_footprint(sc.size),
             ),
         };
-        Ok(Some(crate::AcquiredSurfaceTexture {
+        Ok(crate::AcquiredSurfaceTexture {
             texture,
             suboptimal: false,
-        }))
+        })
     }
     unsafe fn discard_texture(&self, _texture: Texture) {
         let mut swapchain = self.swap_chain.write();
@@ -1604,13 +1664,11 @@ impl crate::Queue for Queue {
 #[derive(Debug)]
 pub struct DxilPassthroughShader {
     pub shader: Vec<u8>,
-    pub num_workgroups: (u32, u32, u32),
 }
 
 #[derive(Debug)]
 pub struct HlslPassthroughShader {
     pub shader: String,
-    pub num_workgroups: (u32, u32, u32),
 }
 
 #[derive(Debug)]
@@ -1622,24 +1680,24 @@ pub enum ShaderModuleSource {
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum FeatureLevel {
-    _11_0,
-    _11_1,
-    _12_0,
-    _12_1,
-    _12_2,
+    V11_0,
+    V11_1,
+    V12_0,
+    V12_1,
+    V12_2,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ShaderModel {
-    _5_1,
-    _6_0,
-    _6_1,
-    _6_2,
-    _6_3,
-    _6_4,
-    _6_5,
-    _6_6,
-    _6_7,
-    _6_8,
-    _6_9,
+    V5_1,
+    V6_0,
+    V6_1,
+    V6_2,
+    V6_3,
+    V6_4,
+    V6_5,
+    V6_6,
+    V6_7,
+    V6_8,
+    V6_9,
 }

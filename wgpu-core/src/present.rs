@@ -76,7 +76,7 @@ pub enum ConfigureSurfaceError {
     InvalidViewFormat(wgt::TextureFormat, wgt::TextureFormat),
     #[error(transparent)]
     MissingDownlevelFlags(#[from] MissingDownlevelFlags),
-    #[error("`SurfaceOutput` must be dropped before a new `Surface` is made")]
+    #[error("The `SurfaceOutput` returned by `get_current_texture` must be dropped before re-configuring via `configure` or  retrieving a new texture via `get_current_texture`.")]
     PreviousOutputExists,
     #[error("Failed to wait for GPU to come idle before reconfiguring the Surface")]
     GpuWaitTimeout,
@@ -171,7 +171,7 @@ impl Surface {
                 fence.as_ref(),
             )
         } {
-            Ok(Some(ast)) => {
+            Ok(ast) => {
                 drop(fence);
 
                 let texture_desc = wgt::TextureDescriptor {
@@ -252,10 +252,11 @@ impl Surface {
                 };
                 (Some(texture), status)
             }
-            Ok(None) => (None, Status::Timeout),
             Err(err) => (
                 None,
                 match err {
+                    hal::SurfaceError::Timeout => Status::Timeout,
+                    hal::SurfaceError::Occluded => Status::Occluded,
                     hal::SurfaceError::Lost => Status::Lost,
                     hal::SurfaceError::Device(err) => {
                         return Err(device.handle_hal_error(err).into());
@@ -309,13 +310,15 @@ impl Surface {
         match result {
             Ok(()) => Ok(Status::Good),
             Err(err) => match err {
+                hal::SurfaceError::Timeout => Ok(Status::Timeout),
+                hal::SurfaceError::Occluded => Ok(Status::Occluded),
                 hal::SurfaceError::Lost => Ok(Status::Lost),
                 hal::SurfaceError::Device(err) => {
                     Err(SurfaceError::from(device.handle_hal_error(err)))
                 }
                 hal::SurfaceError::Outdated => Ok(Status::Outdated),
                 hal::SurfaceError::Other(msg) => {
-                    log::error!("acquire error: {msg}");
+                    log::error!("present error: {msg}");
                     Err(SurfaceError::Invalid)
                 }
             },

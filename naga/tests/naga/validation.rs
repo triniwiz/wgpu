@@ -111,6 +111,7 @@ fn populate_atomic_result() {
                 binding: None,
                 ty: ty_atomic_u32,
                 init: None,
+                memory_decorations: naga::MemoryDecorations::empty(),
             },
             span,
         );
@@ -281,6 +282,7 @@ fn emit_workgroup_uniform_load_result() {
                 binding: None,
                 ty: ty_u32,
                 init: None,
+                memory_decorations: naga::MemoryDecorations::empty(),
             },
             span,
         );
@@ -433,6 +435,7 @@ fn incompatible_interpolation_and_sampling_types() {
                     naga::Interpolation::Flat,
                     Some(naga::Sampling::First | naga::Sampling::Either)
                 )
+                | (naga::Interpolation::PerVertex, Some(naga::Sampling::Center))
         );
 
         if valid {
@@ -454,11 +457,12 @@ fn incompatible_interpolation_and_sampling_types() {
         }
     };
 
+    // Note: `PerVertex` is excluded here because its invalid sampling combinations produce
+    // `VaryingError::InvalidPerVertexSampling` rather than `InvalidInterpolationSamplingCombination`.
     let invalid_cases = [
         naga::Interpolation::Flat,
         naga::Interpolation::Linear,
         naga::Interpolation::Perspective,
-        naga::Interpolation::PerVertex,
     ]
     .into_iter()
     .cartesian_product(
@@ -569,9 +573,15 @@ mod dummy_interpolation_shader {
                 naga::Interpolation::PerVertex => "array<u32, 3>",
             };
 
+            let enable_extension = if interpolation == naga::Interpolation::PerVertex {
+                "enable wgpu_per_vertex;\n\n"
+            } else {
+                ""
+            };
             let interpolate_attr = format!("@interpolate({interpolation_str}{sampling_str})");
             let source = format!(
                 "\
+                {enable_extension}
                 struct VertexOutput {{
     @location(0) {interpolate_attr} member: {member_type},
 }}
@@ -879,6 +889,7 @@ fn invalid_local_var_override_sized_array() {
             binding: None,
             ty: ty_array,
             init: None,
+            memory_decorations: naga::MemoryDecorations::empty(),
         },
         span,
     );
@@ -1633,6 +1644,7 @@ fn unexpected_task_payload() {
             binding: None,
             ty: ty_payload,
             init: None,
+            memory_decorations: ir::MemoryDecorations::empty(),
         },
         err_span,
     );
@@ -1661,6 +1673,80 @@ fn unexpected_task_payload() {
         err,
         valid::ValidationError::EntryPoint {
             source: valid::EntryPointError::UnexpectedTaskPayload,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn coherent_requires_capability() {
+    let module = naga::front::wgsl::parse_str(
+        "struct S { x: u32 }
+         @group(0) @binding(0) @coherent var<storage, read_write> buf: S;",
+    )
+    .expect("module should parse");
+
+    let err = valid::Validator::new(ValidationFlags::default(), Capabilities::empty())
+        .validate(&module)
+        .expect_err("should fail without capability");
+    assert!(matches!(
+        err.into_inner(),
+        valid::ValidationError::GlobalVariable {
+            source: valid::GlobalVariableError::CoherentNotSupported,
+            ..
+        }
+    ));
+
+    let result = valid::Validator::new(
+        ValidationFlags::default(),
+        Capabilities::MEMORY_DECORATION_COHERENT,
+    )
+    .validate(&module);
+    assert!(result.is_ok(), "should succeed with capability: {result:?}");
+}
+
+#[test]
+fn volatile_requires_capability() {
+    let module = naga::front::wgsl::parse_str(
+        "struct S { x: u32 }
+         @group(0) @binding(0) @volatile var<storage, read_write> buf: S;",
+    )
+    .expect("module should parse");
+
+    let err = valid::Validator::new(ValidationFlags::default(), Capabilities::empty())
+        .validate(&module)
+        .expect_err("should fail without capability");
+    assert!(matches!(
+        err.into_inner(),
+        valid::ValidationError::GlobalVariable {
+            source: valid::GlobalVariableError::VolatileNotSupported,
+            ..
+        }
+    ));
+
+    let result = valid::Validator::new(
+        ValidationFlags::default(),
+        Capabilities::MEMORY_DECORATION_VOLATILE,
+    )
+    .validate(&module);
+    assert!(result.is_ok(), "should succeed with capability: {result:?}");
+}
+
+#[test]
+fn memory_decorations_require_storage_address_space() {
+    let module = naga::front::wgsl::parse_str("@coherent var<workgroup> wg: array<u32, 4>;")
+        .expect("module should parse");
+
+    let err = valid::Validator::new(
+        ValidationFlags::default(),
+        Capabilities::MEMORY_DECORATION_COHERENT | Capabilities::MEMORY_DECORATION_VOLATILE,
+    )
+    .validate(&module)
+    .expect_err("should fail on non-storage address space");
+    assert!(matches!(
+        err.into_inner(),
+        valid::ValidationError::GlobalVariable {
+            source: valid::GlobalVariableError::InvalidMemoryDecorationsAddressSpace,
             ..
         }
     ));

@@ -199,8 +199,10 @@ impl<'a> BindingParser<'a> {
             "interpolate" => {
                 lexer.expect(Token::Paren('('))?;
                 let (raw, span) = lexer.next_ident_with_span()?;
-                self.interpolation
-                    .set(conv::map_interpolation(raw, span)?, name_span)?;
+                self.interpolation.set(
+                    conv::map_interpolation(&lexer.enable_extensions, raw, span)?,
+                    name_span,
+                )?;
                 if lexer.next_if(Token::Separator(',')) {
                     let (raw, span) = lexer.next_ident_with_span()?;
                     self.sampling
@@ -891,6 +893,7 @@ impl Parser {
             ty,
             init,
             doc_comments: Vec::new(),
+            memory_decorations: crate::MemoryDecorations::empty(),
         })
     }
 
@@ -1849,6 +1852,7 @@ impl Parser {
         let mut mesh_output = ParsedAttribute::default();
 
         let mut must_use: ParsedAttribute<Span> = ParsedAttribute::default();
+        let mut memory_decorations = crate::MemoryDecorations::empty();
 
         let mut dependencies = FastIndexSet::default();
         let mut ctx = ExpressionContext {
@@ -2017,6 +2021,12 @@ impl Parser {
                 "must_use" => {
                     must_use.set(name_span, name_span)?;
                 }
+                "coherent" => {
+                    memory_decorations |= crate::MemoryDecorations::COHERENT;
+                }
+                "volatile" => {
+                    memory_decorations |= crate::MemoryDecorations::VOLATILE;
+                }
                 _ => return Err(Box::new(Error::UnknownAttribute(name_span))),
             }
         }
@@ -2116,6 +2126,7 @@ impl Parser {
                 let mut var = self.variable_decl(lexer, &mut ctx)?;
                 var.binding = binding.take();
                 var.doc_comments = doc_comments;
+                var.memory_decorations = memory_decorations;
                 Some(ast::GlobalDeclKind::Var(var))
             }
             (Token::Word("fn"), _) => {
@@ -2181,6 +2192,9 @@ impl Parser {
                 Some(ast::GlobalDeclKind::ConstAssert(condition))
             }
             (Token::End, _) => return Ok(()),
+            (Token::UnterminatedBlockComment(_), span) => {
+                return Err(Box::new(Error::UnterminatedBlockComment(span)))
+            }
             other => {
                 return Err(Box::new(Error::Unexpected(
                     other.1,
@@ -2188,6 +2202,12 @@ impl Parser {
                 )))
             }
         };
+
+        if let Some(must_use_span) = must_use.value {
+            if !matches!(kind.as_ref(), Some(ast::GlobalDeclKind::Fn(_))) {
+                return Err(Box::new(Error::FunctionMustUseOnNonFunction(must_use_span)));
+            }
+        }
 
         if let Some(kind) = kind {
             out.decls.append(
@@ -2253,7 +2273,7 @@ impl Parser {
                             };
                             // Check if the required capability is supported
                             let required_capability = extension.capability();
-                            if !options.capabilities.contains(required_capability) {
+                            if !options.capabilities.intersects(required_capability) {
                                 return Err(Box::new(Error::EnableExtensionNotSupported {
                                     kind,
                                     span,

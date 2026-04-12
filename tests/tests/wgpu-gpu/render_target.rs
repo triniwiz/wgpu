@@ -244,17 +244,25 @@ async fn run_test(
         .await
         .unwrap();
 
-    let data = slice.get_mapped_range();
+    let data = slice.get_mapped_range().unwrap();
     let succeeded = data.iter().all(|b| *b == u8::MAX);
     assert!(succeeded);
 }
 
 #[gpu_test]
 static DRAW_TO_3D_VIEW: GpuTestConfiguration = GpuTestConfiguration::new()
-    .parameters(TestParameters::default().limits(wgpu::Limits {
-        max_texture_dimension_3d: 512,
-        ..wgpu::Limits::downlevel_webgl2_defaults()
-    }))
+    .parameters(
+        TestParameters::default()
+            .limits(wgpu::Limits {
+                max_texture_dimension_3d: 512,
+                ..wgpu::Limits::downlevel_webgl2_defaults()
+            })
+            // https://github.com/gfx-rs/wgpu/issues/9184
+            .expect_fail(
+                wgpu_test::FailureCase::molten_vk()
+                    .validation_error("VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT"),
+            ),
+    )
     .run_async(run_test_3d);
 
 async fn run_test_3d(ctx: TestingContext) {
@@ -428,7 +436,7 @@ async fn run_test_3d(ctx: TestingContext) {
         .await
         .unwrap();
 
-    let data = slice.get_mapped_range();
+    let data = slice.get_mapped_range().unwrap();
     let succeeded = data.iter().all(|b| *b == u8::MAX);
     assert!(succeeded);
 }
