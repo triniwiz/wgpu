@@ -1,5 +1,5 @@
 use alloc::{string::String, sync::Arc, vec::Vec};
-use core::ptr;
+use core::{ptr, sync::atomic::AtomicU64};
 use std::thread;
 
 use parking_lot::Mutex;
@@ -480,6 +480,7 @@ impl super::Adapter {
             | wgt::Features::DUAL_SOURCE_BLENDING
             | wgt::Features::TEXTURE_FORMAT_NV12
             | wgt::Features::FLOAT32_FILTERABLE
+            | wgt::Features::FLOAT32_BLENDABLE
             | wgt::Features::TEXTURE_ATOMIC
             | wgt::Features::PASSTHROUGH_SHADERS
             | wgt::Features::EXTERNAL_TEXTURE
@@ -743,23 +744,23 @@ impl super::Adapter {
         // Source: https://learn.microsoft.com/en-us/windows/win32/direct3d12/root-signature-limits#memory-limits-and-costs
         //
         // Per pipeline layout:
-        // - RootElement::Constant, (immediates) 32 root constants
+        // - RootElement::Immediates, 32 root constants
         //     (bounded by maxImmediateSize) = 32 x 4 bytes = 128 bytes
-        // - RootElement::SamplerHeap, a root table = 4 bytes
+        // - RootElement::SamplerHeapDescriptorTable, a descriptor table = 4 bytes
         // - RootElement::SpecialConstantBuffer, 3 root constants = 3 x 4 bytes = 12 bytes
-        // - RootElement::DynamicOffsetsBuffer, a root constant per dynamic storage buffer
+        // - RootElement::DynamicStorageBufferOffsets, a root constant per dynamic storage buffer
         //     (bounded by maxDynamicStorageBuffersPerPipelineLayout) = 4 x 4 bytes = 16 bytes
         // - RootElement::DynamicUniformBuffer, a root descriptor per dynamic uniform buffer
         //     (bounded by maxDynamicUniformBuffersPerPipelineLayout) = 8 x 8 bytes = 64 bytes
         // Per bind group:
-        // - RootElement::Table, a root table
+        // - RootElement::DescriptorTable, a descriptor table
         //     (bounded by maxBindGroups) = 8 x 4 bytes = 32 bytes
         //
         // Source: logic in `create_pipeline_layout`
         //
         // Total: 128 + 4 + 12 + 16 + 64 + 32 = 256 bytes
         //
-        let max_immediate_size = 128;
+        let max_immediate_size = super::MAX_IMMEDIATE_SIZE;
         let max_bind_groups = 8;
         let max_dynamic_uniform_buffers_per_pipeline_layout = 8;
         let max_dynamic_storage_buffers_per_pipeline_layout = 4;
@@ -894,7 +895,9 @@ impl super::Adapter {
                     max_texture_dimension_3d: Direct3D12::D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION,
                     // 2048
                     max_texture_array_layers: Direct3D12::D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION,
-                    // No real limit.
+                    // No limit.
+                    max_bind_groups_plus_vertex_buffers: u32::MAX,
+                    // No limit.
                     max_bindings_per_bind_group: u32::MAX,
                     max_sampled_textures_per_shader_stage,
                     max_samplers_per_shader_stage,
@@ -1073,11 +1076,21 @@ impl crate::Adapter for super::Adapter {
             self.compiler_container.clone(),
             self.options.clone(),
         )?;
+        let idle_fence: Direct3D12::ID3D12Fence = unsafe {
+            self.device
+                .CreateFence(0, Direct3D12::D3D12_FENCE_FLAG_NONE)
+        }
+        .into_device_result("Queue idle fence creation")?;
+        let idle_event = super::Event::create(false, false)?;
+
         Ok(crate::OpenDevice {
             device,
             queue: super::Queue {
                 raw: queue,
                 temp_lists: Mutex::new(Vec::new()),
+                idle_fence,
+                idle_event,
+                idle_fence_value: AtomicU64::new(0),
             },
         })
     }
