@@ -192,7 +192,8 @@ impl Example {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: Self::DEPTH_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TRANSIENT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TRANSIENT_ATTACHMENT,
             label: None,
             view_formats: &[],
         });
@@ -395,6 +396,7 @@ impl crate::framework::Example for Example {
                     mip_level_count: None,
                     base_array_layer: i as u32,
                     array_layer_count: Some(1),
+                    swizzle: wgpu::TextureComponentSwizzle::default(),
                 }))
             })
             .collect::<Vec<_>>();
@@ -840,7 +842,7 @@ pub fn main() {
 }
 
 #[cfg(test)]
-#[wgpu_test::gpu_test]
+#[wgpu_test::apply(wgpu_test::gpu_test!)]
 pub static TEST: crate::framework::ExampleTestParams = crate::framework::ExampleTestParams {
     name: "shadow",
     image_path: "/examples/features/src/shadow/screenshot.png",

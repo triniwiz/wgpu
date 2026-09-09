@@ -24,9 +24,9 @@ Additionally, [WebGPU Fundamentals] is a tutorial for WebGPU which is very simil
 [Learn Wgpu]: https://sotrh.github.io/learn-wgpu/
 [WebGPU Fundamentals]: https://webgpufundamentals.org/
 
-### Wiki
+### Documentation Guides
 
-We have a [wiki](https://github.com/gfx-rs/wgpu/wiki) which has information on useful architecture patterns, debugging tips, and more getting started information.
+We ship a set of [documentation modules](https://docs.rs/wgpu/latest/wgpu/documentation/index.html) with information on useful architecture patterns, debugging tips, and more getting started information.
 
 ### Need Help? Want to Contribute?
 
@@ -50,13 +50,13 @@ To use wgpu in C or dozens of other languages, look at [wgpu-native](https://git
 
 |         Docs          |         Examples          |        Changelog        |
 | :-------------------: | :-----------------------: | :---------------------: |
-|    [v29][rel-docs]    |    [v29][rel-examples]    |    [v29][rel-change]    |
+|    [v30][rel-docs]    |    [v30][rel-examples]    |    [v30][rel-change]    |
 | [`trunk`][trunk-docs] | [`trunk`][trunk-examples] | [`trunk`][trunk-change] |
 
 Contributors are welcome! See [CONTRIBUTING.md][contrib] for more information.
 
 [rel-docs]: https://docs.rs/wgpu/
-[rel-examples]: https://github.com/gfx-rs/wgpu/tree/v29/examples#readme
+[rel-examples]: https://github.com/gfx-rs/wgpu/tree/v30/examples#readme
 [rel-change]: https://github.com/gfx-rs/wgpu/releases
 [trunk-docs]: https://wgpu.rs/doc/wgpu/
 [trunk-examples]: https://github.com/gfx-rs/wgpu/tree/trunk/examples#readme
@@ -65,17 +65,17 @@ Contributors are welcome! See [CONTRIBUTING.md][contrib] for more information.
 
 ## Supported Platforms
 
-| API    | Windows      | Linux/Android   | macOS/iOS | Web (wasm)  |
-| ------ | ------------ | --------------- | --------- | ----------- |
-| Vulkan | ✅           | ✅              | 🌋        |             |
-| Metal  |              |                 | ✅        |             |
-| DX12   | ✅           |                 |           |             |
-| OpenGL | 🆗 (GL 3.3+) | 🆗 (GL ES 3.0+) | 📐        | 🆗 (WebGL2) |
-| WebGPU |              |                 |           | ✅          |
+| API    | Windows             | Linux/Android   | macOS/iOS | Web (wasm)  |
+| ------ | ------------------- | --------------- | --------- | ----------- |
+| Vulkan | ✅                  | ✅              | 🌋        |             |
+| Metal  |                     |                 | ✅        |             |
+| DX12   | ✅                  |                 |           |             |
+| OpenGL | 🆗 (GL 3.3+), or 📐 | 🆗 (GL ES 3.0+) | 📐        | 🆗 (WebGL2) |
+| WebGPU |                     |                 |           | ✅          |
 
 ✅ = First Class Support  
 🆗 = Downlevel/Best Effort Support  
-📐 = Requires the [ANGLE](https://github.com/gfx-rs/wgpu/wiki/Running-on-ANGLE) translation layer (GL ES 3.0 only)  
+📐 = Requires the [ANGLE](https://docs.rs/wgpu/latest/wgpu/documentation/platforms/angle/index.html) translation layer (GL ES 3.0 only). On macOS/iOS, use the `angle` feature. On Windows, `gles` uses WGL by default; build with `cfg(windows_angle)` to use ANGLE instead.
 🌋 = Requires the [MoltenVK](https://vulkan.lunarg.com/sdk/home#mac) translation layer  
 🛠️ = Unsupported, though open to contributions
 
@@ -89,11 +89,11 @@ Testing, examples, and `::from_env()` methods use a standardized set of environm
 
 See the [documentation](https://docs.rs/wgpu/latest/wgpu/index.html?search=env) for more environment variables.
 
-When running the CTS, use the variables `DENO_WEBGPU_ADAPTER_NAME`, `DENO_WEBGPU_BACKEND`, `DENO_WEBGPU_POWER_PREFERENCE`, and `DENO_WEBGPU_DX12_COMPILER`.
+When running the CTS, use the variables `DENO_WEBGPU_ADAPTER_NAME`, `DENO_WEBGPU_BACKEND`, `DENO_WEBGPU_POWER_PREFERENCE`, `DENO_WEBGPU_DX12_COMPILER`, and `DENO_WEBGPU_STRICT_COMPLIANCE`.
 
 ## Repo Overview
 
-For an overview of all the components in the gfx-rs ecosystem, see [the big picture](./docs/big-picture.png).
+For an overview of all the components in the gfx-rs ecosystem, see [the big picture](./wgpu/src/documentation/images/big-picture.webp).
 
 ## MSRV policy
 
@@ -107,7 +107,7 @@ We will avoid bumping the MSRV of `wgpu` without good reason, and such a change 
 Due to complex dependants, we have three MSRV policies:
 
 - `wgpu`'s MSRV is **1.87**
-- `wgpu-core` (and hence `wgpu-hal`, `naga`, and `wgpu-types`)'s MSRV is **1.87**.
+- `wgpu-core` (and hence `wgpu-hal`, `naga`, `naga-types` and `wgpu-types`)'s MSRV is **1.87**.
 - The rest of the workspace has an MSRV of **1.93**.
 
 It is enforced on CI (in "/.github/workflows/ci.yml") with the `WGPU_MSRV`, `CORE_MSRV`, and `REPO_MSRV` variables, respectively.

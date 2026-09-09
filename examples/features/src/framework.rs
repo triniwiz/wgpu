@@ -290,6 +290,7 @@ impl ExampleContext {
                 required_features: (E::optional_features() & adapter.features())
                     | E::required_features(),
                 required_limits: needed_limits,
+                default_queue: wgpu::QueueDescriptor { label: None },
                 experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
                 memory_hints: wgpu::MemoryHints::MemoryUsage,
                 trace: match std::env::var_os("WGPU_TRACE") {
@@ -526,17 +527,6 @@ impl<E: Example> ApplicationHandler<AppAction> for App<E> {
             | WindowEvent::CloseRequested => {
                 event_loop.exit();
             }
-            #[cfg(not(target_arch = "wasm32"))]
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        logical_key: Key::Character(s),
-                        ..
-                    },
-                ..
-            } if s == "r" => {
-                println!("{:#?}", context.instance.generate_report());
-            }
             WindowEvent::RedrawRequested => {
                 // Don't render while occluded, this may leak on apple platforms.
                 if self.occluded {
@@ -560,6 +550,9 @@ impl<E: Example> ApplicationHandler<AppAction> for App<E> {
                     context.queue.present(frame);
                 }
 
+                // Request another redraw to keep the animation loop running.
+                // Examples that only render once (like hello_triangle) omit
+                // this call so the event loop can rest between frames.
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
@@ -697,9 +690,11 @@ impl<E: Example + wgpu::WasmNotSendSync> From<ExampleTestParams<E>>
                     &wgpu::SurfaceConfiguration {
                         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
                         format,
+                        color_space: wgpu::SurfaceColorSpace::Auto,
                         width: params.width,
                         height: params.height,
                         desired_maximum_frame_latency: 2,
+                        // Fifo corresponds to traditional VSync. It's supported everywhere.
                         present_mode: wgpu::PresentMode::Fifo,
                         alpha_mode: wgpu::CompositeAlphaMode::Auto,
                         view_formats: vec![format],

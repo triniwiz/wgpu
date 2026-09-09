@@ -145,6 +145,7 @@ pub fn map_built_in(
         "object_to_world" => crate::BuiltIn::ObjectToWorld,
         "world_to_object" => crate::BuiltIn::WorldToObject,
         "hit_kind" => crate::BuiltIn::HitKind,
+        "hit_barycentrics" => crate::BuiltIn::HitBarycentrics,
         _ => return Err(Box::new(Error::UnknownBuiltin(span))),
     };
     match built_in {
@@ -462,6 +463,8 @@ pub fn map_predeclared_type(
         "i32" => Ti::Scalar(Sc::I32).into(),
         "u32" => Ti::Scalar(Sc::U32).into(),
         "f32" => Ti::Scalar(Sc::F32).into(),
+        "i16" => Ti::Scalar(Sc::I16).into(),
+        "u16" => Ti::Scalar(Sc::U16).into(),
         "f16" => Ti::Scalar(Sc::F16).into(),
         "i64" => Ti::Scalar(Sc::I64).into(),
         "u64" => Ti::Scalar(Sc::U64).into(),
@@ -572,6 +575,9 @@ pub fn map_predeclared_type(
     let extensions_needed: Option<&[_]> = match ty {
         PredeclaredType::TypeInner(ref ty) if ty.scalar() == Some(Sc::F16) => {
             Some(&[ImplementedEnableExtension::F16])
+        }
+        PredeclaredType::TypeInner(ref ty) if matches!(ty.scalar(), Some(s) if s == Sc::I16 || s == Sc::U16) => {
+            Some(&[ImplementedEnableExtension::WgpuInt16])
         }
         PredeclaredType::RayDesc
         | PredeclaredType::RayIntersection

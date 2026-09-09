@@ -85,6 +85,8 @@ pub enum LocalVariableError {
     InitializerType,
     #[error("Initializer is not a const or override expression")]
     NonConstOrOverrideInitializer,
+    #[error("Local variable has a type `ray_query` and so cannot be initialized.")]
+    RayQueryWithInitializeExpression,
 }
 
 #[derive(Clone, Debug, thiserror::Error)]
@@ -234,6 +236,10 @@ pub enum FunctionError {
     InvalidPayloadAddressSpace(crate::AddressSpace),
     #[error("The payload type ({0:?}) passed to `traceRay` does not match the previous one {1:?}")]
     MismatchedPayloadType(Handle<crate::Type>, Handle<crate::Type>),
+    #[error("The payload passed to `traceRay` must be a pointer directly to a global variable")]
+    PayloadPointerNotGlobal,
+    #[error("Tried to store to pointer {0:?} which is a ray query and so cannot be assigned to")]
+    RayQueryStore(Handle<crate::Expression>),
 }
 
 bitflags::bitflags! {
@@ -668,7 +674,9 @@ impl super::Validator {
         match (scalar.kind, *op) {
             (sk::Bool, sg::All | sg::Any) if is_scalar => {}
             (sk::Sint | sk::Uint | sk::Float, sg::Add | sg::Mul | sg::Min | sg::Max) => {}
-            (sk::Sint | sk::Uint, sg::And | sg::Or | sg::Xor) => {}
+            // Subgroup bitwise ops require >= 32-bit integers because HLSL's
+            // WaveActiveBitAnd/Or/Xor don't support 16-bit types.
+            (sk::Sint | sk::Uint, sg::And | sg::Or | sg::Xor) if scalar.width >= 4 => {}
 
             (_, _) => {
                 log::error!("Subgroup operand type {argument_inner:?}");
@@ -775,6 +783,7 @@ impl super::Validator {
         Ok(())
     }
 
+    #[allow(clippy::large_stack_frames)] // TODO(https://github.com/gfx-rs/wgpu/issues/9456)
     fn validate_block_impl(
         &mut self,
         statements: &crate::Block,
@@ -1090,6 +1099,13 @@ impl super::Validator {
                     let good = if let Some(&Ti::Atomic(ref scalar)) = pointer_base_ty {
                         // The Naga IR allows storing a scalar to an atomic.
                         *value_ty == Ti::Scalar(*scalar)
+                    } else if let Some(&Ti::RayQuery { .. }) = pointer_base_ty {
+                        return Err(FunctionError::RayQueryStore(pointer)
+                            .with_span_context((
+                                context.expressions.get_span(pointer),
+                                format!("this pointer has a base type of {pointer_base_ty:?} which cannot be stored to"),
+                            ))
+                            .with_span(span, "store to a type which is not allowed to be stored to"));
                     } else if let Some(tr) = pointer_base_tr {
                         context.compare_types(value_tr, &tr)
                     } else {
@@ -1572,6 +1588,7 @@ impl super::Validator {
                         }
                         crate::RayQueryFunction::ConfirmIntersection => {}
                         crate::RayQueryFunction::Terminate => {}
+                        crate::RayQueryFunction::Begin => {}
                     }
                 }
                 S::SubgroupBallot { result, predicate } => {
@@ -1735,6 +1752,13 @@ impl super::Validator {
                             }
                         };
 
+                        // spir-v requires a direct reference to a global variable.
+                        let crate::Expression::GlobalVariable(_) = context.expressions[payload]
+                        else {
+                            return Err(FunctionError::PayloadPointerNotGlobal
+                                .with_span_handle(payload, context.expressions));
+                        };
+
                         let ty = *self
                             .trace_rays_payload_type
                             .get_or_insert(current_payload_ty);
@@ -1800,6 +1824,10 @@ impl super::Validator {
 
             if !local_expr_kind.is_const_or_override(init) {
                 return Err(LocalVariableError::NonConstOrOverrideInitializer);
+            }
+
+            if matches!(gctx.types[var.ty].inner, crate::TypeInner::RayQuery { .. }) {
+                return Err(LocalVariableError::RayQueryWithInitializeExpression);
             }
         }
 

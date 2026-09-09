@@ -1,24 +1,18 @@
 // Copyright 2018-2025 the Deno authors. MIT license.
 
+use std::sync::Arc;
+
 use deno_core::op2;
 use deno_core::GarbageCollected;
 use deno_core::WebIDL;
+use wgpu_core::resource::Labeled as _;
 
 use crate::error::GPUGenericError;
 use crate::texture::GPUTextureViewDimension;
 use crate::webidl::GPUShaderStageFlags;
-use crate::Instance;
 
 pub struct GPUBindGroupLayout {
-  pub instance: Instance,
-  pub id: wgpu_core::id::BindGroupLayoutId,
-  pub label: String,
-}
-
-impl Drop for GPUBindGroupLayout {
-  fn drop(&mut self) {
-    self.instance.bind_group_layout_drop(self.id);
-  }
+  pub wgpu_bind_group_layout: Arc<wgpu_core::binding_model::BindGroupLayout>,
 }
 
 impl deno_core::webidl::WebIdlInterfaceConverter for GPUBindGroupLayout {
@@ -42,7 +36,7 @@ impl GPUBindGroupLayout {
   #[getter]
   #[string]
   fn label(&self) -> String {
-    self.label.clone()
+    self.wgpu_bind_group_layout.label().to_string()
   }
   #[setter]
   #[string]

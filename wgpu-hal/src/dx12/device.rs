@@ -10,7 +10,7 @@ use core::{ffi, num::NonZeroU32, ptr, time::Duration};
 use std::time::Instant;
 
 use bytemuck::TransparentWrapper;
-use parking_lot::Mutex;
+use wgpu_sync::Mutex;
 use windows::{
     core::Interface as _,
     Win32::{
@@ -418,7 +418,11 @@ impl super::Device {
 
         let source_name = stage.module.raw_name.as_deref();
 
-        let full_stage = format!("{}_{}", naga_stage.to_hlsl_str(), key.shader_model.to_str());
+        let full_stage = format!(
+            "{}_{}",
+            naga::back::hlsl::shader_stage_to_hlsl_str(naga_stage),
+            key.shader_model.to_str()
+        );
 
         let compiled_shader = self.compiler_container.compile(
             self,
@@ -477,6 +481,7 @@ impl super::Device {
                 suballocation::AllocationType::Texture,
                 format.theoretical_memory_footprint(size),
             ),
+            plane_slice_override: None,
         }
     }
 
@@ -486,7 +491,7 @@ impl super::Device {
     ) -> super::Buffer {
         super::Buffer {
             resource,
-            size,
+            allocated_size: size,
             allocation: suballocation::Allocation::none(
                 suballocation::AllocationType::Buffer,
                 size,
@@ -501,7 +506,7 @@ impl crate::Device for super::Device {
     unsafe fn create_buffer(
         &self,
         desc: &crate::BufferDescriptor,
-    ) -> Result<super::Buffer, crate::DeviceError> {
+    ) -> Result<(super::Buffer, wgt::BufferAddress), crate::DeviceError> {
         let mut desc = desc.clone();
 
         if desc.usage.contains(wgt::BufferUses::UNIFORM) {
@@ -515,11 +520,14 @@ impl crate::Device for super::Device {
 
         self.counters.buffers.add(1);
 
-        Ok(super::Buffer {
-            resource,
-            size: desc.size,
-            allocation,
-        })
+        Ok((
+            super::Buffer {
+                resource,
+                allocated_size: desc.size,
+                allocation,
+            },
+            desc.size,
+        ))
     }
 
     unsafe fn destroy_buffer(&self, buffer: super::Buffer) {
@@ -598,6 +606,7 @@ impl crate::Device for super::Device {
             mip_level_count: desc.mip_level_count,
             sample_count: desc.sample_count,
             allocation,
+            plane_slice_override: None,
         })
     }
 
@@ -629,7 +638,7 @@ impl crate::Device for super::Device {
             subresource_index: texture.calc_subresource(
                 desc.range.base_mip_level,
                 desc.range.base_array_layer,
-                0,
+                view_desc.plane_slice(),
             ),
             mip_slice: desc.range.base_mip_level,
             handle_srv: if desc.usage.intersects(wgt::TextureUses::RESOURCE) {
@@ -687,8 +696,12 @@ impl crate::Device for super::Device {
             } else {
                 None
             },
-            handle_dsv_ro: if desc.usage.intersects(wgt::TextureUses::DEPTH_STENCIL_READ) {
-                let raw_desc = unsafe { view_desc.to_dsv(true) };
+            handle_dsv_wr: if desc.format.is_combined_depth_stencil_format()
+                && desc
+                    .usage
+                    .contains(wgt::TextureUses::DEPTH_WRITE | wgt::TextureUses::STENCIL_READ)
+            {
+                let raw_desc = unsafe { view_desc.to_dsv(false, true) };
                 let handle = self.dsv_pool.lock().alloc_handle()?;
                 unsafe {
                     self.raw
@@ -698,8 +711,40 @@ impl crate::Device for super::Device {
             } else {
                 None
             },
-            handle_dsv_rw: if desc.usage.intersects(wgt::TextureUses::DEPTH_STENCIL_WRITE) {
-                let raw_desc = unsafe { view_desc.to_dsv(false) };
+            handle_dsv_rw: if desc.format.is_combined_depth_stencil_format()
+                && desc
+                    .usage
+                    .contains(wgt::TextureUses::DEPTH_READ | wgt::TextureUses::STENCIL_WRITE)
+            {
+                let raw_desc = unsafe { view_desc.to_dsv(true, false) };
+                let handle = self.dsv_pool.lock().alloc_handle()?;
+                unsafe {
+                    self.raw
+                        .CreateDepthStencilView(&texture.resource, Some(&raw_desc), handle.raw)
+                };
+                Some(handle)
+            } else {
+                None
+            },
+            handle_dsv_ww: if desc
+                .usage
+                .intersects(wgt::TextureUses::DEPTH_WRITE | wgt::TextureUses::STENCIL_WRITE)
+            {
+                let raw_desc = unsafe { view_desc.to_dsv(false, false) };
+                let handle = self.dsv_pool.lock().alloc_handle()?;
+                unsafe {
+                    self.raw
+                        .CreateDepthStencilView(&texture.resource, Some(&raw_desc), handle.raw)
+                };
+                Some(handle)
+            } else {
+                None
+            },
+            handle_dsv_rr: if desc
+                .usage
+                .intersects(wgt::TextureUses::DEPTH_READ | wgt::TextureUses::STENCIL_READ)
+            {
+                let raw_desc = unsafe { view_desc.to_dsv(true, true) };
                 let handle = self.dsv_pool.lock().alloc_handle()?;
                 unsafe {
                     self.raw
@@ -725,12 +770,22 @@ impl crate::Device for super::Device {
         if let Some(handle) = view.handle_rtv {
             self.rtv_pool.lock().free_handle(handle);
         }
-        if view.handle_dsv_ro.is_some() || view.handle_dsv_rw.is_some() {
+        if view.handle_dsv_rr.is_some()
+            || view.handle_dsv_wr.is_some()
+            || view.handle_dsv_rw.is_some()
+            || view.handle_dsv_ww.is_some()
+        {
             let mut pool = self.dsv_pool.lock();
-            if let Some(handle) = view.handle_dsv_ro {
+            if let Some(handle) = view.handle_dsv_rr {
+                pool.free_handle(handle);
+            }
+            if let Some(handle) = view.handle_dsv_wr {
                 pool.free_handle(handle);
             }
             if let Some(handle) = view.handle_dsv_rw {
+                pool.free_handle(handle);
+            }
+            if let Some(handle) = view.handle_dsv_ww {
                 pool.free_handle(handle);
             }
         }
@@ -768,7 +823,9 @@ impl crate::Device for super::Device {
             MipLODBias: 0f32,
             MaxAnisotropy: desc.anisotropy_clamp as u32,
 
-            ComparisonFunc: conv::map_comparison(desc.compare.unwrap_or_default()),
+            ComparisonFunc: desc
+                .compare
+                .map_or(Direct3D12::D3D12_COMPARISON_FUNC_NONE, conv::map_comparison),
             BorderColor: border_color,
             MinLOD: desc.lod_clamp.start,
             MaxLOD: desc.lod_clamp.end,
@@ -1402,28 +1459,6 @@ impl crate::Device for super::Device {
                 };
                 let special_constant_buffer_args_len = size_of::<super::SpecialConstants>();
 
-                let draw_mesh = if self
-                    .features
-                    .features_wgpu
-                    .contains(wgt::FeaturesWGPU::EXPERIMENTAL_MESH_SHADER)
-                {
-                    Some(Self::create_command_signature(
-                        &self.raw,
-                        Some(&raw),
-                        special_constant_buffer_args_len + size_of::<wgt::DispatchIndirectArgs>(),
-                        &[
-                            constant_indirect_argument_desc,
-                            Direct3D12::D3D12_INDIRECT_ARGUMENT_DESC {
-                                Type: Direct3D12::D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH,
-                                ..Default::default()
-                            },
-                        ],
-                        0,
-                    )?)
-                } else {
-                    None
-                };
-
                 Some(super::CommandSignatures {
                     draw: Self::create_command_signature(
                         &self.raw,
@@ -1452,7 +1487,8 @@ impl crate::Device for super::Device {
                         ],
                         0,
                     )?,
-                    draw_mesh,
+                    // Mesh pipelines don't support updating special constants.
+                    draw_mesh: None,
                     dispatch: Self::create_command_signature(
                         &self.raw,
                         Some(&raw),
@@ -1562,7 +1598,7 @@ impl crate::Device for super::Device {
                     let end = start + entry.count as usize;
                     for data in &desc.buffers[start..end] {
                         let gpu_address = data.resolve_address();
-                        let mut size = data.resolve_size().try_into().unwrap();
+                        let mut size = data.size.get().try_into().unwrap();
 
                         if has_dynamic_offset {
                             match ty {
@@ -1574,8 +1610,13 @@ impl crate::Device for super::Device {
                                     ));
                                     continue;
                                 }
+                                // TODO(https://github.com/gfx-rs/wgpu/issues/9865): There is not currently
+                                // any mechanism to check that shader accesses are within the valid range
+                                // of a dynamic offset binding, and while using the actual size of the buffer
+                                // here would be slightly closer to being correct, it isn't sufficient
+                                // (because the upper bound moves with the dynamic offset).
                                 wgt::BufferBindingType::Storage { .. } => {
-                                    size = (data.buffer.size - data.offset) as u32;
+                                    size = (data.buffer.allocated_size - data.offset) as u32;
                                     dynamic_buffers.push(super::DynamicBuffer::Storage);
                                 }
                             }
@@ -1653,6 +1694,33 @@ impl crate::Device for super::Device {
                         let handle = data.view.handle_srv.unwrap();
                         cpu_views.as_mut().unwrap().stage.push(handle.raw);
                     }
+                    // The table range reserves the full `layout.count`, so pad a
+                    // partially-bound array with null SRVs to keep later bindings aligned.
+                    let array_size = layout.count.map_or(1, NonZeroU32::get);
+                    for _ in entry.count..array_size {
+                        let inner = cpu_views.as_mut().unwrap();
+                        let cpu_index = inner.stage.len() as u32;
+                        let handle = desc.layout.cpu_heap_views.as_ref().unwrap().at(cpu_index);
+                        let raw_desc = Direct3D12::D3D12_SHADER_RESOURCE_VIEW_DESC {
+                            Format: Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+                            ViewDimension: Direct3D12::D3D12_SRV_DIMENSION_TEXTURE2D,
+                            Shader4ComponentMapping:
+                                Direct3D12::D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                            Anonymous: Direct3D12::D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                                Texture2D: Direct3D12::D3D12_TEX2D_SRV {
+                                    MostDetailedMip: 0,
+                                    MipLevels: 1,
+                                    PlaneSlice: 0,
+                                    ResourceMinLODClamp: 0.0,
+                                },
+                            },
+                        };
+                        unsafe {
+                            self.raw
+                                .CreateShaderResourceView(None, Some(&raw_desc), handle)
+                        };
+                        inner.stage.push(handle);
+                    }
                 }
                 wgt::BindingType::StorageTexture { .. } => {
                     let start = entry.resource_index as usize;
@@ -1660,6 +1728,29 @@ impl crate::Device for super::Device {
                     for data in &desc.textures[start..end] {
                         let handle = data.view.handle_uav.unwrap();
                         cpu_views.as_mut().unwrap().stage.push(handle.raw);
+                    }
+                    // Same partial-binding-array padding as the `Texture` branch above, but
+                    // with null UAVs so that bindings following the array keep their offsets.
+                    let array_size = layout.count.map_or(1, NonZeroU32::get);
+                    for _ in entry.count..array_size {
+                        let inner = cpu_views.as_mut().unwrap();
+                        let cpu_index = inner.stage.len() as u32;
+                        let handle = desc.layout.cpu_heap_views.as_ref().unwrap().at(cpu_index);
+                        let raw_desc = Direct3D12::D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                            Format: Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+                            ViewDimension: Direct3D12::D3D12_UAV_DIMENSION_TEXTURE2D,
+                            Anonymous: Direct3D12::D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                                Texture2D: Direct3D12::D3D12_TEX2D_UAV {
+                                    MipSlice: 0,
+                                    PlaneSlice: 0,
+                                },
+                            },
+                        };
+                        unsafe {
+                            self.raw
+                                .CreateUnorderedAccessView(None, None, Some(&raw_desc), handle)
+                        };
+                        inner.stage.push(handle);
                     }
                 }
                 wgt::BindingType::Sampler { .. } => {
@@ -1706,7 +1797,7 @@ impl crate::Device for super::Device {
                         cpu_views.as_mut().unwrap().stage.push(plane_handle.raw);
                     }
                     let gpu_address = external_texture.params.resolve_address();
-                    let size = external_texture.params.resolve_size() as u32;
+                    let size = crate::EXTERNAL_TEXTURE_PARAMS_SIZE as u32;
                     let inner = cpu_views.as_mut().unwrap();
                     let cpu_index = inner.stage.len() as u32;
                     let params_handle = desc.layout.cpu_heap_views.as_ref().unwrap().at(cpu_index);
@@ -2208,6 +2299,29 @@ impl crate::Device for super::Device {
         self.counters.compute_pipelines.sub(1);
     }
 
+    unsafe fn create_ray_tracing_pipeline(
+        &self,
+        _desc: &crate::RayTracingPipelineDescriptor<
+            super::PipelineLayout,
+            super::ShaderModule,
+            super::PipelineCache,
+        >,
+    ) -> Result<<Self::A as crate::Api>::RayTracingPipeline, crate::PipelineError> {
+        unreachable!("ray tracing pipelines not yet implemented")
+    }
+
+    unsafe fn destroy_ray_tracing_pipeline(&self, _pipeline: super::RayTracingPipeline) {
+        unreachable!("ray tracing pipelines not yet implemented")
+    }
+
+    unsafe fn get_raytracing_pipeline_group_data(
+        &self,
+        _pipeline: &super::RayTracingPipeline,
+        _groups: core::ops::Range<u32>,
+    ) -> Result<Vec<u8>, crate::DeviceError> {
+        unimplemented!("ray tracing pipelines not yet implemented")
+    }
+
     unsafe fn create_pipeline_cache(
         &self,
         _desc: &crate::PipelineCacheDescriptor<'_>,
@@ -2586,18 +2700,18 @@ impl crate::Device for super::Device {
         Some(self.mem_allocator.generate_report())
     }
 
-    fn tlas_instance_to_bytes(&self, instance: TlasInstance) -> Vec<u8> {
+    fn tlas_instance_to_bytes(&self, instance: TlasInstance, to_extend: &mut Vec<u8>) {
         const MAX_U24: u32 = (1u32 << 24u32) - 1u32;
         let temp = Direct3D12::D3D12_RAYTRACING_INSTANCE_DESC {
             Transform: instance.transform,
             _bitfield1: (instance.custom_data & MAX_U24) | (u32::from(instance.mask) << 24),
-            _bitfield2: 0,
+            _bitfield2: (instance.pipeline_intersection_data_offset & MAX_U24),
             AccelerationStructure: instance.blas_address,
         };
 
         wgt::bytemuck_wrapper!(unsafe struct Desc(Direct3D12::D3D12_RAYTRACING_INSTANCE_DESC));
 
-        bytemuck::bytes_of(&Desc::wrap(temp)).to_vec()
+        to_extend.extend_from_slice(bytemuck::bytes_of(&Desc::wrap(temp)))
     }
 
     fn check_if_oom(&self) -> Result<(), crate::DeviceError> {

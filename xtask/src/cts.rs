@@ -72,6 +72,10 @@ pub fn run_cts(
     let llvm_cov = args.contains("--llvm-cov");
     let release = args.contains("--release");
 
+    // This is used in the Vulkan hal to waive pre-existing validation
+    // errors in the CTS, until they can be fixed.
+    shell.set_var("WGPU_CTS_XTASK", "1");
+
     let output_filter = args
         .opt_value_from_str::<_, String>("--print-output-when")?
         .map(|f| {
@@ -137,9 +141,29 @@ pub fn run_cts(
         })
         .collect::<Vec<_>>();
 
-    if running_on_backend.is_none() && (!list_files.is_empty() || tests.is_empty()) {
+    if let Some(backend) = &running_on_backend {
+        shell.set_var("DENO_WEBGPU_BACKEND", backend);
+    } else if !list_files.is_empty() || tests.is_empty() {
         log::warn!("The `--backend` option was not provided. `fails-if` conditions and external");
         log::warn!("texture support are handled correctly only when a backend is specified.");
+    }
+
+    #[cfg(windows)]
+    if running_on_backend.as_ref().is_none_or(|b| b == "dx12") {
+        const DENO_WEBGPU_DX12_COMPILER: &str = "DENO_WEBGPU_DX12_COMPILER";
+        const DEFAULT_DX12_COMPILER: &str = "dynamicdxc";
+
+        match shell.var(DENO_WEBGPU_DX12_COMPILER) {
+            Ok(value) => {
+                log::info!("Using `{DENO_WEBGPU_DX12_COMPILER}` = {value:?} from environment")
+            }
+            Err(_) => {
+                shell.set_var(DENO_WEBGPU_DX12_COMPILER, DEFAULT_DX12_COMPILER);
+                log::info!(
+                    "Using default `{DENO_WEBGPU_DX12_COMPILER}` = {DEFAULT_DX12_COMPILER:?}"
+                );
+            }
+        }
     }
 
     let mut default_output_filter = PrintOutputWhen::Always;
@@ -427,13 +451,15 @@ pub fn run_cts(
                         println!("\n== Summary for {} ==", test.selector.to_string_lossy());
                         println!("{}", summary.trim());
                     } else {
+                        log::info!("Running {}", test.selector.to_string_lossy());
                         print!("{}", stdout);
                         eprint!("{}", stderr);
                     }
                 } else {
+                    log::info!("Running {}", test.selector.to_string_lossy());
                     print!("{}", stdout);
                     eprint!("{}", stderr);
-                    bail!("CTS failed");
+                    bail!("CTS failed ({})", output.status);
                 }
             }
             PrintOutputWhen::Always => {

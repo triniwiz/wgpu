@@ -1145,10 +1145,10 @@ macro_rules! check_extension_validation {
         // Don't check with explicitly allowed caps, as certain things (currently just
         // `acceleration_structure`s) can be enabled by multiple extensions
         let error = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), !(caps | other_caps))
-            .validate(&module)
-            .map_err(|e| e.into_inner()); // TODO(https://github.com/gfx-rs/wgpu/issues/8153): Add tests for spans
+            .validate(&module).map_err(|e|e.into_inner());
+        let error = error.as_ref(); // TODO(https://github.com/gfx-rs/wgpu/issues/8153): Add tests for spans
         #[allow(clippy::redundant_pattern_matching)]
-        if !matches!(&error, $val_err_pat) {
+        if !matches!(error, $val_err_pat) {
             eprintln!(
                 concat!(
                     "validation error without {:?} does not match pattern:\n",
@@ -1212,6 +1212,16 @@ macro_rules! check_validation {
     }
 }
 
+#[cfg_attr(
+    not(target_pointer_width = "32"),
+    expect(
+        clippy::result_large_err,
+        reason = "`ValidationError` is large enough that it should usually be boxed, \
+              but this is only a test, and it makes the `match` expressions \
+              in the callers a bit cleaner. \
+              This lint does not trigger on 32-bit builds."
+    )
+)]
 #[track_caller]
 fn validation_error(
     source: &str,
@@ -1276,6 +1286,36 @@ fn per_vertex_capability() {
         },
     )
         }
+}
+
+#[test]
+fn linear_interpolation_capability() {
+    // Regression test for https://github.com/gfx-rs/wgpu/issues/9971: `@interpolate(linear)`
+    // has no GLSL ES equivalent, so it must be rejected during validation rather than
+    // silently passing and then failing in the GLSL backend at pipeline creation.
+    let source = r#"
+        @fragment
+        fn fs_main(@location(0) @interpolate(linear) v: f32) -> @location(0) vec4<f32> {
+            return vec4(v, 0.0, 0.0, 1.0);
+        }
+    "#;
+
+    check_one_validation! {
+        source,
+        Err(naga::valid::ValidationError::EntryPoint {
+            stage: naga::ShaderStage::Fragment,
+            source: valid::EntryPointError::Argument(
+                0,
+                valid::VaryingError::UnsupportedCapability(Capabilities::LINEAR_INTERPOLATION),
+            ),
+            ..
+        })
+    }
+
+    no_validation_error(
+        source,
+        Capabilities::default() | Capabilities::LINEAR_INTERPOLATION,
+    );
 }
 
 #[test]
@@ -1415,22 +1455,159 @@ fn float16_capability_and_enable() {
 }
 
 #[test]
-fn float16_in_immediate() {
+fn int16_capability_and_enable() {
+    // A zero value expression
+    check_extension_validation! {
+        Capabilities::SHADER_INT16,
+        r#"fn foo() {
+            let a = u16();
+        }
+        "#,
+        r#"error: the `wgpu_int16` enable extension is not enabled
+  ┌─ wgsl:2:21
+  │
+2 │             let a = u16();
+  │                     ^^^ the `wgpu_int16` "Enable Extension" is needed for this functionality, but it is not currently enabled.
+  │
+  = note: You can enable this extension by adding `enable wgpu_int16;` at the top of the shader, before any other items.
+
+"#,
+        Err(naga::valid::ValidationError::Type {
+            source: naga::valid::TypeError::WidthError(naga::valid::WidthError::MissingCapability { flag: "SHADER_INT16", .. }),
+            ..
+        })
+    }
+
+    // Literals (via constructor)
+    check_extension_validation! {
+        Capabilities::SHADER_INT16,
+        r#"fn foo() {
+            let a = u16(1);
+        }
+        "#,
+        r#"error: the `wgpu_int16` enable extension is not enabled
+  ┌─ wgsl:2:21
+  │
+2 │             let a = u16(1);
+  │                     ^^^ the `wgpu_int16` "Enable Extension" is needed for this functionality, but it is not currently enabled.
+  │
+  = note: You can enable this extension by adding `enable wgpu_int16;` at the top of the shader, before any other items.
+
+"#,
+        Err(naga::valid::ValidationError::Function {
+            source: naga::valid::FunctionError::Expression {
+                source: naga::valid::ExpressionError::Literal(
+                    naga::valid::LiteralError::Width(
+                        naga::valid::WidthError::MissingCapability { flag: "SHADER_INT16", .. }
+                    )
+                ),
+                ..
+            },
+            ..
+        })
+    }
+
+    // `u16`-typed declarations
+    check_extension_validation! {
+        Capabilities::SHADER_INT16,
+        "var input: u16;",
+        r#"error: the `wgpu_int16` enable extension is not enabled
+  ┌─ wgsl:1:12
+  │
+1 │ var input: u16;
+  │            ^^^ the `wgpu_int16` "Enable Extension" is needed for this functionality, but it is not currently enabled.
+  │
+  = note: You can enable this extension by adding `enable wgpu_int16;` at the top of the shader, before any other items.
+
+"#,
+        Err(naga::valid::ValidationError::Type {
+            source: naga::valid::TypeError::WidthError(naga::valid::WidthError::MissingCapability { flag: "SHADER_INT16", .. }),
+            ..
+        })
+    }
+
+    // `i16`-typed declarations
+    check_extension_validation! {
+        Capabilities::SHADER_INT16,
+        "var input: i16;",
+        r#"error: the `wgpu_int16` enable extension is not enabled
+  ┌─ wgsl:1:12
+  │
+1 │ var input: i16;
+  │            ^^^ the `wgpu_int16` "Enable Extension" is needed for this functionality, but it is not currently enabled.
+  │
+  = note: You can enable this extension by adding `enable wgpu_int16;` at the top of the shader, before any other items.
+
+"#,
+        Err(naga::valid::ValidationError::Type {
+            source: naga::valid::TypeError::WidthError(naga::valid::WidthError::MissingCapability { flag: "SHADER_INT16", .. }),
+            ..
+        })
+    }
+}
+
+#[test]
+fn int16_in_atomic() {
     check_validation! {
-        "enable f16; var<immediate> input: f16;",
-        "enable f16; var<immediate> input: vec2<f16>;",
-        "enable f16; var<immediate> input: mat4x4<f16>;",
-        "enable f16; struct S { a: f16 }; var<immediate> input: S;",
-        "enable f16; struct S1 { a: f16 }; struct S2 { a : S1 } var<immediate> input: S2;":
-        Err(naga::valid::ValidationError::GlobalVariable {
-            source: naga::valid::GlobalVariableError::InvalidImmediateType(
-                naga::valid::ImmediateError::InvalidScalar(
-                    naga::Scalar::F16
-                )
+        "enable wgpu_int16; @group(0) @binding(0) var<storage> a: atomic<u16>;",
+        "enable wgpu_int16; @group(0) @binding(0) var<storage> a: atomic<i16>;":
+        Err(naga::valid::ValidationError::Type {
+            source: naga::valid::TypeError::InvalidAtomicWidth(_, 2),
+            ..
+        }),
+        naga::valid::Capabilities::SHADER_INT16
+    }
+}
+
+#[test]
+fn int16_subgroup_bitwise_rejected() {
+    check_validation! {
+        "enable wgpu_int16; @compute @workgroup_size(1) fn main() { var v = i16(1); v = subgroupAnd(v); }",
+        "enable wgpu_int16; @compute @workgroup_size(1) fn main() { var v = i16(1); v = subgroupOr(v); }",
+        "enable wgpu_int16; @compute @workgroup_size(1) fn main() { var v = i16(1); v = subgroupXor(v); }",
+        "enable wgpu_int16; @compute @workgroup_size(1) fn main() { var v = u16(1); v = subgroupAnd(v); }":
+        Err(naga::valid::ValidationError::EntryPoint {
+            source: naga::valid::EntryPointError::Function(
+                naga::valid::FunctionError::InvalidSubgroup(
+                    naga::valid::SubgroupError::InvalidOperand(_),
+                ),
             ),
             ..
         }),
-        naga::valid::Capabilities::SHADER_FLOAT16 | naga::valid::Capabilities::IMMEDIATES
+        naga::valid::Capabilities::SHADER_INT16 | naga::valid::Capabilities::SUBGROUP
+    }
+}
+
+#[test]
+fn int16_in_immediate() {
+    check_validation! {
+        "enable wgpu_int16; var<immediate> input: i16;",
+        "enable wgpu_int16; var<immediate> input: u16;",
+        "enable wgpu_int16; var<immediate> input: vec2<i16>;",
+        "enable wgpu_int16; struct S { a: u16 }; var<immediate> input: S;":
+        Err(naga::valid::ValidationError::GlobalVariable {
+            source: naga::valid::GlobalVariableError::InvalidImmediateType(
+                naga::valid::ImmediateError::InvalidScalar(_)
+            ),
+            ..
+        }),
+        naga::valid::Capabilities::SHADER_INT16 | naga::valid::Capabilities::IMMEDIATES
+    }
+}
+
+#[test]
+fn array_in_immediate() {
+    check_validation! {
+        "var<immediate> input: array<u32, 4>;",
+        "var<immediate> input: array<u32>;",
+        "struct S { a: array<u32, 4> }; var<immediate> input: S;":
+        Err(naga::valid::ValidationError::GlobalVariable {
+            source: naga::valid::GlobalVariableError::InvalidImmediateType(
+                naga::valid::ImmediateError::InvalidArray
+            ),
+            ..
+        }),
+        naga::valid::Capabilities::IMMEDIATES
     }
 }
 
@@ -1642,25 +1819,27 @@ fn struct_type_mismatch_in_let_decl() {
 
 #[test]
 fn struct_type_mismatch_in_return_value() {
-    check_validation!(
+    check(
         "
         struct Foo { a: u32 };
         struct Bar { a: u32 };
         fn bar() -> Bar {
             return Foo(1);
         }
-        ":
-        Err(naga::valid::ValidationError::Function {
-            handle: _,
-            name: function_name,
-            source: naga::valid::FunctionError::InvalidReturnType { .. }
-        }) if function_name == "bar"
+        ",
+        r#"error: expected `Bar`, found `Foo`
+  ┌─ wgsl:5:20
+  │
+5 │             return Foo(1);
+  │                    ^^^^^^ this expression has type `Foo`
+
+"#,
     );
 }
 
 #[test]
 fn struct_type_mismatch_in_argument() {
-    check_validation!(
+    check(
         "
         struct Foo { a: u32 };
         struct Bar { a: u32 };
@@ -1668,17 +1847,56 @@ fn struct_type_mismatch_in_argument() {
         fn main() {
             bar(Foo(1));
         }
-        ":
-        Err(naga::valid::ValidationError::Function {
-            name: function_name,
-            source: naga::valid::FunctionError::InvalidCall {
-                function: _,
-                error: naga::valid::CallError::ArgumentType { index, .. },
-            },
-            ..
-        })
-        // The validation error is reported at the call, i.e., in `main`
-        if function_name == "main" && *index == 0
+        ",
+        r#"error: expected `Bar`, found `Foo`
+  ┌─ wgsl:6:17
+  │
+6 │             bar(Foo(1));
+  │                 ^^^^^^ this expression has type `Foo`
+
+"#,
+    );
+}
+
+/// Regression test for <https://github.com/gfx-rs/wgpu/issues/7419>: a
+/// constructor component of the wrong concrete type used to be reported by the
+/// IR validator as `Composing 0's component type is not expected`.
+#[test]
+fn type_mismatch_in_composite_constructor() {
+    check(
+        "
+        fn main() {
+            var a = array<vec2<u32>, 2>(1u, 2u);
+        }
+        ",
+        r#"error: expected `vec2<u32>`, found `u32`
+  ┌─ wgsl:3:21
+  │
+3 │             var a = array<vec2<u32>, 2>(1u, 2u);
+  │                     ^^^^^^^^^^^^^^^^^^^ ^^ this expression has type `u32`
+  │                     │                    
+  │                     a value of type `vec2<u32>` is required here
+
+"#,
+    );
+
+    check(
+        "
+        struct S { inner: array<u32, 4> }
+        fn main() {
+            var s = S(1u);
+        }
+        ",
+        r#"error: expected `array<u32, 4>`, found `u32`
+  ┌─ wgsl:2:9
+  │
+2 │         struct S { inner: array<u32, 4> }
+  │         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ a value of type `array<u32, 4>` is required here
+3 │         fn main() {
+4 │             var s = S(1u);
+  │                       ^^ this expression has type `u32`
+
+"#,
     );
 }
 
@@ -1839,13 +2057,16 @@ fn invalid_functions() {
 
 #[test]
 fn invalid_return_type() {
-    check_validation! {
-        "fn invalid_return_type() -> i32 { return 0u; }":
-        Err(naga::valid::ValidationError::Function {
-            source: naga::valid::FunctionError::InvalidReturnType { .. },
-            ..
-        })
-    };
+    check(
+        "fn invalid_return_type() -> i32 { return 0u; }",
+        r#"error: expected `i32`, found `u32`
+  ┌─ wgsl:1:42
+  │
+1 │ fn invalid_return_type() -> i32 { return 0u; }
+  │                                          ^^ this expression has type `u32`
+
+"#,
+    );
 }
 
 #[test]
@@ -3914,9 +4135,10 @@ fn vector_logical_ops() {
 #[test]
 fn issue7165() {
     // Regression test for https://github.com/gfx-rs/wgpu/issues/7165
+    // Any shader that parses but fails validation with a span will do.
     let shader = "
-        struct Struct { a: u32 }
-        fn invalid_return_type(a: Struct) -> i32 { return a; }
+        struct Atom { a: atomic<u32> }
+        fn non_constructible_return_type(a: Atom) -> Atom { return a; }
     ";
 
     // We need the span for the error, so have to invoke manually.
@@ -4574,6 +4796,50 @@ fn max_type_size_array_of_structs() {
 }
 
 #[test]
+fn max_type_size_array_constructor_with_oversize_type() {
+    // An `array(...)` constructor expression invokes the layouter to compute
+    // the stride of the constructed array. If a previously declared type is
+    // oversize, the layouter encounters it and the error must be reported
+    // rather than panicking.
+    //
+    // Regression test for <https://github.com/gfx-rs/wgpu/issues/9440>.
+    check(
+        r#"
+            var<workgroup> big: array<u32, 1 << 29>;
+            const A = array(1);
+        "#,
+        r#"error: type is too large
+ = note: the maximum size is 2147483647 bytes
+
+"#,
+    );
+}
+
+#[test]
+fn max_type_size_concretize_with_oversize_type() {
+    // Concretizing an abstract array (here, indexing it with a non-constant
+    // index forces concretization to a concrete element type) invokes the
+    // layouter to compute the new array's stride. If a previously declared
+    // type is oversize, the layouter encounters it and the error must be
+    // reported rather than panicking.
+    //
+    // Regression test for <https://github.com/gfx-rs/wgpu/issues/9440>.
+    check(
+        r#"
+            const a = array(0.);
+            var<workgroup> big: array<u32, 1 << 29>;
+            fn main(i: u32) {
+                let x = a[i];
+            }
+        "#,
+        r#"error: type is too large
+ = note: the maximum size is 2147483647 bytes
+
+"#,
+    );
+}
+
+#[test]
 fn source_with_control_char() {
     check(
         "\x07",
@@ -4893,7 +5159,7 @@ fn binding_array_requires_capability() {
 
     check_validation! {
         r#"
-            enable wgpu_binding_array; 
+            enable wgpu_binding_array;
             struct Buffer { data: u32 }
             @group(0) @binding(0)
             var<uniform> uniform_array: binding_array<Buffer, 10>;
@@ -5218,6 +5484,7 @@ fn check_ray_tracing_pipeline_bindings() {
         ("object_to_world", "mat4x3<f32>"),
         ("world_to_object", "mat4x3<f32>"),
         ("hit_kind", "u32"),
+        ("hit_barycentrics", "vec2<f32>"),
     ] {
         for stage in ["@compute @workgroup_size(1)", " @vertex", "@fragment"] {
             check_one_validation!(
@@ -5235,6 +5502,30 @@ fn check_ray_tracing_pipeline_bindings() {
                 },)
             );
         }
+    }
+}
+
+/// Checks that `hit_barycentrics` is rejected in the ray tracing pipeline stages
+/// that have no hit, since it is backed by a hit attribute.
+#[test]
+fn check_ray_tracing_pipeline_hit_barycentrics_stage() {
+    for stage in ["@ray_generation", "@miss @incoming_payload(incoming)"] {
+        check_one_validation!(
+            &format!(
+                "enable wgpu_ray_tracing_pipeline;
+            var<incoming_ray_payload> incoming: u32;
+
+            {stage} fn main(@builtin(hit_barycentrics) bary: vec2<f32>) {{}}"
+            ),
+            Err(naga::valid::ValidationError::EntryPoint {
+                source: naga::valid::EntryPointError::Argument(
+                    0,
+                    naga::valid::VaryingError::InvalidBuiltInStage(_),
+                ),
+                ..
+            },),
+            Capabilities::RAY_TRACING_PIPELINE
+        );
     }
 }
 
@@ -5460,4 +5751,153 @@ fn unterminated_block_comment_errors() {
         "const N: u32 = 1u; /* Trailing unterminated",
         "unterminated block comment",
     )
+}
+
+#[test]
+fn compute_shaders_dont_accept_result_types() {
+    check_validation! {
+        "
+        @compute @workgroup_size(1)
+        fn main() -> @location(0) u32 { return 0; }
+        ":
+        Err(
+            naga::valid::ValidationError::EntryPoint {
+                stage: naga::ShaderStage::Compute,
+                source: naga::valid::EntryPointError::UnexpectedComputeShaderEntryResult,
+                ..
+            },
+        )
+    }
+
+    check_validation! {
+        "
+        struct ComputeOutput {
+            @location(0) output0: vec4<f32>,
+            @location(1) output1: u32,
+        }
+        @compute @workgroup_size(1)
+        fn main() -> ComputeOutput { return ComputeOutput(vec4(0.0), 1); }
+        ":
+        Err(
+            naga::valid::ValidationError::EntryPoint {
+                stage: naga::ShaderStage::Compute,
+                source: naga::valid::EntryPointError::UnexpectedComputeShaderEntryResult,
+                ..
+            },
+        )
+    }
+}
+
+#[test]
+fn user_locations_not_accepted_in_compute_entry_point_arguments() {
+    check_validation! {
+        "
+        @compute @workgroup_size(1)
+        fn main(@location(0) _input: u32) { return; }
+        ":
+        Err(
+            naga::valid::ValidationError::EntryPoint {
+                stage: naga::ShaderStage::Compute,
+                source: naga::valid::EntryPointError::Argument(
+                    0,
+                    naga::valid::VaryingError::InvalidAttributeInStage(
+                        "location",
+                        naga::ShaderStage::Compute,
+                    ),
+                ),
+                ..
+            },
+        )
+    }
+
+    check_validation! {
+        "
+        struct ComputeInput {
+            @location(0) input0: vec4<f32>,
+            @location(1) input1: u32,
+        }
+        @compute @workgroup_size(1)
+        fn main(_input: ComputeInput) { return; }
+        ":
+        Err(
+            naga::valid::ValidationError::EntryPoint {
+                stage: naga::ShaderStage::Compute,
+                source: naga::valid::EntryPointError::Argument(
+                    0,
+                    naga::valid::VaryingError::InvalidAttributeInStage(
+                        "location",
+                        naga::ShaderStage::Compute
+                    ),
+                ),
+                ..
+            },
+        )
+    }
+}
+
+#[test]
+fn ray_query_store() {
+    // ray queries cannot be stored to despite them being a `var`
+    check_validation! {
+        r#"
+            enable wgpu_ray_query;
+
+            @compute @workgroup_size(1)
+            fn main() {
+                var rq: ray_query;
+                var rq_2: ray_query;
+                rq = rq_2;
+            }
+        "#:
+        Err(naga::valid::ValidationError::EntryPoint {
+            stage: naga::ShaderStage::Compute,
+            source: naga::valid::EntryPointError::Function(
+                naga::valid::FunctionError::RayQueryStore(_)
+            ),
+            ..
+        }),
+        Capabilities::RAY_QUERY
+    }
+}
+
+#[test]
+fn ray_query_initializer() {
+    // ray queries cannot have initializers
+    check_validation! {
+        r#"
+            enable wgpu_ray_query;
+
+            @compute @workgroup_size(1)
+            fn main() {
+                var rq: ray_query = ray_query();
+            }
+        "#:
+        Err(naga::valid::ValidationError::EntryPoint {
+            stage: naga::ShaderStage::Compute,
+            source: naga::valid::EntryPointError::Function(
+                naga::valid::FunctionError::LocalVariable {
+                    source: naga::valid::LocalVariableError::RayQueryWithInitializeExpression,
+                    ..
+                },
+            ),
+            ..
+        }),
+        Capabilities::RAY_QUERY
+    }
+}
+
+#[test]
+fn ray_query_let() {
+    check_error_matches(
+        "
+            enable wgpu_ray_query;
+
+            @compute @workgroup_size(1)
+            fn main() {
+                var rq: ray_query;
+                let _rq_1 = rq;
+            }
+        ",
+        "Ray query with initialize",
+    );
 }

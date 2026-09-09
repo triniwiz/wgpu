@@ -1,8 +1,9 @@
 //! `wgpu` is a cross-platform, safe, pure-Rust graphics API. It runs natively on
 //! Vulkan, Metal, D3D12, and OpenGL; and on top of WebGL2 and WebGPU on wasm.
 //!
-//! The API is based on the [WebGPU standard][webgpu], but is a fully native Rust library.
-//! It serves as the core of the WebGPU integration in Firefox, Servo, and Deno.
+//! The API is based on the [WebGPU standard][webgpu], but is a fully native Rust library
+//! and includes many extensions specific to the native backends. It serves as the core of
+//! the WebGPU integration in Firefox, Servo, and Deno.
 //!
 //! [webgpu]: https://gpuweb.github.io/gpuweb/
 //!
@@ -15,64 +16,28 @@
 //!
 //! Additionally, [WebGPU Fundamentals] is a tutorial for WebGPU which is very similar to our API, minus differences between Rust and Javascript.
 //!
-//! We have a [wiki](https://github.com/gfx-rs/wgpu/wiki) which has information on useful architecture patterns, debugging tips, and more getting started information.
+//! Most types and functions are documented, but for more general guides and explanations, see the [documentation modules][documentation].
 //!
-//! There are examples for this version [available on GitHub](https://github.com/gfx-rs/wgpu/tree/v29/examples#readme).
+//! There are examples for this version [available on GitHub](https://github.com/gfx-rs/wgpu/tree/v30/examples#readme).
 //!
 //! The API is refcounted, so all handles are cloneable, and if you create a resource which references another,
 //! it will automatically keep dependent resources alive.
 //!
 //! `wgpu` uses the coordinate systems of D3D and Metal. Depth ranges from [0, 1].
 //!
-//! | Render                | Texture                |
-//! | --------------------- | ---------------------- |
-//! | ![render_coordinates] | ![texture_coordinates] |
+//! | Render | Texture |
+//! | --- | --- |
+//! | ![Render coordinates][render_coordinates.webp] | ![Texture coordinates][texture_coordinates.webp] |
 //!
 //! `wgpu`'s MSRV is **1.87**.
 //!
 //! [Learn Wgpu]: https://sotrh.github.io/learn-wgpu/
 //! [WebGPU Fundamentals]: https://webgpufundamentals.org/
-//! [render_coordinates]: https://raw.githubusercontent.com/gfx-rs/wgpu/refs/heads/v29/docs/render_coordinates.png
-//! [texture_coordinates]: https://raw.githubusercontent.com/gfx-rs/wgpu/refs/heads/v29/docs/texture_coordinates.png
-//!
-//! ## Extension Specifications
-//!
-//! While the core of `wgpu` is based on the WebGPU standard, we also support extensions that allow for features that the standard does not have yet.
-//! For high-level documentation on how to use these extensions, see documentation on [`Features`] or the relevant specification:
-//!
-//! 🧪EXPERIMENTAL🧪 APIs are subject to change and may allow undefined behavior if used incorrectly.
-//!
-//! - 🧪EXPERIMENTAL🧪 [Ray Tracing](https://github.com/gfx-rs/wgpu/blob/v29/docs/api-specs/ray_tracing.md).
-//! - 🧪EXPERIMENTAL🧪 [Mesh Shading](https://github.com/gfx-rs/wgpu/blob/v29/docs/api-specs/mesh_shading.md).
-//!
-//! ## Shader Support
-//!
-//! `wgpu` can consume shaders in [WGSL](https://gpuweb.github.io/gpuweb/wgsl/), SPIR-V, and GLSL.
-//! Both [HLSL](https://github.com/Microsoft/DirectXShaderCompiler) and [GLSL](https://github.com/KhronosGroup/glslang)
-//! have compilers to target SPIR-V. All of these shader languages can be used with any backend as we handle all of the conversions. Additionally, support for these shader inputs is not going away.
-//!
-//! While WebGPU does not support any shading language other than WGSL, we will automatically convert your
-//! non-WGSL shaders if you're running on WebGPU.
-//!
-//! WGSL is always supported by default, but GLSL and SPIR-V need features enabled to compile in support.
-//!
-//! To enable WGSL shaders, enable the `wgsl` feature of `wgpu` (enabled by default).
-//! To enable SPIR-V shaders, enable the `spirv` feature of `wgpu`.
-//! To enable GLSL shaders, enable the `glsl` feature of `wgpu`.
-//!
-//! ## Feature flags
-#![doc = document_features::document_features!()]
-//!
-//! ### Feature Aliases
-//!
-//! These features aren't actually features on the crate itself, but a convenient shorthand for
-//! complicated cases.
-//!
-//! - **`wgpu_core`** --- Enabled when there is any non-webgpu backend enabled on the platform.
-//! - **`naga`** --- Enabled when target `glsl` or `spirv` input is enabled, or when `wgpu_core` is enabled.
-//!
-
+#![doc = crate::macros::doc_image!("render_coordinates.webp")]
+#![doc = crate::macros::doc_image!("texture_coordinates.webp")]
 #![no_std]
+// `-Znext-solver` requires deeper recursion limits (at least for now) to prove Send/Sync
+#![recursion_limit = "256"]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc(html_logo_url = "https://raw.githubusercontent.com/gfx-rs/wgpu/trunk/logo.png")]
 #![warn(
@@ -114,6 +79,7 @@ mod api;
 mod backend;
 mod cmp;
 mod dispatch;
+pub mod documentation;
 mod macros;
 pub mod util;
 
@@ -132,29 +98,31 @@ pub use wgt::{
     Backends, BindGroupLayoutEntry, BindingType, BlendComponent, BlendFactor, BlendOperation,
     BlendState, BufferAddress, BufferBindingType, BufferSize, BufferTextureCopyInfo,
     BufferTransition, BufferUsages, BufferUses, Color, ColorTargetState, ColorWrites,
-    CommandBufferDescriptor, CompareFunction, CompositeAlphaMode, CooperativeMatrixProperties,
-    CooperativeScalarType, CopyExternalImageDestInfo, CoreCounters, DepthBiasState,
-    DepthStencilState, DeviceLostReason, DeviceType, DownlevelCapabilities, DownlevelFlags,
-    DownlevelLimits, Dx12BackendOptions, Dx12Compiler, Dx12SwapchainKind,
-    Dx12UseFrameLatencyWaitableObject, DxcShaderModel, DynamicOffset, ExperimentalFeatures,
-    Extent3d, ExternalTextureFormat, ExternalTextureTransferFunction, Face, Features, FeaturesWGPU,
-    FeaturesWebGPU, FilterMode, ForceShaderModelToken, FrontFace, GlBackendOptions, GlDebugFns,
-    GlFenceBehavior, Gles3MinorVersion, HalCounters, ImageSubresourceRange, IndexFormat,
-    InstanceDescriptor, InstanceFlags, InternalCounters, Limits, LoadOpDontCare,
-    MemoryBudgetThresholds, MemoryHints, MipmapFilterMode, MultisampleState, NoopBackendOptions,
-    Origin2d, Origin3d, PassthroughShaderEntryPoint, PipelineStatisticsTypes, PollError,
-    PollStatus, PolygonMode, PowerPreference, PredefinedColorSpace, PresentMode,
-    PresentationTimestamp, PrimitiveState, PrimitiveTopology, QueryType, RenderBundleDepthStencil,
-    RequestAdapterError, SamplerBindingType, SamplerBorderColor, ShaderLocation, ShaderModel,
-    ShaderRuntimeChecks, ShaderStages, StencilFaceState, StencilOperation, StencilState,
-    StorageTextureAccess, SurfaceCapabilities, SurfaceStatus, TexelCopyBufferLayout, TextureAspect,
-    TextureChannel, TextureDimension, TextureFormat, TextureFormatFeatureFlags,
-    TextureFormatFeatures, TextureSampleType, TextureTransition, TextureUsages, TextureUses,
-    TextureViewDimension, Trace, VertexAttribute, VertexFormat, VertexStepMode, WasmNotSend,
-    WasmNotSendSync, WasmNotSync, WriteOnly, WriteOnlyIter, COPY_BUFFER_ALIGNMENT,
-    COPY_BYTES_PER_ROW_ALIGNMENT, IMMEDIATE_DATA_ALIGNMENT, MAP_ALIGNMENT,
-    MAXIMUM_SUBGROUP_MAX_SIZE, MINIMUM_SUBGROUP_MIN_SIZE, QUERY_RESOLVE_BUFFER_ALIGNMENT,
-    QUERY_SET_MAX_QUERIES, QUERY_SIZE, VERTEX_ALIGNMENT,
+    CommandBufferDescriptor, CompareFunction, ComponentSwizzle, CompositeAlphaMode,
+    CooperativeMatrixProperties, CooperativeScalarType, CopyExternalImageDestInfo, CoreCounters,
+    DepthBiasState, DepthStencilState, DeviceLostReason, DeviceType, DisplayChromaticity,
+    DisplayCoarseRange, DisplayGamut, DisplayHdrInfo, DisplayHeadroom, DisplayLuminance,
+    DownlevelCapabilities, DownlevelFlags, DownlevelLimits, Dx12BackendOptions, Dx12Compiler,
+    Dx12SwapchainKind, Dx12UseFrameLatencyWaitableObject, DxcShaderModel, DynamicOffset,
+    ExperimentalFeatures, Extent3d, ExternalTextureFormat, ExternalTextureTransferFunction, Face,
+    Features, FeaturesWGPU, FeaturesWebGPU, FilterMode, ForceShaderModelToken, FrontFace,
+    GlBackendOptions, GlDebugFns, GlFenceBehavior, Gles3MinorVersion, HalCounters,
+    ImageSubresourceRange, IndexFormat, InstanceDescriptor, InstanceFlags, InternalCounters,
+    Limits, LoadOpDontCare, MemoryBudgetThresholds, MemoryHints, MipmapFilterMode,
+    MultisampleState, NoopBackendOptions, Origin2d, Origin3d, PassthroughShaderEntryPoint,
+    PipelineStatisticsTypes, PollError, PollStatus, PolygonMode, PowerPreference,
+    PredefinedColorSpace, PresentMode, PresentationTimestamp, PrimitiveState, PrimitiveTopology,
+    QueryType, RenderBundleDepthStencil, RequestAdapterError, SamplerBindingType,
+    SamplerBorderColor, ShaderLocation, ShaderModel, ShaderRuntimeChecks, ShaderStages,
+    StencilFaceState, StencilOperation, StencilState, StorageTextureAccess, SurfaceCapabilities,
+    SurfaceColorSpace, SurfaceColorSpaces, SurfaceFormatCapabilities, SurfaceStatus,
+    TexelCopyBufferLayout, TextureAspect, TextureChannel, TextureComponentSwizzle,
+    TextureDimension, TextureFormat, TextureFormatFeatureFlags, TextureFormatFeatures,
+    TextureSampleType, TextureTransition, TextureUsages, TextureUses, TextureViewDimension, Trace,
+    VertexAttribute, VertexFormat, VertexStepMode, WasmNotSend, WasmNotSendSync, WasmNotSync,
+    WriteOnly, WriteOnlyIter, COPY_BUFFER_ALIGNMENT, COPY_BYTES_PER_ROW_ALIGNMENT,
+    IMMEDIATE_DATA_ALIGNMENT, MAP_ALIGNMENT, MAXIMUM_SUBGROUP_MAX_SIZE, MINIMUM_SUBGROUP_MIN_SIZE,
+    QUERY_RESOLVE_BUFFER_ALIGNMENT, QUERY_SET_MAX_QUERIES, QUERY_SIZE, VERTEX_ALIGNMENT,
 };
 
 #[expect(deprecated)]
@@ -186,6 +154,24 @@ pub use raw_window_handle as rwh;
 ///
 #[cfg(web)]
 pub use web_sys;
+
+/// Vendored WebGPU JS-handle types used by the WebGPU backend.
+///
+/// They are exposed publicly so that interop crates can read the JS handle
+/// behind a [`Texture`] / [`Buffer`] / etc. (via [`Texture::as_webgpu`] and
+/// siblings), and pass a foreign handle in (via
+/// [`Device::create_texture_from_webgpu_handle`]).
+///
+/// A `web_sys::GpuTexture` from a consumer's own `web-sys` dependency wraps
+/// the same JS object as a `wgpu::webgpu::GpuTexture`; convert between them
+/// with [`wasm_bindgen::JsCast::unchecked_into`].
+#[cfg(webgpu)]
+pub mod webgpu {
+    pub use crate::backend::webgpu::webgpu_sys::{
+        GpuBuffer, GpuDevice, GpuExternalTexture, GpuQueue, GpuTexture, GpuTextureView,
+    };
+    pub use crate::backend::webgpu::{DropCallback, ExternalTextureSource};
+}
 
 #[doc(hidden)]
 pub use macros::helpers as __macro_helpers;

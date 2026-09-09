@@ -2,7 +2,8 @@ use std::num::NonZero;
 
 use wgpu::{Features, Limits};
 use wgpu_test::{
-    gpu_test, GpuTestConfiguration, GpuTestInitializer, TestParameters, TestingContext,
+    apply, gpu_test, FailureCase, GpuTestConfiguration, GpuTestInitializer, TestParameters,
+    TestingContext,
 };
 
 pub fn all_tests(vec: &mut Vec<GpuTestInitializer>) {
@@ -12,7 +13,7 @@ pub fn all_tests(vec: &mut Vec<GpuTestInitializer>) {
     vec.push(DRAW_MULTIVIEW_MULTISAMPLE);
 }
 
-#[gpu_test]
+#[apply(gpu_test!)]
 static DRAW_MULTIVIEW_SINGLE: GpuTestConfiguration = GpuTestConfiguration::new()
     .parameters(
         TestParameters::default()
@@ -24,7 +25,7 @@ static DRAW_MULTIVIEW_SINGLE: GpuTestConfiguration = GpuTestConfiguration::new()
     )
     .run_async(|ctx| run_test(ctx, 0b1, 1));
 
-#[gpu_test]
+#[apply(gpu_test!)]
 static DRAW_MULTIVIEW: GpuTestConfiguration = GpuTestConfiguration::new()
     .parameters(
         TestParameters::default()
@@ -36,7 +37,7 @@ static DRAW_MULTIVIEW: GpuTestConfiguration = GpuTestConfiguration::new()
     )
     .run_async(|ctx| run_test(ctx, 0b11, 1));
 
-#[gpu_test]
+#[apply(gpu_test!)]
 static DRAW_MULTIVIEW_NONCONTIGUOUS: GpuTestConfiguration = GpuTestConfiguration::new()
     .parameters(TestParameters {
         required_features: Features::MULTIVIEW | Features::SELECTIVE_MULTIVIEW,
@@ -44,17 +45,27 @@ static DRAW_MULTIVIEW_NONCONTIGUOUS: GpuTestConfiguration = GpuTestConfiguration
             max_multiview_view_count: 4,
             ..Limits::defaults()
         },
-        // https://github.com/gfx-rs/wgpu/issues/9184 and https://github.com/gfx-rs/wgpu/issues/9187
-        failures: wgpu_test::FailureCase::mac_vulkan(|case| {
-            case.panic(
-                "assertion `left == right` failed: Expected 0\n  left: Some(255)\n right: None",
-            )
-        }),
+        failures: {
+            let mut failures = Vec::new();
+            // https://github.com/gfx-rs/wgpu/issues/9620
+            failures.push(FailureCase::lvp_poison_memory(
+                "assertion `left == right` failed: Expected 0\n  \
+                 left: Some(128)\n \
+                 right: None",
+            ));
+            // https://github.com/gfx-rs/wgpu/issues/9184 and https://github.com/gfx-rs/wgpu/issues/9187
+            failures.extend(FailureCase::mac_vulkan().into_iter().map(|case| {
+                case.panic(
+                    "assertion `left == right` failed: Expected 0\n  left: Some(255)\n right: None",
+                )
+            }));
+            failures
+        },
         ..Default::default()
     })
     .run_async(|ctx| run_test(ctx, 0b1001, 1));
 
-#[gpu_test]
+#[apply(gpu_test!)]
 static DRAW_MULTIVIEW_MULTISAMPLE: GpuTestConfiguration = GpuTestConfiguration::new()
     .parameters(
         TestParameters::default()
@@ -135,6 +146,7 @@ async fn run_test(ctx: TestingContext, layer_mask: u32, sample_count: u32) {
         mip_level_count: None,
         base_array_layer: 0,
         array_layer_count: Some(num_layers),
+        swizzle: wgpu::TextureComponentSwizzle::default(),
     };
     let entire_texture_view = texture.create_view(&texture_view_desc);
 

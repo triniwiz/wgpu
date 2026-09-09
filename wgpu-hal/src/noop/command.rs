@@ -172,14 +172,14 @@ impl crate::CommandEncoder for CommandBuffer {
 
     unsafe fn set_index_buffer<'a>(
         &mut self,
-        binding: crate::BufferBinding<'a, Buffer>,
+        binding: crate::BufferBinding<'a, Buffer, wgt::BufferAddress>,
         format: wgt::IndexFormat,
     ) {
     }
     unsafe fn set_vertex_buffer<'a>(
         &mut self,
         index: u32,
-        binding: crate::BufferBinding<'a, Buffer>,
+        binding: crate::BufferBinding<'a, Buffer, wgt::BufferAddress>,
     ) {
     }
     unsafe fn set_viewport(&mut self, rect: &crate::Rect<f32>, depth_range: Range<f32>) {}
@@ -298,6 +298,25 @@ impl crate::CommandEncoder for CommandBuffer {
     unsafe fn set_acceleration_structure_dependencies(
         command_buffers: &[&CommandBuffer],
         dependencies: &[&Resource],
+    ) {
+    }
+
+    unsafe fn begin_ray_tracing_pass(&mut self, _desc: &crate::RayTracingPassDescriptor) {}
+
+    unsafe fn end_ray_tracing_pass(&mut self) {}
+
+    unsafe fn set_ray_tracing_pipeline(
+        &mut self,
+        _pipeline: &<Self::A as crate::Api>::RayTracingPipeline,
+    ) {
+    }
+
+    unsafe fn trace_rays(
+        &mut self,
+        _count: [u32; 3],
+        _ray_generation_group_data: crate::PipelineGroupData<Buffer>,
+        _miss_group_data: crate::PipelineGroupData<Buffer>,
+        _intersection_group_data: crate::PipelineGroupData<Buffer>,
     ) {
     }
 }

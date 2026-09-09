@@ -169,6 +169,7 @@ impl crate::framework::Example for Example {
             mip_level_count: None,
             base_array_layer: 0,
             array_layer_count: None,
+            swizzle: wgpu::TextureComponentSwizzle::default(),
         });
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -462,7 +463,7 @@ pub fn main() {
 }
 
 #[cfg(test)]
-#[wgpu_test::gpu_test]
+#[wgpu_test::apply(wgpu_test::gpu_test!)]
 pub static TEST: crate::framework::ExampleTestParams = crate::framework::ExampleTestParams {
     name: "ray_cube_compute",
     image_path: "/examples/features/src/ray_cube_compute/screenshot.png",

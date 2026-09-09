@@ -3,7 +3,7 @@ use super::{
     CreateIndirectValidationPipelineError,
 };
 use crate::{
-    command::RenderPassErrorInner,
+    command::{get_src_stride_of_indirect_args, RenderPassErrorInner},
     device::{queue::TempResource, Device, DeviceError},
     hal_label,
     lock::{rank, Mutex},
@@ -15,6 +15,7 @@ use crate::{
 };
 use alloc::{boxed::Box, string::ToString, sync::Arc, vec, vec::Vec};
 use core::{mem::size_of, num::NonZeroU64};
+use scopeguard::{guard, ScopeGuard};
 use wgt::Limits;
 
 /// Note: This needs to be under:
@@ -63,8 +64,18 @@ impl Draw {
         required_features: &wgt::Features,
         instance_flags: wgt::InstanceFlags,
         backend: wgt::Backend,
+        limits: &Limits,
     ) -> Result<Self, CreateIndirectValidationPipelineError> {
+        // Indirect draw validation doesn't support buffer sizes higher than u32
+        // since its offsets in the shader and dynamic offsets are u32.
+        //
+        // See also: `u64_offset_to_u32_offset`.
+        assert!(limits.max_buffer_size <= u32::MAX as u64);
+
         let module = create_validation_module(device, instance_flags)?;
+        let module = guard(module, |module| unsafe {
+            device.destroy_shader_module(module)
+        });
 
         let metadata_bind_group_layout = create_bind_group_layout(
             device,
@@ -76,6 +87,10 @@ impl Draw {
                 instance_flags,
             ),
         )?;
+        let metadata_bind_group_layout = guard(metadata_bind_group_layout, |bgl| unsafe {
+            device.destroy_bind_group_layout(bgl)
+        });
+
         let src_bind_group_layout = create_bind_group_layout(
             device,
             true,
@@ -86,6 +101,10 @@ impl Draw {
                 instance_flags,
             ),
         )?;
+        let src_bind_group_layout = guard(src_bind_group_layout, |bgl| unsafe {
+            device.destroy_bind_group_layout(bgl)
+        });
+
         let dst_bind_group_layout = create_bind_group_layout(
             device,
             false,
@@ -96,6 +115,9 @@ impl Draw {
                 instance_flags,
             ),
         )?;
+        let dst_bind_group_layout = guard(dst_bind_group_layout, |bgl| unsafe {
+            device.destroy_bind_group_layout(bgl)
+        });
 
         let pipeline_layout_desc = hal::PipelineLayoutDescriptor {
             label: hal_label(
@@ -115,6 +137,9 @@ impl Draw {
                 .create_pipeline_layout(&pipeline_layout_desc)
                 .map_err(DeviceError::from_hal)?
         };
+        let pipeline_layout = guard(pipeline_layout, |pipeline_layout| unsafe {
+            device.destroy_pipeline_layout(pipeline_layout)
+        });
 
         let supports_indirect_first_instance =
             required_features.contains(wgt::Features::INDIRECT_FIRST_INSTANCE);
@@ -127,14 +152,19 @@ impl Draw {
             write_d3d12_special_constants,
             instance_flags,
         )?;
+        let pipeline = guard(pipeline, |pipeline| unsafe {
+            device.destroy_compute_pipeline(pipeline)
+        });
 
+        // Error returns after we start consuming guards could bypass resource cleanup.
+        #[deny(clippy::question_mark_used)]
         Ok(Self {
-            module,
-            metadata_bind_group_layout,
-            src_bind_group_layout,
-            dst_bind_group_layout,
-            pipeline_layout,
-            pipeline,
+            module: ScopeGuard::into_inner(module),
+            metadata_bind_group_layout: ScopeGuard::into_inner(metadata_bind_group_layout),
+            src_bind_group_layout: ScopeGuard::into_inner(src_bind_group_layout),
+            dst_bind_group_layout: ScopeGuard::into_inner(dst_bind_group_layout),
+            pipeline_layout: ScopeGuard::into_inner(pipeline_layout),
+            pipeline: ScopeGuard::into_inner(pipeline),
 
             free_indirect_entries: Mutex::new(rank::BUFFER_POOL, Vec::new()),
             free_metadata_entries: Mutex::new(rank::BUFFER_POOL, Vec::new()),
@@ -437,7 +467,7 @@ impl Draw {
                     pipeline_layout,
                     1,
                     src_bind_group,
-                    &[batch.src_dynamic_offset as u32],
+                    &[u64_offset_to_u32_offset(batch.src_dynamic_offset)],
                 );
             }
 
@@ -540,7 +570,7 @@ fn create_validation_module(
         CreateShaderModuleError::Validation(naga::error::ShaderError {
             source: src.to_string(),
             label: None,
-            inner: Box::new(inner),
+            inner,
         })
     })?;
     let hal_shader = hal::ShaderInput::Naga(hal::NagaShader {
@@ -673,43 +703,52 @@ fn calculate_src_buffer_binding_size(buffer_size: u64, limits: &Limits) -> u64 {
 }
 
 /// Splits the given `offset` into a dynamic offset & offset.
-fn calculate_src_offsets(buffer_size: u64, limits: &Limits, offset: u64) -> (u64, u64) {
+fn calculate_src_offsets(
+    buffer_size: u64,
+    limits: &Limits,
+    offset: u64,
+    data_size: u64,
+) -> (u64, u64) {
+    const MAX_DATA_SIZE: u64 = 20; // indexed indirect draw params are 20B
     let binding_size = calculate_src_buffer_binding_size(buffer_size, limits);
-
     let min_storage_buffer_offset_alignment = limits.min_storage_buffer_offset_alignment as u64;
 
-    let chunk_adjustment = match min_storage_buffer_offset_alignment {
-        // No need to adjust since the src_offset is 4 byte aligned.
-        4 => 0,
-        // With 16/20 bytes of data we can straddle up to 2 8 byte boundaries:
-        //  - 16 bytes of data: (4|8|4)
-        //  - 20 bytes of data: (4|8|8, 8|8|4)
-        8 => 2,
-        // With 16/20 bytes of data we can straddle up to 1 16+ byte boundary:
-        //  - 16 bytes of data: (4|12, 8|8, 12|4)
-        //  - 20 bytes of data: (4|16, 8|12, 12|8, 16|4)
-        16.. => 1,
-        _ => unreachable!(),
-    };
+    assert!([16, MAX_DATA_SIZE].contains(&data_size));
+    assert!([32, 64, 128, 256].contains(&min_storage_buffer_offset_alignment));
+    assert!(buffer_size >= data_size);
+    assert!(offset <= buffer_size - data_size);
+    assert!(binding_size <= buffer_size);
 
-    let chunks = binding_size / min_storage_buffer_offset_alignment;
-    let dynamic_offset_stride =
-        chunks.saturating_sub(chunk_adjustment) * min_storage_buffer_offset_alignment;
+    // Invariants that the outputs of this function must satisfy:
+    // - out_dynamic_offset + out_offset = offset
+    // - out_dynamic_offset % min_storage_buffer_offset_alignment = 0
+    // - out_dynamic_offset + binding_size <= buffer_size
+    // - out_offset + data_size <= binding_size
 
+    // Align the max offset in the binding and treat it as the stride between
+    // dynamic offsets.
+    //
+    // `dynamic_offset_stride` could just be `min_storage_buffer_offset_alignment`
+    // but we want to make it as large as possible since setting dynamic
+    // offsets requires extra calls to setBindGroup and then to dispatch,
+    // calls which we want to minimize.
+    //
+    // Use `MAX_DATA_SIZE` instead of the actual `data_size` so that the
+    // resulting stride is the same for both indexed and non-indexed draw calls,
+    // reducing the likelihood of `out_dynamic_offset` being different.
+    let dynamic_offset_stride = binding_size.saturating_sub(MAX_DATA_SIZE)
+        / min_storage_buffer_offset_alignment
+        * min_storage_buffer_offset_alignment;
     if dynamic_offset_stride == 0 {
         return (0, offset);
     }
 
     let max_dynamic_offset = buffer_size - binding_size;
-    let max_dynamic_offset_index = max_dynamic_offset / dynamic_offset_stride;
+    let out_dynamic_offset =
+        max_dynamic_offset.min(offset / dynamic_offset_stride * dynamic_offset_stride);
+    let out_offset = offset - out_dynamic_offset;
 
-    let src_dynamic_offset_index = offset / dynamic_offset_stride;
-
-    let src_dynamic_offset =
-        src_dynamic_offset_index.min(max_dynamic_offset_index) * dynamic_offset_stride;
-    let src_offset = offset - src_dynamic_offset;
-
-    (src_dynamic_offset, src_offset)
+    (out_dynamic_offset, out_offset)
 }
 
 #[derive(Debug)]
@@ -731,7 +770,7 @@ fn create_buffer_and_bind_group(
         usage,
         memory_flags: hal::MemoryFlags::empty(),
     };
-    let buffer = unsafe { device.create_buffer(&buffer_desc) }?;
+    let (buffer, _) = unsafe { device.create_buffer(&buffer_desc) }?;
     let bind_group_desc = hal::BindGroupDescriptor {
         label: bind_group_label,
         layout: bind_group_layout,
@@ -892,11 +931,7 @@ impl MetadataEntry {
     ) -> Self {
         const U32_MAX_AS_U64: u64 = u32::MAX as u64;
 
-        // NOTE: buffer sizes should never exceed `u32::MAX`.
-        assert!(src_offset <= U32_MAX_AS_U64);
-        assert!(dst_offset <= U32_MAX_AS_U64);
-
-        let src_offset = src_offset as u32;
+        let src_offset = u64_offset_to_u32_offset(src_offset);
         let src_offset = src_offset / 4; // translate byte offset to offset in u32's
 
         // `src_offset` needs at most 30 bits,
@@ -914,7 +949,7 @@ impl MetadataEntry {
         let instance_limit_bit_32 = (instance_limit >> 32) as u32; // extract bit 32
         let instance_limit = instance_limit as u32; // truncate the limit to a u32
 
-        let dst_offset = dst_offset as u32;
+        let dst_offset = u64_offset_to_u32_offset(dst_offset);
         let dst_offset = dst_offset / 4; // translate byte offset to offset in u32's
 
         // `dst_offset` needs at most 30 bits,
@@ -991,7 +1026,9 @@ impl DrawBatcher {
 
         let buffer_size = src_buffer.size;
         let limits = device.adapter.limits();
-        let (src_dynamic_offset, src_offset) = calculate_src_offsets(buffer_size, &limits, offset);
+        let data_size = get_src_stride_of_indirect_args(family);
+        let (src_dynamic_offset, src_offset) =
+            calculate_src_offsets(buffer_size, &limits, offset, data_size);
 
         let src_buffer_tracker_index = src_buffer.tracker_index();
 
@@ -1028,5 +1065,100 @@ impl DrawBatcher {
         }
 
         Ok((dst_resource_index, dst_offset))
+    }
+}
+
+/// Indirect draw validation doesn't support u64 offsets.
+///
+/// This fn should never panic due to the assert in [`Draw::new`].
+fn u64_offset_to_u32_offset(offset: u64) -> u32 {
+    offset.try_into().unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn calculate_src_offsets_test() {
+        const MBUS: u64 = 256 << 20; // default max_buffer_size
+        const MBIS: u64 = 128 << 20; // default max_storage_buffer_binding_size
+
+        #[rustfmt::skip]
+        let cases: &[(u64, u64, u32, u64, u64, u64, u64)] = &[
+            // (buffer_size, max_binding_size, offset_alignment, data_size, offset, out_dynamic_offset, out_offset)
+
+            // data at start of buffer
+            (MBUS, MBIS, 32,  16, 0, 0, 0),
+            // data at end of buffer
+            (MBUS, MBIS, 32,  16, MBUS - 16, MBIS, MBIS - 16),
+            // data at end of buffer, where buffer_size % alignment != 0
+            (MBUS + 4, MBUS, 32, 16, MBUS + 4 - 16, 32, MBUS - 32 + 4 - 16),
+            // data before/straddling/after middle of the buffer with
+            // max binding size limit being half of the buffer size
+            // alignment = 32
+            (512, 256, 32,  16, 240, 224, 16), // before middle
+            (512, 256, 32,  16, 248, 224, 24), // straddling middle
+            (512, 256, 32,  16, 256, 224, 32), // after middle
+            // alignment = 64
+            (512, 256, 64,  16, 240, 192, 48), // before middle
+            (512, 256, 64,  16, 248, 192, 56), // straddling middle
+            (512, 256, 64,  16, 256, 192, 64), // after middle
+            // alignment = 128
+            (512, 256, 128, 16, 240, 128, 112), // before middle
+            (512, 256, 128, 16, 248, 128, 120), // straddling middle
+            (512, 256, 128, 16, 256, 256, 0), // after middle
+            // as above but with data_size = 20
+            // alignment = 32
+            (512, 256, 32,  20, 236, 224, 12), // before middle
+            (512, 256, 32,  20, 244, 224, 20), // straddling middle
+            (512, 256, 32,  20, 252, 224, 28), // after middle
+            // alignment = 64
+            (512, 256, 64,  20, 236, 192, 44), // before middle
+            (512, 256, 64,  20, 244, 192, 52), // straddling middle
+            (512, 256, 64,  20, 252, 192, 60), // after middle
+            // alignment = 128
+            (512, 256, 128, 20, 236, 128, 108), // before middle
+            (512, 256, 128, 20, 244, 128, 116), // straddling middle
+            (512, 256, 128, 20, 252, 128, 124), // after middle
+        ];
+
+        for &(
+            buffer_size,
+            max_storage_buffer_binding_size,
+            min_storage_buffer_offset_alignment,
+            data_size,
+            offset,
+            expected_out_dynamic_offset,
+            expected_out_offset,
+        ) in cases
+        {
+            let limits = Limits {
+                max_storage_buffer_binding_size,
+                min_storage_buffer_offset_alignment,
+                ..Limits::default()
+            };
+            let (out_dynamic_offset, out_offset) =
+                calculate_src_offsets(buffer_size, &limits, offset, data_size);
+            let binding_size = calculate_src_buffer_binding_size(buffer_size, &limits);
+            // check invariants
+            assert_eq!(out_dynamic_offset + out_offset, offset);
+            assert_eq!(
+                out_dynamic_offset % min_storage_buffer_offset_alignment as u64,
+                0
+            );
+            assert!(out_dynamic_offset + binding_size <= buffer_size);
+            assert!(out_offset + data_size <= binding_size);
+            // check output matches
+            assert_eq!(
+                (out_dynamic_offset, out_offset),
+                (expected_out_dynamic_offset, expected_out_offset),
+                "buffer_size={buffer_size} \
+                 max_binding_size={max_storage_buffer_binding_size} \
+                 offset_alignment={min_storage_buffer_offset_alignment} \
+                 data_size={data_size} \
+                 offset={offset}"
+            );
+        }
     }
 }

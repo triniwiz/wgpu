@@ -94,7 +94,9 @@ impl Writer {
             zero_initialize_workgroup_memory: options.zero_initialize_workgroup_memory,
             force_loop_bounding: options.force_loop_bounding,
             ray_query_initialization_tracking: options.ray_query_initialization_tracking,
+            trace_ray_argument_validation: options.trace_ray_argument_validation,
             use_storage_input_output_16: options.use_storage_input_output_16,
+            emit_int_div_checks: options.emit_int_div_checks,
             void_type,
             tuple_of_u32s_ty_id: None,
             lookup_type: crate::FastHashMap::default(),
@@ -111,6 +113,8 @@ impl Writer {
             gl450_ext_inst_id,
             temp_list: Vec::new(),
             ray_query_functions: crate::FastHashMap::default(),
+            ray_tracing_functions: crate::FastHashMap::default(),
+            has_ray_tracing_pipeline: false,
             io_f16_polyfills: super::f16_polyfill::F16IoPolyfill::new(
                 options.use_storage_input_output_16,
             ),
@@ -171,12 +175,14 @@ impl Writer {
             zero_initialize_workgroup_memory: self.zero_initialize_workgroup_memory,
             force_loop_bounding: self.force_loop_bounding,
             ray_query_initialization_tracking: self.ray_query_initialization_tracking,
+            trace_ray_argument_validation: self.trace_ray_argument_validation,
             use_storage_input_output_16: self.use_storage_input_output_16,
             capabilities_available: take(&mut self.capabilities_available),
             fake_missing_bindings: self.fake_missing_bindings,
             binding_map: take(&mut self.binding_map),
             task_dispatch_limits: self.task_dispatch_limits,
             mesh_shader_primitive_indices_clamp: self.mesh_shader_primitive_indices_clamp,
+            emit_int_div_checks: self.emit_int_div_checks,
 
             // Initialized afresh:
             id_gen,
@@ -203,6 +209,8 @@ impl Writer {
             saved_cached: take(&mut self.saved_cached).reclaim(),
             temp_list: take(&mut self.temp_list).reclaim(),
             ray_query_functions: take(&mut self.ray_query_functions).reclaim(),
+            ray_tracing_functions: take(&mut self.ray_tracing_functions).reclaim(),
+            has_ray_tracing_pipeline: false,
             io_f16_polyfills: take(&mut self.io_f16_polyfills).reclaim(),
             debug_printf: None,
         };
@@ -516,7 +524,7 @@ impl Writer {
     ///
     /// If the specified resource is not present in the binding map this will
     /// return an error, unless [`Writer::fake_missing_bindings`] is set.
-    fn resolve_resource_binding(
+    pub(super) fn resolve_resource_binding(
         &self,
         res_binding: &crate::ResourceBinding,
     ) -> Result<BindingInfo, Error> {
@@ -552,10 +560,22 @@ impl Writer {
                             // is negative one, or when the divisor is zero. These wrapped
                             // functions override the divisor to one in these cases,
                             // matching the WGSL spec.
+                            //
+                            // Signed `%` is additionally always wrapped (even without
+                            // `emit_int_div_checks`) so it can be lowered to
+                            // `a - b * (a / b)`: `OpSRem` produces a poison result for
+                            // negative operands in the Vulkan SPIR-V environment unless
+                            // `VK_KHR_maintenance8` is enabled. See
+                            // <https://github.com/gfx-rs/wgpu/issues/8191>.
                             (
                                 crate::BinaryOperator::Divide | crate::BinaryOperator::Modulo,
                                 crate::ScalarKind::Sint | crate::ScalarKind::Uint,
-                            ) => {
+                            ) if self.emit_int_div_checks
+                                || matches!(
+                                    (op, expr_ty.scalar().kind),
+                                    (crate::BinaryOperator::Modulo, crate::ScalarKind::Sint)
+                                ) =>
+                            {
                                 self.write_wrapped_binary_op(
                                     op,
                                     expr_ty,
@@ -731,6 +751,10 @@ impl Writer {
         let divisor_selector_id = match scalar.kind {
             crate::ScalarKind::Sint => {
                 let (const_min_id, const_neg_one_id) = match scalar.width {
+                    2 => Ok((
+                        self.get_constant_scalar(crate::Literal::I16(i16::MIN)),
+                        self.get_constant_scalar(crate::Literal::I16(-1i16)),
+                    )),
                     4 => Ok((
                         self.get_constant_scalar(crate::Literal::I32(i32::MIN)),
                         self.get_constant_scalar(crate::Literal::I32(-1i32)),
@@ -792,21 +816,57 @@ impl Writer {
             composite_one_id,
             rhs_id,
         ));
-        let op = match (op, scalar.kind) {
-            (crate::BinaryOperator::Divide, crate::ScalarKind::Sint) => spirv::Op::SDiv,
-            (crate::BinaryOperator::Divide, crate::ScalarKind::Uint) => spirv::Op::UDiv,
-            (crate::BinaryOperator::Modulo, crate::ScalarKind::Sint) => spirv::Op::SRem,
-            (crate::BinaryOperator::Modulo, crate::ScalarKind::Uint) => spirv::Op::UMod,
-            _ => unreachable!(),
+        let return_id = if matches!(op, crate::BinaryOperator::Modulo)
+            && matches!(scalar.kind, crate::ScalarKind::Sint)
+        {
+            // `OpSRem` produces a poison result for negative operands in the Vulkan
+            // environment without the `maintenance8` feature. `OpSDiv` is not poisoned, so
+            // reconstruct the remainder as `a - b * (a / b)`, which is well-defined for
+            // negative operands. `divisor_id` is the zero/overflow-guarded divisor selected
+            // above, so the degenerate cases still match `OpSRem`'s guarded result (0).
+            let quotient_id = self.id_gen.next();
+            block.body.push(Instruction::binary(
+                spirv::Op::SDiv,
+                return_type_id,
+                quotient_id,
+                lhs_id,
+                divisor_id,
+            ));
+            let product_id = self.id_gen.next();
+            block.body.push(Instruction::binary(
+                spirv::Op::IMul,
+                return_type_id,
+                product_id,
+                quotient_id,
+                divisor_id,
+            ));
+            let remainder_id = self.id_gen.next();
+            block.body.push(Instruction::binary(
+                spirv::Op::ISub,
+                return_type_id,
+                remainder_id,
+                lhs_id,
+                product_id,
+            ));
+            remainder_id
+        } else {
+            let spv_op = match (op, scalar.kind) {
+                (crate::BinaryOperator::Divide, crate::ScalarKind::Sint) => spirv::Op::SDiv,
+                (crate::BinaryOperator::Divide, crate::ScalarKind::Uint) => spirv::Op::UDiv,
+                (crate::BinaryOperator::Modulo, crate::ScalarKind::Sint) => spirv::Op::SRem,
+                (crate::BinaryOperator::Modulo, crate::ScalarKind::Uint) => spirv::Op::UMod,
+                _ => unreachable!(),
+            };
+            let return_id = self.id_gen.next();
+            block.body.push(Instruction::binary(
+                spv_op,
+                return_type_id,
+                return_id,
+                lhs_id,
+                divisor_id,
+            ));
+            return_id
         };
-        let return_id = self.id_gen.next();
-        block.body.push(Instruction::binary(
-            op,
-            return_type_id,
-            return_id,
-            lhs_id,
-            divisor_id,
-        ));
 
         function.consume(block, Instruction::return_value(return_id));
         function.to_words(&mut self.logical_layout.function_definitions);
@@ -1857,10 +1917,22 @@ impl Writer {
                 .to_words(&mut self.logical_layout.execution_modes);
                 spirv::ExecutionModel::MeshEXT
             }
-            crate::ShaderStage::RayGeneration
-            | crate::ShaderStage::AnyHit
-            | crate::ShaderStage::ClosestHit
-            | crate::ShaderStage::Miss => unreachable!(),
+            crate::ShaderStage::RayGeneration => {
+                self.require_any("ray tracing pipelines", &[spirv::Capability::RayTracingKHR])?;
+                spirv::ExecutionModel::RayGenerationKHR
+            }
+            crate::ShaderStage::AnyHit => {
+                self.require_any("ray tracing pipelines", &[spirv::Capability::RayTracingKHR])?;
+                spirv::ExecutionModel::AnyHitKHR
+            }
+            crate::ShaderStage::ClosestHit => {
+                self.require_any("ray tracing pipelines", &[spirv::Capability::RayTracingKHR])?;
+                spirv::ExecutionModel::ClosestHitKHR
+            }
+            crate::ShaderStage::Miss => {
+                self.require_any("ray tracing pipelines", &[spirv::Capability::RayTracingKHR])?;
+                spirv::ExecutionModel::MissKHR
+            }
         };
         //self.check(exec_model.required_capabilities())?;
 
@@ -1891,6 +1963,16 @@ impl Writer {
                 };
                 if let Some(cap) = cap {
                     self.capabilities_used.insert(cap);
+                }
+                if bits == 16 {
+                    self.capabilities_used
+                        .insert(spirv::Capability::StorageBuffer16BitAccess);
+                    self.capabilities_used
+                        .insert(spirv::Capability::UniformAndStorageBuffer16BitAccess);
+                    if self.use_storage_input_output_16 {
+                        self.capabilities_used
+                            .insert(spirv::Capability::StorageInputOutput16);
+                    }
                 }
                 Instruction::type_int(id, bits, signedness)
             }
@@ -1960,7 +2042,16 @@ impl Writer {
                 }
             }
             crate::TypeInner::AccelerationStructure { .. } => {
-                self.require_any("Acceleration Structure", &[spirv::Capability::RayQueryKHR])?;
+                self.require_any(
+                    "Acceleration Structure",
+                    // unless we use this conditional, the ray query snapshot
+                    // tests pick the wrong capability
+                    &[if self.has_ray_tracing_pipeline {
+                        spirv::Capability::RayTracingKHR
+                    } else {
+                        spirv::Capability::RayQueryKHR
+                    }],
+                )?;
             }
             crate::TypeInner::RayQuery { .. } => {
                 self.require_any("Ray Query", &[spirv::Capability::RayQueryKHR])?;
@@ -1989,6 +2080,22 @@ impl Writer {
             }
             | crate::TypeInner::Scalar(crate::Scalar::F16) => {
                 self.require_any("16 bit floating-point", &[spirv::Capability::Float16])?;
+                self.use_extension("SPV_KHR_16bit_storage");
+            }
+            // 16 bit integer support requires Int16 capability
+            crate::TypeInner::Vector {
+                scalar:
+                    crate::Scalar {
+                        kind: crate::ScalarKind::Sint | crate::ScalarKind::Uint,
+                        width: 2,
+                    },
+                ..
+            }
+            | crate::TypeInner::Scalar(crate::Scalar {
+                kind: crate::ScalarKind::Sint | crate::ScalarKind::Uint,
+                width: 2,
+            }) => {
+                self.require_any("16 bit integer", &[spirv::Capability::Int16])?;
                 self.use_extension("SPV_KHR_16bit_storage");
             }
             // Cooperative types and ops
@@ -2549,6 +2656,13 @@ impl Writer {
                 let low = value.to_bits();
                 Instruction::constant_16bit(type_id, id, low as u32)
             }
+            crate::Literal::U16(value) => Instruction::constant_16bit(type_id, id, value as u32),
+            crate::Literal::I16(value) => {
+                // Sign-extend into the 32-bit word so that `spirv-as` can
+                // round-trip the disassembly (it expects signed values for
+                // signed types).
+                Instruction::constant_16bit(type_id, id, value as i32 as u32)
+            }
             crate::Literal::U32(value) => Instruction::constant_32bit(type_id, id, value),
             crate::Literal::I32(value) => Instruction::constant_32bit(type_id, id, value as u32),
             crate::Literal::U64(value) => {
@@ -2849,7 +2963,8 @@ impl Writer {
     /// the interface, and adds appropriate decorations to indicate which
     /// builtin or location it represents, how it should be interpolated, and so
     /// on. The `class` argument gives the variable's SPIR-V storage class,
-    /// which should be either [`Input`] or [`Output`].
+    /// which should be either [`Input`] or [`Output`]. The one exception is
+    /// `hit_barycentrics`, which overrides `class` to `HitAttributeKHR`.
     ///
     /// [`Binding`]: crate::Binding
     /// [`Function`]: crate::Function
@@ -2865,6 +2980,25 @@ impl Writer {
         ty: Handle<crate::Type>,
         binding: &crate::Binding,
     ) -> Result<Word, Error> {
+        // Triangle barycentrics are supplied as a `HitAttributeKHR` variable, not as an `Input`
+        // builtin: when a hit group has no intersection shader, the hit attribute an any-hit or
+        // closest-hit shader reads is a two-component float vector holding the barycentric
+        // coordinates of the hit, and hit attributes carry no `BuiltIn` decoration.
+        //
+        // SPEC: https://registry.khronos.org/vulkan/specs/latest/html/vkspec.html#interfaces-raypipeline
+        //
+        // Declaring it here, alongside the entry point's other varyings, works because ray tracing
+        // requires SPIR-V 1.4, where the `OpEntryPoint` interface lists global variables from every
+        // storage class rather than just `Input` and `Output`.
+        //
+        // SPEC: https://registry.khronos.org/SPIR-V/specs/unified1/SPIRV.html#OpEntryPoint
+        let class = match *binding {
+            crate::Binding::BuiltIn(crate::BuiltIn::HitBarycentrics) => {
+                spirv::StorageClass::HitAttributeKHR
+            }
+            _ => class,
+        };
+
         let id = self.id_gen.next();
         let ty_inner = &ir_module.types[ty].inner;
         let needs_polyfill = self.needs_f16_polyfill(ty_inner);
@@ -3096,7 +3230,12 @@ impl Writer {
                         )?;
                         BuiltIn::CullDistance
                     }
-                    Bi::InstanceIndex => BuiltIn::InstanceIndex,
+                    Bi::InstanceIndex => match stage {
+                        crate::ShaderStage::AnyHit | crate::ShaderStage::ClosestHit => {
+                            BuiltIn::InstanceId
+                        }
+                        _ => BuiltIn::InstanceIndex,
+                    },
                     Bi::PointSize => BuiltIn::PointSize,
                     Bi::VertexIndex => BuiltIn::VertexIndex,
                     Bi::DrawIndex => {
@@ -3112,14 +3251,34 @@ impl Writer {
                     Bi::PointCoord => BuiltIn::PointCoord,
                     Bi::FrontFacing => BuiltIn::FrontFacing,
                     Bi::PrimitiveIndex => {
-                        // Geometry shader capability is required for primitive index
-                        self.require_any(
-                            "`primitive_index` built-in",
-                            &[spirv::Capability::Geometry],
-                        )?;
+                        // `PrimitiveId` is enabled by any of `Geometry`, `Tessellation`,
+                        // `RayTracingKHR` or `MeshShadingEXT`. `require_any` picks the first one the target
+                        // allows.
+                        //
+                        // SPEC: https://registry.khronos.org/SPIR-V/specs/unified1/SPIRV.html#:~:text=PrimitiveId
+                        let enabled_by: &[spirv::Capability] = match stage {
+                            // The stage itself already requires `RayTracingKHR`.
+                            crate::ShaderStage::AnyHit | crate::ShaderStage::ClosestHit => &[],
+                            // The stage itself already requires `MeshShadingEXT`.
+                            crate::ShaderStage::Mesh => &[],
+                            // A fragment shader can be fed primitive IDs by a geometry,
+                            // tessellation or mesh pipeline.
+                            crate::ShaderStage::Fragment => &[
+                                spirv::Capability::Geometry,
+                                spirv::Capability::Tessellation,
+                                spirv::Capability::MeshShadingEXT,
+                            ],
+                            // `PrimitiveId` isn't permitted in these execution models.
+                            _ => return Err(Error::Validation(
+                                "`primitive_index` built-in is not allowed in this shader stage",
+                            )),
+                        };
+                        self.require_any("`primitive_index` built-in", enabled_by)?;
+
                         if stage == crate::ShaderStage::Mesh {
                             others.push(Decoration::PerPrimitiveEXT);
                         }
+
                         BuiltIn::PrimitiveId
                     }
                     Bi::Barycentric { perspective } => {
@@ -3198,19 +3357,22 @@ impl Writer {
                     Bi::VertexCount | Bi::Vertices | Bi::PrimitiveCount | Bi::Primitives => {
                         unreachable!()
                     }
-                    Bi::RayInvocationId
-                    | Bi::NumRayInvocations
-                    | Bi::InstanceCustomData
-                    | Bi::GeometryIndex
-                    | Bi::WorldRayOrigin
-                    | Bi::WorldRayDirection
-                    | Bi::ObjectRayOrigin
-                    | Bi::ObjectRayDirection
-                    | Bi::RayTmin
-                    | Bi::RayTCurrentMax
-                    | Bi::ObjectToWorld
-                    | Bi::WorldToObject
-                    | Bi::HitKind => unreachable!(),
+                    // ray tracing pipeline
+                    Bi::RayInvocationId => BuiltIn::LaunchIdKHR,
+                    Bi::NumRayInvocations => BuiltIn::LaunchSizeKHR,
+                    Bi::InstanceCustomData => BuiltIn::InstanceCustomIndexKHR,
+                    Bi::GeometryIndex => BuiltIn::RayGeometryIndexKHR,
+                    Bi::WorldRayOrigin => BuiltIn::WorldRayOriginKHR,
+                    Bi::WorldRayDirection => BuiltIn::WorldRayDirectionKHR,
+                    Bi::ObjectRayOrigin => BuiltIn::ObjectRayOriginKHR,
+                    Bi::ObjectRayDirection => BuiltIn::ObjectRayDirectionKHR,
+                    Bi::RayTmin => BuiltIn::RayTminKHR,
+                    Bi::RayTCurrentMax => BuiltIn::RayTmaxKHR,
+                    Bi::ObjectToWorld => BuiltIn::ObjectToWorldKHR,
+                    Bi::WorldToObject => BuiltIn::WorldToObjectKHR,
+                    Bi::HitKind => BuiltIn::HitKindKHR,
+                    // Read from the entry point's `HitAttributeKHR` variable instead.
+                    Bi::HitBarycentrics => return Ok(BindingDecorations::None),
                 };
 
                 use crate::ScalarKind as Sk;
@@ -3296,6 +3458,12 @@ impl Writer {
 
         let id = self.id_gen.next();
         let class = map_storage_class(global_variable.space);
+
+        if let crate::AddressSpace::RayPayload | crate::AddressSpace::IncomingRayPayload =
+            global_variable.space
+        {
+            self.require_any("ray tracing pipelines", &[spirv::Capability::RayTracingKHR])?;
+        }
 
         //self.check(class.required_capabilities())?;
 
@@ -3575,18 +3743,13 @@ impl Writer {
             .iter()
             .flat_map(|entry| entry.function.arguments.iter())
             .any(|arg| has_view_index_check(ir_module, arg.binding.as_ref(), arg.ty));
-        let mut has_ray_query = ir_module.special_types.ray_desc.is_some()
-            | ir_module.special_types.ray_intersection.is_some();
         let has_vertex_return = ir_module.special_types.ray_vertex_return.is_some();
 
-        for (_, &crate::Type { ref inner, .. }) in ir_module.types.iter() {
-            // spirv does not know whether these have vertex return - that is done by us
-            if let &crate::TypeInner::AccelerationStructure { .. }
-            | &crate::TypeInner::RayQuery { .. } = inner
-            {
-                has_ray_query = true
-            }
-        }
+        let rt_uses = ir_module.uses_ray_tracing(ep_index);
+        let has_ray_query = rt_uses.queries;
+        let has_ray_tracing_pipeline = rt_uses.pipelines;
+
+        self.has_ray_tracing_pipeline = has_ray_tracing_pipeline;
 
         if self.physical_layout.version < 0x10300 && has_storage_buffers {
             // enable the storage buffer class on < SPV-1.3
@@ -3612,6 +3775,19 @@ impl Writer {
             if lang_version.0 <= 1 && lang_version.1 < 4 {
                 return Err(Error::SpirvVersionTooLow(1, 4));
             }
+        }
+        if has_ray_tracing_pipeline {
+            // `SPV_KHR_ray_tracing` requires SPIR-V 1.4. That is also what lets `write_varying`
+            // emit `hit_barycentrics` as a `HitAttributeKHR` variable, since only from 1.4 on does
+            // the `OpEntryPoint` interface cover storage classes other than `Input` and `Output`.
+            //
+            // SPEC: https://github.khronos.org/SPIRV-Registry/extensions/KHR/SPV_KHR_ray_tracing.html
+            let lang_version = self.lang_version();
+            if lang_version.0 <= 1 && lang_version.1 < 4 {
+                return Err(Error::SpirvVersionTooLow(1, 4));
+            }
+            Instruction::extension("SPV_KHR_ray_tracing")
+                .to_words(&mut self.logical_layout.extensions)
         }
         Instruction::type_void(self.void_type).to_words(&mut self.logical_layout.declarations);
         Instruction::ext_inst_import(self.gl450_ext_inst_id, "GLSL.std.450")

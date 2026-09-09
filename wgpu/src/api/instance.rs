@@ -1,3 +1,5 @@
+#[cfg(wgpu_core)]
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::future::Future;
 
@@ -17,6 +19,8 @@ bitflags::bitflags! {
         const UnrestrictedPointerParameters = 1 << 2;
         /// <https://www.w3.org/TR/WGSL/#language_extension-pointer_composite_access>
         const PointerCompositeAccess = 1 << 3;
+        /// <https://www.w3.org/TR/WGSL/#language_extension-immediate_address_space>
+        const ImmediateAddressSpace = 1 << 4;
     }
 }
 
@@ -221,12 +225,13 @@ impl Instance {
                 let value: &wasm_bindgen::JsValue = &canvas;
                 let obj = core::ptr::NonNull::from(value).cast();
                 let raw_window_handle = raw_window_handle::WebCanvasWindowHandle::new(obj).into();
+                let raw_display_handle = raw_window_handle::WebDisplayHandle::new().into();
 
                 // Note that we need to call this while we still have `value` around.
                 // This is safe without storing canvas to `handle_origin` since the surface will create a copy internally.
                 unsafe {
                     self.create_surface_unsafe(SurfaceTargetUnsafe::RawHandle {
-                        raw_display_handle: None,
+                        raw_display_handle: Some(raw_display_handle),
                         raw_window_handle,
                     })
                 }?
@@ -239,12 +244,13 @@ impl Instance {
                 let obj = core::ptr::NonNull::from(value).cast();
                 let raw_window_handle =
                     raw_window_handle::WebOffscreenCanvasWindowHandle::new(obj).into();
+                let raw_display_handle = raw_window_handle::WebDisplayHandle::new().into();
 
                 // Note that we need to call this while we still have `value` around.
                 // This is safe without storing canvas to `handle_origin` since the surface will create a copy internally.
                 unsafe {
                     self.create_surface_unsafe(SurfaceTargetUnsafe::RawHandle {
-                        raw_display_handle: None,
+                        raw_display_handle: Some(raw_display_handle),
                         raw_window_handle,
                     })
                 }?
@@ -297,15 +303,6 @@ impl Instance {
     /// [`Queue`s]: Queue
     pub fn poll_all(&self, force_wait: bool) -> bool {
         self.inner.poll_all_devices(force_wait)
-    }
-
-    /// Generates memory report.
-    ///
-    /// Returns `None` if the feature is not supported by the backend
-    /// which happens only when WebGPU is pre-selected by the instance creation.
-    #[cfg(wgpu_core)]
-    pub fn generate_report(&self) -> Option<wgc::global::GlobalReport> {
-        self.inner.as_core_opt().map(|ctx| ctx.generate_report())
     }
 }
 
@@ -392,11 +389,8 @@ impl Instance {
         hal_adapter: hal::ExposedAdapter<A>,
     ) -> Adapter {
         let core_instance = self.inner.as_core();
-        let adapter = unsafe { core_instance.create_adapter_from_hal(hal_adapter) };
-        let core = backend::wgpu_core::CoreAdapter {
-            context: core_instance.clone(),
-            id: adapter,
-        };
+        let wgpu_adapter = unsafe { core_instance.create_adapter_from_hal(hal_adapter) };
+        let core = backend::wgpu_core::CoreAdapter { wgpu_adapter };
 
         Adapter { inner: core.into() }
     }
@@ -410,15 +404,9 @@ impl Instance {
     /// # Arguments
     ///
     /// - `core_instance` - wgpu-core instance.
-    ///
-    /// # Safety
-    ///
-    /// Refer to the creation of wgpu-core Instance.
-    pub unsafe fn from_core(core_instance: wgc::instance::Instance) -> Self {
+    pub fn from_core(core_instance: Arc<wgc::instance::Instance>) -> Self {
         Self {
-            inner: unsafe {
-                crate::backend::ContextWgpuCore::from_core_instance(core_instance).into()
-            },
+            inner: crate::backend::ContextWgpuCore::from_core_instance(core_instance).into(),
         }
     }
 }

@@ -1,3 +1,8 @@
+#![expect(
+    missing_debug_implementations,
+    reason = "TODO: someone developing on Windows add Debug impls where possible"
+)]
+
 use alloc::{borrow::ToOwned as _, ffi::CString, string::String, sync::Arc, vec::Vec};
 use core::{
     ffi::{c_int, c_void, CStr},
@@ -6,10 +11,7 @@ use core::{
     time::Duration,
 };
 use std::{
-    sync::{
-        mpsc::{sync_channel, SyncSender},
-        LazyLock,
-    },
+    sync::mpsc::{sync_channel, SyncSender},
     thread,
 };
 
@@ -19,8 +21,8 @@ use glutin_wgl_sys::wgl_extra::{
     CONTEXT_PROFILE_MASK_ARB,
 };
 use hashbrown::HashSet;
-use parking_lot::{Mutex, MutexGuard, RwLock};
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
+use wgpu_sync::{Lazy, Mutex, MutexGuard, RwLock};
 use wgt::InstanceFlags;
 use windows::{
     core::{Error, PCSTR},
@@ -41,8 +43,8 @@ pub struct AdapterContext {
     inner: Arc<Mutex<Inner>>,
 }
 
-unsafe impl Sync for AdapterContext {}
-unsafe impl Send for AdapterContext {}
+#[cfg(send_sync)]
+static_assertions::assert_impl_all!(AdapterContext: Send, Sync);
 
 impl AdapterContext {
     pub fn is_owned(&self) -> bool {
@@ -182,8 +184,8 @@ pub struct Instance {
     inner: Arc<Mutex<Inner>>,
 }
 
-unsafe impl Send for Instance {}
-unsafe impl Sync for Instance {}
+#[cfg(send_sync)]
+static_assertions::assert_impl_all!(Instance: Send, Sync);
 
 fn load_gl_func(name: &str, module: Option<Foundation::HMODULE>) -> *const c_void {
     let addr = CString::new(name.as_bytes()).unwrap();
@@ -336,8 +338,8 @@ fn create_global_window_class() -> Result<CString, crate::InstanceError> {
 }
 
 fn get_global_window_class() -> Result<CString, crate::InstanceError> {
-    static GLOBAL: LazyLock<Result<CString, crate::InstanceError>> =
-        LazyLock::new(create_global_window_class);
+    static GLOBAL: Lazy<Result<CString, crate::InstanceError>> =
+        Lazy::new(create_global_window_class);
     GLOBAL.clone()
 }
 

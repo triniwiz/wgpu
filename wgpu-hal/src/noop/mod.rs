@@ -3,10 +3,7 @@
 use alloc::{string::String, sync::Arc, vec, vec::Vec};
 use core::{ptr, sync::atomic::Ordering, time::Duration};
 
-#[cfg(supports_64bit_atomics)]
-use core::sync::atomic::AtomicU64;
-#[cfg(not(supports_64bit_atomics))]
-use portable_atomic::AtomicU64;
+use wgpu_sync::atomic::AtomicU64;
 
 use crate::TlasInstance;
 
@@ -18,6 +15,7 @@ pub use command::CommandBuffer;
 #[derive(Clone, Debug)]
 pub struct Api;
 
+#[derive(Debug)]
 pub struct Context {
     options: Arc<wgt::NoopBackendOptions>,
 }
@@ -60,6 +58,7 @@ impl crate::Api for Api {
     type PipelineLayout = Resource;
     type ShaderModule = Resource;
     type RenderPipeline = Resource;
+    type RayTracingPipeline = Resource;
     type ComputePipeline = Resource;
 }
 
@@ -76,6 +75,7 @@ impl crate::DynPipelineCache for Resource {}
 impl crate::DynPipelineLayout for Resource {}
 impl crate::DynQuerySet for Resource {}
 impl crate::DynRenderPipeline for Resource {}
+impl crate::DynRayTracingPipeline for Resource {}
 impl crate::DynSampler for Resource {}
 impl crate::DynShaderModule for Resource {}
 impl crate::DynSurfaceTexture for Resource {}
@@ -178,6 +178,9 @@ pub const CAPABILITIES: crate::Capabilities = {
             uniform_bounds_check_alignment: wgt::BufferSize::MIN,
             raw_tlas_instance_size: 0,
             ray_tracing_scratch_buffer_alignment: 1,
+            ray_tracing_pipeline_group_data_size: 1,
+            ray_tracing_pipeline_group_data_alignment: 1,
+            ray_tracing_pipeline_data_offset_alignment: 1,
         },
         downlevel: wgt::DownlevelCapabilities {
             flags: wgt::DownlevelFlags::all(),
@@ -251,7 +254,8 @@ impl crate::Adapter for Context {
     fn get_ordered_texture_usages(&self) -> wgt::TextureUses {
         wgt::TextureUses::INCLUSIVE
             | wgt::TextureUses::COLOR_TARGET
-            | wgt::TextureUses::DEPTH_STENCIL_WRITE
+            | wgt::TextureUses::DEPTH_WRITE
+            | wgt::TextureUses::STENCIL_WRITE
     }
 }
 
@@ -262,7 +266,7 @@ impl crate::Queue for Context {
         &self,
         command_buffers: &[&CommandBuffer],
         surface_textures: &[&Resource],
-        (fence, fence_value): (&mut Fence, crate::FenceValue),
+        (fence, fence_value): (&Fence, crate::FenceValue),
     ) -> DeviceResult<()> {
         // All commands are executed synchronously.
         for cb in command_buffers {
@@ -295,7 +299,10 @@ impl crate::Queue for Context {
 impl crate::Device for Context {
     type A = Api;
 
-    unsafe fn create_buffer(&self, desc: &crate::BufferDescriptor) -> DeviceResult<Buffer> {
+    unsafe fn create_buffer(
+        &self,
+        desc: &crate::BufferDescriptor,
+    ) -> DeviceResult<(Buffer, wgt::BufferAddress)> {
         Buffer::new(desc)
     }
 
@@ -389,6 +396,20 @@ impl crate::Device for Context {
         Ok(Resource)
     }
     unsafe fn destroy_compute_pipeline(&self, pipeline: Resource) {}
+    unsafe fn create_ray_tracing_pipeline(
+        &self,
+        desc: &crate::RayTracingPipelineDescriptor<Resource, Resource, Resource>,
+    ) -> Result<Resource, crate::PipelineError> {
+        Ok(Resource)
+    }
+    unsafe fn destroy_ray_tracing_pipeline(&self, pipeline: Resource) {}
+    unsafe fn get_raytracing_pipeline_group_data(
+        &self,
+        pipeline: &Resource,
+        groups: core::ops::Range<u32>,
+    ) -> Result<Vec<u8>, crate::DeviceError> {
+        Ok(vec![0; groups.count()])
+    }
     unsafe fn create_pipeline_cache(
         &self,
         desc: &crate::PipelineCacheDescriptor<'_>,
@@ -453,9 +474,7 @@ impl crate::Device for Context {
     }
     unsafe fn destroy_acceleration_structure(&self, _acceleration_structure: Resource) {}
 
-    fn tlas_instance_to_bytes(&self, instance: TlasInstance) -> Vec<u8> {
-        vec![]
-    }
+    fn tlas_instance_to_bytes(&self, instance: TlasInstance, to_extend: &mut Vec<u8>) {}
 
     fn get_internal_counters(&self) -> wgt::HalCounters {
         Default::default()

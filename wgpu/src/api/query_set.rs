@@ -38,6 +38,21 @@ impl QuerySet {
     pub fn as_custom<T: custom::QuerySetInterface>(&self) -> Option<&T> {
         self.inner.as_custom()
     }
+
+    /// Destroys the [`QuerySet`], releasing its resources.
+    pub fn destroy(&self) {
+        self.inner.destroy();
+    }
+
+    /// Returns the type of queries stored.
+    pub fn ty(&self) -> QueryType {
+        self.inner.ty()
+    }
+
+    /// Returns the number of query result slots.
+    pub fn count(&self) -> u32 {
+        self.inner.count()
+    }
 }
 
 /// Describes a [`QuerySet`].

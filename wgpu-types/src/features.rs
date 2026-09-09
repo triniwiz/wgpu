@@ -6,8 +6,7 @@
 //! The `wgpu` Rust API always uses the `Features` bit flag type to represent a
 //! set of features. However, the WebGPU-defined JavaScript API uses
 //! `kebab-case` feature name strings, so some utilities are provided for
-//! working with those names. See [`Features::as_str`] and [`<Features as
-//! FromStr>::from_str`].
+//! working with those names. See [`Features::as_str`] and [`Features::from_str`].
 //!
 //! The [`bitflags`] crate names flags by stringifying the
 //! `SCREAMING_SNAKE_CASE` identifier. These names are returned by
@@ -89,6 +88,9 @@ mod webgpu_impl {
 
     #[doc(hidden)]
     pub const WEBGPU_FEATURE_PRIMITIVE_INDEX: u64 = 1 << 17;
+
+    #[doc(hidden)]
+    pub const WEBGPU_FEATURE_TEXTURE_COMPONENT_SWIZZLE: u64 = 1 << 18;
 }
 
 macro_rules! bitflags_array_impl {
@@ -629,8 +631,6 @@ bitflags_array! {
         // ? const NORM16_RESOLVE = 1 << ??; (https://github.com/gpuweb/gpuweb/issues/3839)
         // ? const 32BIT_FORMAT_MULTISAMPLE = 1 << ??; (https://github.com/gpuweb/gpuweb/issues/3844)
         // ? const 32BIT_FORMAT_RESOLVE = 1 << ??; (https://github.com/gpuweb/gpuweb/issues/3844)
-        // ? const TEXTURE_COMPRESSION_ASTC_HDR = 1 << ??; (https://github.com/gpuweb/gpuweb/issues/3856)
-        // TEXTURE_FORMAT_16BIT_NORM & TEXTURE_COMPRESSION_ASTC_HDR will most likely become web features as well
         // TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES might not be necessary if we have all the texture features implemented
 
         // Texture Formats:
@@ -641,6 +641,9 @@ bitflags_array! {
         /// - Vulkan
         /// - DX12
         /// - Metal
+        /// - OpenGL (desktop GL 3.3+ for UNORM; GLES / WebGL2 needs
+        ///   `EXT_texture_norm16`. SNORM color-attachment usage
+        ///   additionally requires `EXT_render_snorm` on both paths.)
         ///
         /// This is a native only feature.
         #[name("wgpu-texture-format-16-bit-norm", "texture-format-16-bit-norm")]
@@ -698,7 +701,9 @@ bitflags_array! {
         const PIPELINE_STATISTICS_QUERY = 1 << 4;
         /// Allows for timestamp queries directly on command encoders.
         ///
-        /// Implies [`Features::TIMESTAMP_QUERY`] is supported.
+        /// Adapters that support this feature also support
+        /// [`Features::TIMESTAMP_QUERY`]. Both features must be requested
+        /// explicitly to use timestamp queries on command encoders.
         ///
         /// Additionally allows for timestamp writes on command encoders
         /// using [`CommandEncoder::write_timestamp`].
@@ -706,7 +711,7 @@ bitflags_array! {
         /// Supported platforms:
         /// - Vulkan
         /// - DX12
-        /// - Metal
+        /// - Metal (AMD & Intel, not Apple GPUs)
         /// - OpenGL (with GL_ARB_timer_query)
         ///
         /// This is a native only feature.
@@ -714,9 +719,13 @@ bitflags_array! {
         #[doc = link_to_wgpu_docs!(["`CommandEncoder::write_timestamp`"]: "struct.CommandEncoder.html#method.write_timestamp")]
         #[name("wgpu-timestamp-query-inside-encoders")]
         const TIMESTAMP_QUERY_INSIDE_ENCODERS = 1 << 5;
-        /// Allows for timestamp queries directly on command encoders.
+        /// Allows for timestamp queries directly inside render and compute passes.
         ///
-        /// Implies [`Features::TIMESTAMP_QUERY`] & [`Features::TIMESTAMP_QUERY_INSIDE_ENCODERS`] is supported.
+        /// Adapters that support this feature also support
+        /// [`Features::TIMESTAMP_QUERY`] and [`Features::TIMESTAMP_QUERY_INSIDE_ENCODERS`].
+        /// This feature must be requested with [`Features::TIMESTAMP_QUERY`] to use timestamp
+        /// queries inside passes. Additionally, [`Features::TIMESTAMP_QUERY_INSIDE_ENCODERS`]
+        /// must be requested to use timestamp queries on command encoders.
         ///
         /// Additionally allows for timestamp queries to be used inside render & compute passes using:
         /// - [`RenderPass::write_timestamp`]
@@ -914,6 +923,7 @@ bitflags_array! {
         /// - DX12
         /// - Vulkan
         /// - Metal
+        /// - OpenGL (not GLES)
         ///
         /// This is a native only feature.
         ///
@@ -927,6 +937,7 @@ bitflags_array! {
         ///
         /// Supported platforms:
         /// - Vulkan
+        /// - OpenGL (not GLES)
         ///
         /// This is a native only feature.
         ///
@@ -1060,10 +1071,14 @@ bitflags_array! {
         /// This is a native only feature.
         #[name("wgpu-shader-f64", "shader-f64")]
         const SHADER_F64 = 1 << 33;
-        /// Allows shaders to use i16. Not currently supported in `naga`, only available through `spirv-passthrough`.
+        /// Allows shaders to use `i16` and `u16` 16-bit integer types.
+        ///
+        /// Requires `enable wgpu_int16;` in WGSL shaders.
         ///
         /// Supported platforms:
-        /// - Vulkan
+        /// - Vulkan (with `shaderInt16` and `VK_KHR_16bit_storage`)
+        /// - Metal (always available)
+        /// - DX12 (with `Native16BitShaderOpsSupported`, SM 6.2+)
         ///
         /// This is a native only feature.
         #[name("wgpu-shader-i16", "shader-i16")]
@@ -1470,6 +1485,10 @@ bitflags_array! {
         #[name("wgpu-memory-decoration-volatile")]
         const MEMORY_DECORATION_VOLATILE = 1 << 62;
 
+        /// Allows for constructing ray tracing pipelines.
+        #[name("wgpu-ray-tracing-pipelines")]
+        const EXPERIMENTAL_RAY_TRACING_PIPELINES = 1 << 24;
+
         // Adding a new feature? All bits in the first u64 are used. Use the second u64 (bits 64+).
     }
 
@@ -1811,6 +1830,21 @@ bitflags_array! {
         /// remain compatible with previous wgpu behavior.
         #[name("primitive-index", "shader-primitive-index")]
         const PRIMITIVE_INDEX = WEBGPU_FEATURE_PRIMITIVE_INDEX;
+
+        /// Allows `TextureView`s to rearrange or replace the color components
+        /// from texture's red/green/blue/alpha channels when used as a `TEXTURE_BINDING`.
+        ///
+        /// Supported platforms:
+        /// - Vulkan
+        /// - DX12
+        /// - Metal on Apple2+ or Mac2+
+        ///
+        /// Not yet implemented:
+        /// - OpenGL
+        ///
+        /// This is a web and native feature.
+        #[name("texture-component-swizzle")]
+        const TEXTURE_COMPONENT_SWIZZLE = WEBGPU_FEATURE_TEXTURE_COMPONENT_SWIZZLE;
     }
 }
 
@@ -1842,7 +1876,8 @@ impl Features {
                 | FeaturesWGPU::EXPERIMENTAL_MESH_SHADER_POINTS.bits()
                 | FeaturesWGPU::EXPERIMENTAL_RAY_QUERY.bits()
                 | FeaturesWGPU::EXPERIMENTAL_RAY_HIT_VERTEX_RETURN.bits()
-                | FeaturesWGPU::EXPERIMENTAL_COOPERATIVE_MATRIX.bits(),
+                | FeaturesWGPU::EXPERIMENTAL_COOPERATIVE_MATRIX.bits()
+                | FeaturesWGPU::EXPERIMENTAL_RAY_TRACING_PIPELINES.bits(),
             FeaturesWebGPU::empty().bits(),
         ]))
     }
@@ -1851,7 +1886,8 @@ impl Features {
     #[must_use]
     pub fn allowed_vertex_formats_for_blas(&self) -> Vec<VertexFormat> {
         let mut formats = Vec::new();
-        if self.intersects(Self::EXPERIMENTAL_RAY_QUERY) {
+        if self.intersects(Self::EXPERIMENTAL_RAY_QUERY | Self::EXPERIMENTAL_RAY_TRACING_PIPELINES)
+        {
             formats.push(VertexFormat::Float32x3);
         }
         if self.contains(Self::EXTENDED_ACCELERATION_STRUCTURE_VERTEX_FORMATS) {

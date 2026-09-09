@@ -236,7 +236,7 @@ pub trait QueueInterface: CommonTraits {
         &self,
         buffer: &DispatchBuffer,
         offset: crate::BufferAddress,
-        staging_buffer: &DispatchQueueWriteBuffer,
+        staging_buffer: DispatchQueueWriteBuffer,
     );
 
     fn write_texture(
@@ -287,11 +287,38 @@ pub trait BufferInterface: CommonTraits {
     fn unmap(&self);
 
     fn destroy(&self);
+
+    fn size(&self) -> crate::BufferAddress;
+
+    fn usage(&self) -> crate::BufferUsages;
 }
 pub trait TextureInterface: CommonTraits {
     fn create_view(&self, desc: &crate::TextureViewDescriptor<'_>) -> DispatchTextureView;
 
     fn destroy(&self);
+
+    fn size(&self) -> wgt::Extent3d;
+
+    fn mip_level_count(&self) -> u32;
+
+    fn sample_count(&self) -> u32;
+
+    fn dimension(&self) -> wgt::TextureDimension;
+
+    fn format(&self) -> wgt::TextureFormat;
+
+    fn usage(&self) -> wgt::TextureUsages;
+
+    /// Marks this texture's contents as already initialized, skipping wgpu's
+    /// lazy zero-initialization of it.
+    ///
+    /// Defaults to a no-op, which is a valid implementation for backends
+    /// (such as WebGPU) that have no concept of lazy zero-initialization.
+    ///
+    /// # Safety
+    ///
+    /// The entire contents of the texture must already be initialized.
+    unsafe fn mark_externally_initialized(&self) {}
 }
 pub trait ExternalTextureInterface: CommonTraits {
     fn destroy(&self);
@@ -301,7 +328,13 @@ pub trait BlasInterface: CommonTraits {
     fn ready_for_compaction(&self) -> bool;
 }
 pub trait TlasInterface: CommonTraits {}
-pub trait QuerySetInterface: CommonTraits {}
+pub trait QuerySetInterface: CommonTraits {
+    fn destroy(&self);
+
+    fn ty(&self) -> crate::QueryType;
+
+    fn count(&self) -> u32;
+}
 pub trait PipelineLayoutInterface: CommonTraits {}
 pub trait RenderPipelineInterface: CommonTraits {
     fn get_bind_group_layout(&self, index: u32) -> DispatchBindGroupLayout;
@@ -433,14 +466,14 @@ pub trait RenderPassInterface: CommonTraits + Drop {
         buffer: &DispatchBuffer,
         index_format: crate::IndexFormat,
         offset: crate::BufferAddress,
-        size: Option<crate::BufferSize>,
+        size: Option<crate::BufferAddress>,
     );
     fn set_vertex_buffer(
         &mut self,
         slot: u32,
         buffer: Option<&DispatchBuffer>,
         offset: crate::BufferAddress,
-        size: Option<crate::BufferSize>,
+        size: Option<crate::BufferAddress>,
     );
     fn set_immediates(&mut self, offset: u32, data: &[u8]);
     fn set_blend_constant(&mut self, color: crate::Color);
@@ -544,14 +577,14 @@ pub trait RenderBundleEncoderInterface: CommonTraits {
         buffer: &DispatchBuffer,
         index_format: crate::IndexFormat,
         offset: crate::BufferAddress,
-        size: Option<crate::BufferSize>,
+        size: Option<crate::BufferAddress>,
     );
     fn set_vertex_buffer(
         &mut self,
         slot: u32,
         buffer: Option<&DispatchBuffer>,
         offset: crate::BufferAddress,
-        size: Option<crate::BufferSize>,
+        size: Option<crate::BufferAddress>,
     );
     fn set_immediates(&mut self, offset: u32, data: &[u8]);
 
@@ -571,6 +604,22 @@ pub trait RenderBundleEncoderInterface: CommonTraits {
     fn finish(self, desc: &crate::RenderBundleDescriptor<'_>) -> DispatchRenderBundle
     where
         Self: Sized;
+
+    /// Object-safe version of `finish` for dyn dispatch through `Box<dyn RenderBundleEncoderInterface>`.
+    ///
+    /// A default implementation cannot be provided here: a default that calls `finish` would
+    /// require `Self: Sized` (to move out of the box), which would remove the method from the
+    /// vtable and break object safety. Every concrete backend must implement this as:
+    /// ```ignore
+    /// fn finish_boxed(self: Box<Self>, desc: &RenderBundleDescriptor<'_>) -> DispatchRenderBundle {
+    ///     (*self).finish(desc)
+    /// }
+    /// ```
+    #[cfg(custom)]
+    fn finish_boxed(
+        self: Box<Self>,
+        desc: &crate::RenderBundleDescriptor<'_>,
+    ) -> DispatchRenderBundle;
 }
 
 pub trait CommandBufferInterface: CommonTraits {}
@@ -579,9 +628,19 @@ pub trait RenderBundleInterface: CommonTraits {}
 pub trait SurfaceInterface: CommonTraits {
     fn get_capabilities(&self, adapter: &DispatchAdapter) -> crate::SurfaceCapabilities;
 
+    /// The backing display's current HDR / luminance characteristics.
+    ///
+    /// Defaults to [`crate::DisplayHdrInfo::default`] (all fields `None`) so
+    /// custom backends without a display query need not override it.
+    fn display_hdr_info(&self, adapter: &DispatchAdapter) -> crate::DisplayHdrInfo {
+        let _ = adapter;
+        crate::DisplayHdrInfo::default()
+    }
+
     fn configure(&self, device: &DispatchDevice, config: &crate::SurfaceConfiguration);
     fn get_current_texture(
         &self,
+        desc: Option<crate::TextureDescriptor<'static>>,
     ) -> (
         Option<DispatchTexture>,
         crate::SurfaceStatus,
@@ -591,6 +650,7 @@ pub trait SurfaceInterface: CommonTraits {
 
 pub trait SurfaceOutputDetailInterface: CommonTraits {
     fn texture_discard(&self);
+    fn texture_release(&self);
 }
 
 pub trait QueueWriteBufferInterface: CommonTraits {
@@ -603,6 +663,8 @@ pub trait QueueWriteBufferInterface: CommonTraits {
 }
 
 pub trait BufferMappedRangeInterface: CommonTraits {
+    // Used only in wgpu_core's `impl QueueWriteBufferInterface`
+    #[cfg_attr(not(wgpu_core), expect(unused))]
     fn len(&self) -> usize;
 
     /// # Safety
@@ -617,6 +679,52 @@ pub trait BufferMappedRangeInterface: CommonTraits {
 
     #[cfg(webgpu)]
     fn as_uint8array(&self) -> &js_sys::Uint8Array;
+}
+
+/// Generates a `Send` and `Sync` implementation for a dispatch enum generated by `dispatch_types!`.
+macro_rules! explicit_send_sync_impl {
+    ($name:ident) => {
+        /// Implement [`Send`] + [`Sync`] for the dispatch type, and check that all of its fields
+        /// are [`Send`] + [`Sync`] so that that implementation is sound.
+        ///
+        /// This is identical to the “auto trait” implementation that Rust would provide, except
+        /// that it is eager rather than lazy: its requirements are checked now (in
+        /// `_fields_are_send_sync`), when this crate is compiled, rather than whenever a dependent
+        /// wants to know whether `$name: Send` holds.
+        ///
+        /// This improves compilation performance and avoids a risk of dependents running into the
+        /// default [`recursion_limit`] when checking types containing wgpu API types. This risk
+        /// will become greater when Rust’s “next solver” is stabilized.
+        ///
+        /// The effectiveness of this strategy is tested by
+        ///     ../tests/send_sync_recursion.rs.
+        #[cfg(send_sync)]
+        const _: () = {
+            // SAFETY: Bounds checked below
+            unsafe impl Send for $name {}
+            // SAFETY: Bounds checked below
+            unsafe impl Sync for $name {}
+
+            /// This code will fail to compile if any field is not `Send + Sync`, or if a new field
+            /// is added to the dispatch type.
+            ///
+            /// This technique is modeled after the macro library `non_structural_derive`, with
+            /// permission (see <https://github.com/fee1-dead/non_structural_derive/issues/1#issuecomment-5250905440>).
+            /// We only need it in this very narrow situation, so we can use a simpler macro.
+            fn _fields_are_send_sync(dispatch_enum: &$name) {
+                fn _check_bound<T: Send + Sync>(_: &T) {}
+                // Must dereference to handle the case where there are no enabled variants.
+                match *dispatch_enum {
+                    #[cfg(wgpu_core)]
+                    $name::Core(ref value) => _check_bound(value),
+                    #[cfg(webgpu)]
+                    $name::WebGPU(ref value) => _check_bound(value),
+                    #[cfg(custom)]
+                    $name::Custom(ref value) => _check_bound(value),
+                }
+            }
+        };
+    };
 }
 
 /// Generates a dispatch type for some `wgpu` API type.
@@ -642,8 +750,7 @@ pub trait BufferMappedRangeInterface: CommonTraits {
 /// a `DerefMut` implementation, and `as_*_mut` methods that return `&mut` references.
 /// This `D` does not implement `Clone`.
 ///
-/// The macro's `ref type` form defines `D` to hold an `Arc` pointing to the backend type,
-/// permitting `Clone` and `Deref`, but losing exclusive, mutable access.
+/// The macro's `ref type` form defines `D` to be `Clone` and `Deref`, but losing exclusive, mutable access.
 ///
 /// For example:
 ///
@@ -658,7 +765,7 @@ pub trait BufferMappedRangeInterface: CommonTraits {
 /// ```ignore
 /// pub enum DispatchBuffer {
 ///     #[cfg(wgpu_core)]
-///     Core(Arc<CoreBuffer>),
+///     Core(CoreBuffer),
 ///     #[cfg(webgpu)]
 ///     WebGPU(WebBuffer),
 ///     #[cfg(custom)]
@@ -697,7 +804,7 @@ macro_rules! dispatch_types {
         #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
         pub enum $name {
             #[cfg(wgpu_core)]
-            Core(Arc<$core_type>),
+            Core($core_type),
             #[cfg(webgpu)]
             WebGPU($webgpu_type),
             #[allow(clippy::allow_attributes, private_interfaces)]
@@ -767,7 +874,7 @@ macro_rules! dispatch_types {
         impl From<$core_type> for $name {
             #[inline]
             fn from(value: $core_type) -> Self {
-                Self::Core(Arc::new(value))
+                Self::Core(value)
             }
         }
 
@@ -786,7 +893,7 @@ macro_rules! dispatch_types {
             fn deref(&self) -> &Self::Target {
                 match self {
                     #[cfg(wgpu_core)]
-                    Self::Core(value) => value.as_ref(),
+                    Self::Core(value) => value,
                     #[cfg(webgpu)]
                     Self::WebGPU(value) => value,
                     #[cfg(custom)]
@@ -796,6 +903,8 @@ macro_rules! dispatch_types {
                 }
             }
         }
+
+        explicit_send_sync_impl!($name);
     };
     (
         mut type $name:ident: $interface:ident = $core_type:ident,$webgpu_type:ident,$custom_type:ident
@@ -962,6 +1071,8 @@ macro_rules! dispatch_types {
                 }
             }
         }
+
+        explicit_send_sync_impl!($name);
     };
 }
 

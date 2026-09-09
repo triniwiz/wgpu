@@ -78,6 +78,7 @@ bitflags::bitflags! {
     }
 }
 
+#[expect(missing_debug_implementations, reason = "would be way too verbose?")]
 pub struct Writer<W> {
     out: W,
     flags: WriterFlags,
@@ -256,9 +257,7 @@ impl<W: Write> Writer<W> {
                     ]
                 }
             };
-            self.write_attributes(&attributes)?;
-            // Add a newline after attribute
-            writeln!(self.out)?;
+            self.write_attributes_line(&attributes)?;
 
             let func_ctx = back::FunctionCtx {
                 ty: back::FunctionType::EntryPoint(index as u16),
@@ -289,6 +288,7 @@ impl<W: Write> Writer<W> {
         #[derive(Default)]
         struct RequiredEnabled {
             f16: bool,
+            int16: bool,
             dual_source_blending: bool,
             clip_distances: bool,
             mesh_shaders: bool,
@@ -342,7 +342,9 @@ impl<W: Write> Writer<W> {
                 | crate::BuiltIn::RayTmin
                 | crate::BuiltIn::RayTCurrentMax
                 | crate::BuiltIn::ObjectToWorld
-                | crate::BuiltIn::WorldToObject,
+                | crate::BuiltIn::WorldToObject
+                | crate::BuiltIn::HitKind
+                | crate::BuiltIn::HitBarycentrics,
             ) => {
                 needed.ray_tracing_pipeline = true;
             }
@@ -356,6 +358,7 @@ impl<W: Write> Writer<W> {
                 | TypeInner::Vector { scalar, .. }
                 | TypeInner::Matrix { scalar, .. } => {
                     needed.f16 |= scalar == crate::Scalar::F16;
+                    needed.int16 |= scalar == crate::Scalar::I16 || scalar == crate::Scalar::U16;
                 }
                 TypeInner::Struct { ref members, .. } => {
                     for binding in members.iter().filter_map(|m| m.binding.as_ref()) {
@@ -431,6 +434,10 @@ impl<W: Write> Writer<W> {
         let mut any_written = false;
         if needed.f16 {
             writeln!(self.out, "enable f16;")?;
+            any_written = true;
+        }
+        if needed.int16 {
+            writeln!(self.out, "enable wgpu_int16;")?;
             any_written = true;
         }
         if needed.dual_source_blending {
@@ -572,15 +579,17 @@ impl<W: Write> Writer<W> {
         Ok(())
     }
 
-    /// Helper method to write a attribute
-    fn write_attributes(&mut self, attributes: &[Attribute]) -> BackendResult {
+    /// Helper method to write an attribute.
+    ///
+    /// Write `attributes` to `out`, with each one followed by a trailing space.
+    fn write_attributes_to(out: &mut impl Write, attributes: &[Attribute]) -> BackendResult {
         for attribute in attributes {
             match *attribute {
-                Attribute::Location(id) => write!(self.out, "@location({id}) ")?,
-                Attribute::BlendSrc(blend_src) => write!(self.out, "@blend_src({blend_src}) ")?,
+                Attribute::Location(id) => write!(out, "@location({id}) ")?,
+                Attribute::BlendSrc(blend_src) => write!(out, "@blend_src({blend_src}) ")?,
                 Attribute::BuiltIn(builtin_attrib) => {
                     let builtin = builtin_attrib.to_wgsl_if_implemented()?;
-                    write!(self.out, "@builtin({builtin}) ")?;
+                    write!(out, "@builtin({builtin}) ")?;
                 }
                 Attribute::Stage(shader_stage) => {
                     let stage_str = match shader_stage {
@@ -596,46 +605,62 @@ impl<W: Write> Writer<W> {
                         ShaderStage::Miss => "miss",
                     };
 
-                    write!(self.out, "@{stage_str} ")?;
+                    write!(out, "@{stage_str} ")?;
                 }
                 Attribute::WorkGroupSize(size) => {
                     write!(
-                        self.out,
+                        out,
                         "@workgroup_size({}, {}, {}) ",
                         size[0], size[1], size[2]
                     )?;
                 }
-                Attribute::Binding(id) => write!(self.out, "@binding({id}) ")?,
-                Attribute::Group(id) => write!(self.out, "@group({id}) ")?,
-                Attribute::Invariant => write!(self.out, "@invariant ")?,
+                Attribute::Binding(id) => write!(out, "@binding({id}) ")?,
+                Attribute::Group(id) => write!(out, "@group({id}) ")?,
+                Attribute::Invariant => write!(out, "@invariant ")?,
                 Attribute::Interpolate(interpolation, sampling) => {
                     if sampling.is_some() && sampling != Some(crate::Sampling::Center) {
                         let interpolation = interpolation
                             .unwrap_or(crate::Interpolation::Perspective)
                             .to_wgsl();
                         let sampling = sampling.unwrap_or(crate::Sampling::Center).to_wgsl();
-                        write!(self.out, "@interpolate({interpolation}, {sampling}) ")?;
+                        write!(out, "@interpolate({interpolation}, {sampling}) ")?;
                     } else if interpolation.is_some()
                         && interpolation != Some(crate::Interpolation::Perspective)
                     {
                         let interpolation = interpolation
                             .unwrap_or(crate::Interpolation::Perspective)
                             .to_wgsl();
-                        write!(self.out, "@interpolate({interpolation}) ")?;
+                        write!(out, "@interpolate({interpolation}) ")?;
                     }
                 }
                 Attribute::MeshStage(ref name) => {
-                    write!(self.out, "@mesh({name}) ")?;
+                    write!(out, "@mesh({name}) ")?;
                 }
                 Attribute::TaskPayload(ref payload_name) => {
-                    write!(self.out, "@payload({payload_name}) ")?;
+                    write!(out, "@payload({payload_name}) ")?;
                 }
-                Attribute::PerPrimitive => write!(self.out, "@per_primitive ")?,
+                Attribute::PerPrimitive => write!(out, "@per_primitive ")?,
                 Attribute::IncomingRayPayload(ref payload_name) => {
-                    write!(self.out, "@incoming_payload({payload_name}) ")?;
+                    write!(out, "@incoming_payload({payload_name}) ")?;
                 }
             };
         }
+        Ok(())
+    }
+
+    /// Write `attributes` followed by a single trailing space, for use where more
+    /// content follows on the same line (e.g. before a parameter name).
+    fn write_attributes(&mut self, attributes: &[Attribute]) -> BackendResult {
+        Self::write_attributes_to(&mut self.out, attributes)
+    }
+
+    /// Write `attributes` on their own line, followed by a newline. Attributes are
+    /// rendered into a buffer first so the trailing space `write_attributes_to`
+    /// puts after the last one can be trimmed before it reaches the line.
+    fn write_attributes_line(&mut self, attributes: &[Attribute]) -> BackendResult {
+        let mut buf = String::new();
+        Self::write_attributes_to(&mut buf, attributes)?;
+        writeln!(self.out, "{}", buf.trim_end())?;
         Ok(())
     }
 
@@ -1378,6 +1403,8 @@ impl<W: Write> Writer<W> {
             Expression::Literal(literal) => match literal {
                 crate::Literal::F16(value) => write!(self.out, "{value}h")?,
                 crate::Literal::F32(value) => write!(self.out, "{value}f")?,
+                crate::Literal::U16(value) => write!(self.out, "u16({value})")?,
+                crate::Literal::I16(value) => write!(self.out, "i16({value})")?,
                 crate::Literal::U32(value) => write!(self.out, "{value}u")?,
                 crate::Literal::I32(value) => {
                     // `-2147483648i` is not valid WGSL. The most negative `i32`
@@ -1986,11 +2013,10 @@ impl<W: Write> Writer<W> {
     ) -> BackendResult {
         // Write group and binding attributes if present
         if let Some(ref binding) = global.binding {
-            self.write_attributes(&[
+            self.write_attributes_line(&[
                 Attribute::Group(binding.group),
                 Attribute::Binding(binding.binding),
             ])?;
-            writeln!(self.out)?;
         }
 
         if global
