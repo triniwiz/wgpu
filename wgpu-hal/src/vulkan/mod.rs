@@ -412,6 +412,11 @@ struct DeviceExtensionFunctions {
     mesh_shading: Option<ext::mesh_shader::Device>,
     #[cfg_attr(not(unix), allow(dead_code))]
     external_memory_fd: Option<khr::external_memory_fd::Device>,
+    /// `VK_ANDROID_external_memory_android_hardware_buffer`, for importing
+    /// `AHardwareBuffer`s as textures.
+    #[cfg(target_os = "android")]
+    android_hardware_buffer:
+        Option<ash::android::external_memory_android_hardware_buffer::Device>,
 }
 
 struct RayTracingDeviceExtensionFunctions {

@@ -1406,6 +1406,19 @@ impl PhysicalDeviceProperties {
             extensions.push(ext::external_memory_dma_buf::NAME);
         }
 
+        // Optional `VK_ANDROID_external_memory_android_hardware_buffer`.
+        //
+        // `VK_EXT_queue_family_foreign` is a dependency and is not core in any Vulkan
+        // version, so both must be present for either to be usable. Its remaining
+        // dependencies are core in Vulkan 1.1.
+        #[cfg(target_os = "android")]
+        if self.supports_extension(ash::android::external_memory_android_hardware_buffer::NAME)
+            && self.supports_extension(ext::queue_family_foreign::NAME)
+        {
+            extensions.push(ash::android::external_memory_android_hardware_buffer::NAME);
+            extensions.push(ext::queue_family_foreign::NAME);
+        }
+
         // Optional `VK_EXT_image_drm_format_modifier`
         if self.supports_extension(ext::image_drm_format_modifier::NAME) {
             extensions.push(ext::image_drm_format_modifier::NAME);
@@ -2743,6 +2756,20 @@ impl super::Adapter {
         } else {
             None
         };
+        #[cfg(target_os = "android")]
+        let android_hardware_buffer_fn = if enabled_extensions
+            .contains(&ash::android::external_memory_android_hardware_buffer::NAME)
+        {
+            Some(
+                ash::android::external_memory_android_hardware_buffer::Device::new(
+                    &self.instance.raw,
+                    &raw_device,
+                ),
+            )
+        } else {
+            None
+        };
+
         let external_memory_fd_fn = if enabled_extensions.contains(&khr::external_memory_fd::NAME) {
             Some(khr::external_memory_fd::Device::new(
                 &self.instance.raw,
@@ -3016,6 +3043,8 @@ impl super::Adapter {
                 ray_tracing_pipelines: ray_tracing_pipeline_fns,
                 mesh_shading: mesh_shading_fns,
                 external_memory_fd: external_memory_fd_fn,
+                #[cfg(target_os = "android")]
+                android_hardware_buffer: android_hardware_buffer_fn,
             },
             pipeline_cache_validation_key,
             vendor_id: self.phd_capabilities.properties.vendor_id,

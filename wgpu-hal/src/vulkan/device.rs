@@ -300,6 +300,152 @@ impl MemoryProperties {
 }
 
 impl super::Device {
+    /// Import an `AHardwareBuffer` as a texture, without copying its contents.
+    ///
+    /// Only formats Vulkan can express directly are accepted. A YCbCr buffer reports
+    /// [`vk::Format::UNDEFINED`] and needs an immutable `VkSamplerYcbcrConversion` in the
+    /// descriptor layout, which this cannot supply -- ask the producer for RGBA instead.
+    ///
+    /// The returned texture owns the `VkImage` and the imported `VkDeviceMemory`. Importing
+    /// takes its own reference to `buffer`, so the caller may release theirs once this
+    /// returns.
+    ///
+    /// # Safety
+    ///
+    /// - `buffer` must be a valid `AHardwareBuffer` with the
+    ///   `AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE` usage bit.
+    /// - `desc` must describe the buffer's actual dimensions and format.
+    #[cfg(target_os = "android")]
+    pub unsafe fn texture_from_android_hardware_buffer(
+        &self,
+        buffer: *mut vk::AHardwareBuffer,
+        desc: &crate::TextureDescriptor,
+    ) -> Result<super::Texture, crate::DeviceError> {
+        let Some(ahb_fns) = self.shared.extension_fns.android_hardware_buffer.as_ref() else {
+            log::error!(
+                "texture_from_android_hardware_buffer: \
+                 VK_ANDROID_external_memory_android_hardware_buffer is not enabled"
+            );
+            return Err(crate::DeviceError::Unexpected);
+        };
+
+        let mut format_props = vk::AndroidHardwareBufferFormatPropertiesANDROID::default();
+
+        // Scoped: `props` borrows `format_props` via `push_next`, so it must drop before
+        // the format is read back out.
+        let (allocation_size, memory_type_bits) = {
+            let mut props =
+                vk::AndroidHardwareBufferPropertiesANDROID::default().push_next(&mut format_props);
+
+            unsafe { ahb_fns.get_android_hardware_buffer_properties(buffer, &mut props) }.map_err(
+                |err| {
+                    log::error!("texture_from_android_hardware_buffer: querying properties: {err}");
+                    crate::DeviceError::Unexpected
+                },
+            )?;
+
+            (props.allocation_size, props.memory_type_bits)
+        };
+
+        if format_props.format == vk::Format::UNDEFINED {
+            log::error!(
+                "texture_from_android_hardware_buffer: buffer uses external format {:#x} \
+                 (ycbcr model {:?}, range {:?}), which needs a ycbcr conversion sampler",
+                format_props.external_format,
+                format_props.suggested_ycbcr_model,
+                format_props.suggested_ycbcr_range,
+            );
+            return Err(crate::DeviceError::Unexpected);
+        }
+
+        let raw_device = &self.shared.raw;
+
+        let mut external_info = vk::ExternalMemoryImageCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::ANDROID_HARDWARE_BUFFER_ANDROID);
+
+        let image_info = vk::ImageCreateInfo::default()
+            .push_next(&mut external_info)
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format_props.format)
+            .extent(vk::Extent3D {
+                width: desc.size.width,
+                height: desc.size.height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+
+        let vk_image = unsafe { raw_device.create_image(&image_info, None) }.map_err(|err| {
+            log::error!("texture_from_android_hardware_buffer: creating image: {err}");
+            crate::DeviceError::Unexpected
+        })?;
+
+        // From here on the image has to be destroyed on every failure path.
+        let import = |device: &Self| -> Result<vk::DeviceMemory, crate::DeviceError> {
+            let Some(memory_type_index) = Self::choose_memory_type(memory_type_bits) else {
+                log::error!(
+                    "texture_from_android_hardware_buffer: no memory type accepts this buffer"
+                );
+                return Err(crate::DeviceError::Unexpected);
+            };
+
+            // The import must be a dedicated allocation bound to this exact image.
+            let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(vk_image);
+            let mut import_info =
+                vk::ImportAndroidHardwareBufferInfoANDROID::default().buffer(buffer);
+
+            let allocate_info = vk::MemoryAllocateInfo::default()
+                .push_next(&mut dedicated)
+                .push_next(&mut import_info)
+                .allocation_size(allocation_size)
+                .memory_type_index(memory_type_index);
+
+            let memory =
+                unsafe { device.shared.raw.allocate_memory(&allocate_info, None) }.map_err(
+                    |err| {
+                        log::error!(
+                            "texture_from_android_hardware_buffer: importing memory: {err}"
+                        );
+                        crate::DeviceError::Unexpected
+                    },
+                )?;
+
+            if let Err(err) =
+                unsafe { device.shared.raw.bind_image_memory(vk_image, memory, 0) }
+            {
+                log::error!("texture_from_android_hardware_buffer: binding memory: {err}");
+                unsafe { device.shared.raw.free_memory(memory, None) };
+                return Err(crate::DeviceError::Unexpected);
+            }
+
+            Ok(memory)
+        };
+
+        let memory = match import(self) {
+            Ok(memory) => memory,
+            Err(err) => {
+                unsafe { raw_device.destroy_image(vk_image, None) };
+                return Err(err);
+            }
+        };
+
+        Ok(unsafe {
+            self.texture_from_raw(vk_image, desc, None, super::TextureMemory::Dedicated(memory))
+        })
+    }
+
+    /// Lowest memory type index allowed by `type_bits`. The driver dictates the type of an
+    /// imported buffer, so there is nothing to choose between.
+    #[cfg(target_os = "android")]
+    fn choose_memory_type(type_bits: u32) -> Option<u32> {
+        (type_bits != 0).then(|| type_bits.trailing_zeros())
+    }
+
     /// # Safety
     ///
     /// - `vk_image` must be created respecting `desc`
