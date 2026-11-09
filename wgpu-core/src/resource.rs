@@ -1575,6 +1575,13 @@ pub struct Texture {
 }
 
 impl Texture {
+    /// Marks every subresource uninitialized, as for a newly acquired surface
+    /// texture: a later load clears it first, a clear load costs nothing extra.
+    pub fn discard_contents(&self) {
+        *self.initialization_status.write() =
+            TextureInitTracker::new(self.desc.mip_level_count, self.desc.array_layer_count());
+    }
+
     pub(crate) fn new(
         device: &Arc<Device>,
         inner: TextureInner,
