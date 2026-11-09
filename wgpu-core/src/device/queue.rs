@@ -301,6 +301,11 @@ impl Drop for Queue {
 
         assert!(queue_empty);
 
+        self.pending_writes
+            .lock()
+            .staging
+            .destroy(self.device.raw());
+
         let closures = crate::device::UserClosures {
             mappings: mapping_closures,
             blas_compact_ready: blas_compact_ready_closures,
@@ -356,6 +361,184 @@ pub(crate) struct EncoderInFlight {
     pub(crate) pending_blas_s: FastHashMap<TrackerIndex, Arc<Blas>>,
 }
 
+/// Larger writes get a dedicated [`StagingBuffer`].
+const STAGING_CHUNK_SIZE: u64 = 1 << 20;
+const STAGING_POOL_MAX_WRITE: u64 = 256 << 10;
+const STAGING_CHUNK_ALIGNMENT: u64 = 16;
+/// Free chunks kept for reuse.
+const STAGING_POOL_MAX_FREE: usize = 8;
+
+/// A persistently mapped staging buffer that small writes are sub-allocated from.
+struct StagingChunk {
+    raw: Box<dyn hal::DynBuffer>,
+    ptr: NonNull<u8>,
+    is_coherent: bool,
+}
+
+// SAFETY: `ptr` is only used while `PendingWrites` is locked.
+unsafe impl Send for StagingChunk {}
+unsafe impl Sync for StagingChunk {}
+
+struct StagingChunkInUse {
+    chunk: StagingChunk,
+    cursor: u64,
+    /// Its `MAP_WRITE -> COPY_SRC` barrier is recorded once per batch.
+    barrier_recorded: bool,
+}
+
+/// Staging memory for small `Queue::write_buffer` calls, so each call is a copy
+/// into mapped memory instead of creating, allocating and mapping a buffer.
+///
+/// A batch's chunks are tagged with the submission that carries it and reused
+/// once the fence passes it; a chunk never spans two submissions.
+#[derive(Default)]
+pub(crate) struct StagingPool {
+    batch: Vec<StagingChunkInUse>,
+    in_flight: alloc::collections::VecDeque<(StagingChunk, SubmissionIndex)>,
+    free: Vec<StagingChunk>,
+}
+
+impl StagingPool {
+    /// Reserves `size` bytes; returns the chunk index in `batch` and the offset.
+    fn reserve(&mut self, device: &Arc<Device>, size: u64) -> Result<(usize, u64), DeviceError> {
+        let aligned = wgt::math::align_to(size, STAGING_CHUNK_ALIGNMENT);
+        if let Some(last) = self.batch.last_mut() {
+            if last.cursor + size <= STAGING_CHUNK_SIZE {
+                let offset = last.cursor;
+                last.cursor += aligned;
+                return Ok((self.batch.len() - 1, offset));
+            }
+        }
+        let chunk = self.take_chunk(device)?;
+        self.batch.push(StagingChunkInUse {
+            chunk,
+            cursor: aligned,
+            barrier_recorded: false,
+        });
+        Ok((self.batch.len() - 1, 0))
+    }
+
+    fn take_chunk(&mut self, device: &Arc<Device>) -> Result<StagingChunk, DeviceError> {
+        if self.free.is_empty() && !self.in_flight.is_empty() {
+            let done = unsafe { device.raw().get_fence_value(device.fence.as_ref()) }
+                .map_err(|e| device.handle_hal_error(e))?;
+            while self
+                .in_flight
+                .front()
+                .is_some_and(|(_, index)| *index <= done)
+            {
+                let (chunk, _) = self.in_flight.pop_front().unwrap();
+                self.free.push(chunk);
+            }
+        }
+        if let Some(chunk) = self.free.pop() {
+            return Ok(chunk);
+        }
+        let desc = hal::BufferDescriptor {
+            label: hal_label(Some("(wgpu internal) Staging chunk"), device.instance_flags),
+            size: STAGING_CHUNK_SIZE,
+            usage: wgt::BufferUses::MAP_WRITE | wgt::BufferUses::COPY_SRC,
+            memory_flags: hal::MemoryFlags::empty(),
+        };
+        let (raw, _) =
+            unsafe { device.raw().create_buffer(&desc) }.map_err(|e| device.handle_hal_error(e))?;
+        let mapping = match unsafe { device.raw().map_buffer(raw.as_ref(), 0..STAGING_CHUNK_SIZE) }
+        {
+            Ok(mapping) => mapping,
+            Err(e) => {
+                unsafe { device.raw().destroy_buffer(raw) };
+                return Err(device.handle_hal_error(e));
+            }
+        };
+        Ok(StagingChunk {
+            raw,
+            ptr: mapping.ptr,
+            is_coherent: mapping.is_coherent,
+        })
+    }
+
+    /// Hands the batch's chunks to submission `index`.
+    fn retire_batch(&mut self, device: &dyn hal::DynDevice, index: SubmissionIndex) {
+        for used in self.batch.drain(..) {
+            if !used.chunk.is_coherent {
+                #[allow(clippy::single_range_in_vec_init)]
+                unsafe {
+                    device.flush_mapped_ranges(used.chunk.raw.as_ref(), &[0..STAGING_CHUNK_SIZE])
+                };
+            }
+            self.in_flight.push_back((used.chunk, index));
+        }
+        while self.free.len() > STAGING_POOL_MAX_FREE {
+            let chunk = self.free.pop().unwrap();
+            Self::destroy_chunk(device, chunk);
+        }
+    }
+
+    fn destroy_chunk(device: &dyn hal::DynDevice, chunk: StagingChunk) {
+        unsafe {
+            device.unmap_buffer(chunk.raw.as_ref());
+            device.destroy_buffer(chunk.raw);
+        }
+    }
+
+    /// The queue must be idle.
+    fn destroy(&mut self, device: &dyn hal::DynDevice) {
+        let chunks = self
+            .batch
+            .drain(..)
+            .map(|used| used.chunk)
+            .chain(self.in_flight.drain(..).map(|(chunk, _)| chunk))
+            .chain(self.free.drain(..))
+            .collect::<Vec<_>>();
+        for chunk in chunks {
+            Self::destroy_chunk(device, chunk);
+        }
+    }
+}
+
+/// Pooled writes from one chunk to one buffer, recorded as one multi-region copy:
+/// a copy command per write costs more in the driver than the write itself.
+struct PooledCopy {
+    src: *const dyn hal::DynBuffer,
+    dst: *const dyn hal::DynBuffer,
+    regions: Vec<hal::BufferCopy>,
+    /// Lets ascending writes skip the overlap scan.
+    max_end: u64,
+}
+
+// SAFETY: `src` is owned by `StagingPool::batch` and `dst` kept alive by
+// `PendingWrites`; both outlive the batch, which is recorded first.
+unsafe impl Send for PooledCopy {}
+unsafe impl Sync for PooledCopy {}
+
+impl PooledCopy {
+    fn overlaps(&self, range: &core::ops::Range<u64>) -> bool {
+        range.start < self.max_end
+            && self
+                .regions
+                .iter()
+                .any(|r| range.start < r.dst_offset + r.size.get() && r.dst_offset < range.end)
+    }
+}
+
+impl core::fmt::Debug for PooledCopy {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PooledCopy")
+            .field("regions", &self.regions.len())
+            .finish()
+    }
+}
+
+impl core::fmt::Debug for StagingPool {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("StagingPool")
+            .field("batch", &self.batch.len())
+            .field("in_flight", &self.in_flight.len())
+            .field("free", &self.free.len())
+            .finish()
+    }
+}
+
 /// A private command encoder for writes made directly on the device
 /// or queue.
 ///
@@ -397,6 +580,9 @@ pub(crate) struct PendingWrites {
     dst_textures: FastHashMap<TrackerIndex, Arc<Texture>>,
     copied_blas_s: FastHashMap<TrackerIndex, Arc<Blas>>,
     instance_flags: wgt::InstanceFlags,
+    staging: StagingPool,
+    pooled_copies: Vec<PooledCopy>,
+    pooled_copy_index: FastHashMap<(usize, TrackerIndex), usize>,
 }
 
 impl PendingWrites {
@@ -408,6 +594,9 @@ impl PendingWrites {
             command_encoder,
             is_recording: false,
             temp_resources: Vec::new(),
+            staging: StagingPool::default(),
+            pooled_copies: Vec::new(),
+            pooled_copy_index: FastHashMap::default(),
             dst_buffers: FastHashMap::default(),
             dst_textures: FastHashMap::default(),
             copied_blas_s: FastHashMap::default(),
@@ -484,7 +673,10 @@ impl PendingWrites {
         command_allocator: &CommandAllocator,
         device: &Arc<Device>,
         queue: &Queue,
+        submit_index: SubmissionIndex,
     ) -> Result<Option<EncoderInFlight>, DeviceError> {
+        self.flush_pooled_copies();
+        self.staging.retire_batch(device.raw(), submit_index);
         if self.is_recording {
             let pending_buffers = mem::take(&mut self.dst_buffers);
             let pending_textures = mem::take(&mut self.dst_textures);
@@ -525,7 +717,26 @@ impl PendingWrites {
         }
     }
 
+    /// Records queued pooled copies first, keeping write order.
     pub fn activate(&mut self) -> &mut dyn hal::DynCommandEncoder {
+        self.flush_pooled_copies();
+        self.activate_encoder()
+    }
+
+    fn flush_pooled_copies(&mut self) {
+        if self.pooled_copies.is_empty() {
+            return;
+        }
+        let copies = mem::take(&mut self.pooled_copies);
+        self.pooled_copy_index.clear();
+        let encoder = self.activate_encoder();
+        for copy in &copies {
+            // SAFETY: see `PooledCopy`.
+            unsafe { encoder.copy_buffer_to_buffer(&*copy.src, &*copy.dst, &copy.regions) };
+        }
+    }
+
+    fn activate_encoder(&mut self) -> &mut dyn hal::DynCommandEncoder {
         if !self.is_recording {
             unsafe {
                 self.command_encoder
@@ -763,6 +974,19 @@ impl Queue {
             return Ok(());
         };
 
+        // GL cannot use a buffer while it stays mapped.
+        if data_size.get() <= STAGING_POOL_MAX_WRITE && self.device.backend() != wgt::Backend::Gl {
+            let snatch_guard = self.device.snatchable_lock.read();
+            let mut pending_writes = self.pending_writes.lock();
+            return self.write_buffer_pooled(
+                &snatch_guard,
+                &mut pending_writes,
+                buffer,
+                buffer_offset,
+                data,
+            );
+        }
+
         // Platform validation requires that the staging buffer always be
         // freed, even if an error occurs. All paths from here must call
         // `device.pending_writes.consume`.
@@ -902,6 +1126,105 @@ impl Queue {
                 side: CopySide::Destination,
             });
         }
+
+        Ok(())
+    }
+
+    fn write_buffer_pooled(
+        &self,
+        snatch_guard: &SnatchGuard,
+        pending_writes: &mut PendingWrites,
+        buffer: Arc<Buffer>,
+        buffer_offset: u64,
+        data: &[u8],
+    ) -> Result<(), QueueWriteError> {
+        profiling::scope!("Queue::write_buffer_pooled");
+        let size = data.len() as u64;
+        self.same_device_as(buffer.as_ref())?;
+        self.validate_write_buffer_impl(&buffer, buffer_offset, size)?;
+        let dst_raw = buffer.try_raw(snatch_guard)?;
+
+        let (index, offset) = pending_writes.staging.reserve(&self.device, size)?;
+        let used = &mut pending_writes.staging.batch[index];
+        // SAFETY: `reserve` returned `offset..offset + size` inside the mapped chunk.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                used.chunk.ptr.as_ptr().add(offset as usize),
+                data.len(),
+            );
+        }
+        let staging_barrier = !used.barrier_recorded;
+        used.barrier_recorded = true;
+
+        let transition = {
+            let mut trackers = self.device.trackers.lock();
+            trackers
+                .buffers
+                .set_single(&buffer, wgt::BufferUses::COPY_DST)
+        };
+
+        let chunk_raw: *const dyn hal::DynBuffer =
+            pending_writes.staging.batch[index].chunk.raw.as_ref();
+        // SAFETY: the chunk outlives the batch (see `PooledCopy`).
+        let chunk_raw = unsafe { &*chunk_raw };
+        let mut barriers = SmallVec::<[hal::BufferBarrier<'_, dyn hal::DynBuffer>; 2]>::new();
+        if staging_barrier {
+            barriers.push(hal::BufferBarrier {
+                buffer: chunk_raw,
+                usage: hal::StateTransition {
+                    from: wgt::BufferUses::MAP_WRITE,
+                    to: wgt::BufferUses::COPY_SRC,
+                },
+            });
+        }
+        barriers.extend(transition.map(|pending| pending.into_hal(&buffer, snatch_guard)));
+        let region = hal::BufferCopy {
+            src_offset: offset,
+            dst_offset: buffer_offset,
+            size: wgt::BufferSize::new(size).unwrap(),
+        };
+        let range = buffer_offset..buffer_offset + size;
+        let key = (index, buffer.tracker_index());
+        // Regions in one copy are unordered: flush before an overlapping write.
+        if pending_writes
+            .pooled_copy_index
+            .get(&key)
+            .is_some_and(|&i| pending_writes.pooled_copies[i].overlaps(&range))
+        {
+            pending_writes.flush_pooled_copies();
+        }
+        if !barriers.is_empty() {
+            let encoder = pending_writes.activate_encoder();
+            unsafe { encoder.transition_buffers(&barriers) };
+        } else {
+            pending_writes.activate_encoder();
+        }
+        match pending_writes.pooled_copy_index.get(&key) {
+            Some(&i) => {
+                let copy = &mut pending_writes.pooled_copies[i];
+                copy.regions.push(region);
+                copy.max_end = copy.max_end.max(range.end);
+            }
+            None => {
+                pending_writes
+                    .pooled_copy_index
+                    .insert(key, pending_writes.pooled_copies.len());
+                pending_writes.pooled_copies.push(PooledCopy {
+                    src: chunk_raw,
+                    dst: dst_raw,
+                    regions: vec![region],
+                    max_end: range.end,
+                });
+            }
+        }
+
+        pending_writes.insert_buffer(&buffer);
+
+        buffer
+            .initialization_status
+            .write()
+            .drain(buffer_offset..(buffer_offset + size));
 
         Ok(())
     }
@@ -1906,7 +2229,12 @@ impl Queue {
             };
         }
 
-        match pending_writes.pre_submit(&self.device.command_allocator, &self.device, self) {
+        match pending_writes.pre_submit(
+            &self.device.command_allocator,
+            &self.device,
+            self,
+            submit_index,
+        ) {
             Ok(Some(pending_execution)) => {
                 executions.insert(0, pending_execution);
             }

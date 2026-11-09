@@ -59,6 +59,7 @@ mod poll;
 mod primitive_index;
 mod query_set;
 mod queue_transfer;
+mod queue_write_pooled;
 mod ray_tracing;
 mod render_pass_ownership;
 mod render_target;
@@ -97,6 +98,7 @@ fn all_tests() -> Vec<wgpu_test::GpuTestInitializer> {
     bind_groups::all_tests(&mut tests);
     binding_array::all_tests(&mut tests);
     buffer_copy::all_tests(&mut tests);
+    queue_write_pooled::all_tests(&mut tests);
     buffer_usages::all_tests(&mut tests);
     buffer::all_tests(&mut tests);
     clear_texture::all_tests(&mut tests);
