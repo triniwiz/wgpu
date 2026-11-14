@@ -210,6 +210,9 @@ pub(super) fn flush_bindings_helper(
     state: &mut PassState,
 ) -> Result<(), InvalidOrDestroyedResourceError> {
     let start = state.binder.take_rebind_start_index();
+    if start >= hal::MAX_BIND_GROUPS {
+        return Ok(());
+    }
     let entries = state.binder.list_valid_with_start(start);
     let pipeline_layout = state.binder.pipeline_layout.as_ref().unwrap();
 

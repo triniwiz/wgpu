@@ -408,21 +408,39 @@ impl OptionalState {
 struct IndexState {
     buffer_format: Option<IndexFormat>,
     limit: u64,
+    /// The binding currently set on the HAL encoder, to skip re-binding it.
+    bound: Option<(Arc<Buffer>, Range<BufferAddress>)>,
 }
 
 impl IndexState {
-    fn update_buffer(&mut self, range: Range<BufferAddress>, format: IndexFormat) {
+    /// Records the binding; returns whether the HAL encoder already has it.
+    fn update_buffer(
+        &mut self,
+        buffer: &Arc<Buffer>,
+        range: Range<BufferAddress>,
+        format: IndexFormat,
+    ) -> bool {
+        let same = self.buffer_format == Some(format)
+            && self
+                .bound
+                .as_ref()
+                .is_some_and(|(b, r)| Arc::ptr_eq(b, buffer) && *r == range);
         self.buffer_format = Some(format);
         let shift = match format {
             IndexFormat::Uint16 => 1,
             IndexFormat::Uint32 => 2,
         };
         self.limit = (range.end - range.start) >> shift;
+        if !same {
+            self.bound = Some((buffer.clone(), range));
+        }
+        same
     }
 
     fn reset(&mut self) {
         self.buffer_format = None;
         self.limit = 0;
+        self.bound = None;
     }
 }
 
@@ -556,21 +574,29 @@ pub(crate) struct VertexSlot {
 pub(crate) struct VertexState {
     slots: [Option<VertexSlot>; hal::MAX_VERTEX_BUFFERS],
     pub(crate) limits: VertexLimits,
+    /// Whether any slot is dirty, so `flush` can skip scanning the slots.
+    any_dirty: bool,
 }
 
 impl VertexState {
-    /// Set a vertex buffer slot, marking it dirty.
+    /// Set a vertex buffer slot, marking it dirty unless it already holds this binding.
     pub(crate) fn set_buffer(
         &mut self,
         slot: usize,
         buffer: Arc<Buffer>,
         range: Range<BufferAddress>,
     ) {
+        if let Some(current) = self.slots[slot].as_ref() {
+            if Arc::ptr_eq(&current.buffer, &buffer) && current.range == range {
+                return;
+            }
+        }
         self.slots[slot] = Some(VertexSlot {
             buffer,
             range,
             is_dirty: true,
         });
+        self.any_dirty = true;
     }
 
     /// Clear a vertex buffer slot.
@@ -638,6 +664,10 @@ impl VertexState {
     where
         F: FnMut(u32, &Arc<Buffer>, BufferAddress, BufferAddress),
     {
+        if !self.any_dirty {
+            return;
+        }
+        self.any_dirty = false;
         for (i, slot) in self.slots.iter_mut().enumerate() {
             let Some(slot) = slot.as_mut() else { continue };
             if !slot.is_dirty {
@@ -657,6 +687,10 @@ struct State<'scope, 'snatch_guard, 'cmd_enc> {
     pipeline: Option<Arc<RenderPipeline>>,
     index: IndexState,
     vertex: VertexState,
+    /// Bit per [`DrawCommandFamily`] whose [`State::is_ready`] checks passed
+    /// since the last command that changed pipeline, binding, vertex or index
+    /// state. Consecutive draws with unchanged state skip re-validation.
+    validated_draws: u8,
 
     info: RenderPassInfo,
 
@@ -667,6 +701,17 @@ struct State<'scope, 'snatch_guard, 'cmd_enc> {
 }
 
 impl<'scope, 'snatch_guard, 'cmd_enc> State<'scope, 'snatch_guard, 'cmd_enc> {
+    /// [`State::is_ready`], skipped when it already passed for `family` and
+    /// no state-changing command ran since.
+    fn ensure_ready(&mut self, family: DrawCommandFamily) -> Result<(), DrawError> {
+        let bit = 1u8 << family as u8;
+        if self.validated_draws & bit == 0 {
+            self.is_ready(family)?;
+            self.validated_draws |= bit;
+        }
+        Ok(())
+    }
+
     fn is_ready(&self, family: DrawCommandFamily) -> Result<(), DrawError> {
         if let Some(pipeline) = self.pipeline.as_ref() {
             self.pass.binder.check_compatibility(pipeline.as_ref())?;
@@ -2329,6 +2374,7 @@ pub(super) fn encode_render_pass(
             pipeline: None,
             index: IndexState::default(),
             vertex: VertexState::default(),
+            validated_draws: 0,
 
             info,
 
@@ -2365,6 +2411,9 @@ pub(super) fn encode_render_pass(
         };
 
         for command in base.commands.drain(..) {
+            if !command.is_draw() {
+                state.validated_draws = 0;
+            }
             match command {
                 ArcRenderCommand::SetBindGroup {
                     index,
@@ -2838,7 +2887,9 @@ fn set_index_buffer(
 
     let raw = buffer.try_raw(state.pass.base.snatch_guard)?;
 
-    state.index.update_buffer(range.clone(), index_format);
+    let already_bound = state
+        .index
+        .update_buffer(&buffer, range.clone(), index_format);
 
     state.pass.base.buffer_memory_init_actions.extend(
         buffer.initialization_status.read().create_action(
@@ -2848,13 +2899,15 @@ fn set_index_buffer(
         ),
     );
 
-    unsafe {
-        // SAFETY: The binding range was validated by `resolve_vertex_or_index_binding_range`.
-        hal::DynCommandEncoder::set_index_buffer(
-            state.pass.base.raw_encoder,
-            hal::BufferBinding::new_unchecked(raw, range.start, range.end - range.start),
-            index_format,
-        );
+    if !already_bound {
+        unsafe {
+            // SAFETY: The binding range was validated by `resolve_vertex_or_index_binding_range`.
+            hal::DynCommandEncoder::set_index_buffer(
+                state.pass.base.raw_encoder,
+                hal::BufferBinding::new_unchecked(raw, range.start, range.end - range.start),
+                index_format,
+            );
+        }
     }
     Ok(())
 }
@@ -3084,7 +3137,7 @@ fn draw(
 ) -> Result<(), RenderPassErrorInner> {
     api_log!("RenderPass::draw {vertex_count} {instance_count} {first_vertex} {first_instance}");
 
-    state.is_ready(DrawCommandFamily::Draw)?;
+    state.ensure_ready(DrawCommandFamily::Draw)?;
     state.flush_vertex_buffers()?;
     state.flush_bindings()?;
     state.flush_immediates();
@@ -3121,7 +3174,7 @@ fn draw_indexed(
 ) -> Result<(), RenderPassErrorInner> {
     api_log!("RenderPass::draw_indexed {index_count} {instance_count} {first_index} {base_vertex} {first_instance}");
 
-    state.is_ready(DrawCommandFamily::DrawIndexed)?;
+    state.ensure_ready(DrawCommandFamily::DrawIndexed)?;
     state.flush_vertex_buffers()?;
     state.flush_bindings()?;
     state.flush_immediates();
@@ -3162,7 +3215,7 @@ fn draw_mesh_tasks(
 ) -> Result<(), RenderPassErrorInner> {
     api_log!("RenderPass::draw_mesh_tasks {group_count_x} {group_count_y} {group_count_z}");
 
-    state.is_ready(DrawCommandFamily::DrawMeshTasks)?;
+    state.ensure_ready(DrawCommandFamily::DrawMeshTasks)?;
 
     state.flush_bindings()?;
     state.flush_immediates();
@@ -3218,7 +3271,7 @@ fn multi_draw_indirect(
         indirect_buffer.error_ident()
     );
 
-    state.is_ready(family)?;
+    state.ensure_ready(family)?;
     state.flush_vertex_buffers()?;
     state.flush_bindings()?;
     state.flush_immediates();
@@ -3415,7 +3468,7 @@ fn multi_draw_indirect_count(
         count_buffer.error_ident()
     );
 
-    state.is_ready(family)?;
+    state.ensure_ready(family)?;
     state.flush_vertex_buffers()?;
     state.flush_bindings()?;
     state.flush_immediates();

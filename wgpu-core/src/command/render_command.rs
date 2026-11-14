@@ -114,6 +114,21 @@ pub enum RenderCommand<R: ReferenceType> {
     ExecuteBundle(R::RenderBundle),
 }
 
+impl<R: ReferenceType> RenderCommand<R> {
+    /// Whether this is a draw command. Draws read the pass's pipeline, binding,
+    /// vertex and index state but never change it.
+    pub(crate) fn is_draw(&self) -> bool {
+        matches!(
+            self,
+            Self::Draw { .. }
+                | Self::DrawIndexed { .. }
+                | Self::DrawMeshTasks { .. }
+                | Self::DrawIndirect { .. }
+                | Self::MultiDrawIndirectCount { .. }
+        )
+    }
+}
+
 /// Equivalent to `RenderCommand` with the Ids resolved into resource Arcs.
 ///
 /// In a render pass, commands are stored in this format between when they are
