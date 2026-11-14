@@ -419,8 +419,7 @@ struct DeviceExtensionFunctions {
     /// `VK_ANDROID_external_memory_android_hardware_buffer`, for importing
     /// `AHardwareBuffer`s as textures.
     #[cfg(target_os = "android")]
-    android_hardware_buffer:
-        Option<ash::android::external_memory_android_hardware_buffer::Device>,
+    android_hardware_buffer: Option<ash::android::external_memory_android_hardware_buffer::Device>,
 }
 
 struct RayTracingDeviceExtensionFunctions {

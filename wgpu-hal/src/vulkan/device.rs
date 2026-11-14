@@ -405,19 +405,13 @@ impl super::Device {
                 .allocation_size(allocation_size)
                 .memory_type_index(memory_type_index);
 
-            let memory =
-                unsafe { device.shared.raw.allocate_memory(&allocate_info, None) }.map_err(
-                    |err| {
-                        log::error!(
-                            "texture_from_android_hardware_buffer: importing memory: {err}"
-                        );
-                        crate::DeviceError::Unexpected
-                    },
-                )?;
+            let memory = unsafe { device.shared.raw.allocate_memory(&allocate_info, None) }
+                .map_err(|err| {
+                    log::error!("texture_from_android_hardware_buffer: importing memory: {err}");
+                    crate::DeviceError::Unexpected
+                })?;
 
-            if let Err(err) =
-                unsafe { device.shared.raw.bind_image_memory(vk_image, memory, 0) }
-            {
+            if let Err(err) = unsafe { device.shared.raw.bind_image_memory(vk_image, memory, 0) } {
                 log::error!("texture_from_android_hardware_buffer: binding memory: {err}");
                 unsafe { device.shared.raw.free_memory(memory, None) };
                 return Err(crate::DeviceError::Unexpected);
@@ -435,7 +429,12 @@ impl super::Device {
         };
 
         Ok(unsafe {
-            self.texture_from_raw(vk_image, desc, None, super::TextureMemory::Dedicated(memory))
+            self.texture_from_raw(
+                vk_image,
+                desc,
+                None,
+                super::TextureMemory::Dedicated(memory),
+            )
         })
     }
 
