@@ -15,6 +15,7 @@ use crate::{
     binding_model::{BindError, BindGroup, ImmediateUploadError},
     command::{
         bind::Binder,
+        draw::validate_mesh_draw_multiview,
         memory_init::{fixup_discarded_surfaces, SurfacesInDiscardState, TextureSurfaceDiscard},
         pass::{self, flush_bindings_helper, ImmediateState},
         pass_base, pass_try,
@@ -2017,6 +2018,10 @@ impl CommandEncoder {
                     ));
                 }
 
+                #[allow(
+                    clippy::collapsible_match,
+                    reason = "Match guards change which attachment error is returned."
+                )]
                 if view
                     .desc
                     .usage
@@ -2777,6 +2782,11 @@ pub(super) fn encode_render_pass(
                 )
                 .map_pass_err(pass_scope)?;
         }
+
+        // Backends may have deferred setup work for the pass's indirect
+        // multi-draws (e.g. Metal indirect-command-buffer generation); encode
+        // it after indirect validation so it reads validated draw arguments.
+        unsafe { transit.encode_deferred_multi_draws() };
     }
 
     encoder.close_and_swap().map_pass_err(pass_scope)?;
@@ -3108,26 +3118,6 @@ fn set_scissor(state: &mut State, rect: Rect<u32>) -> Result<(), RenderPassError
     Ok(())
 }
 
-fn validate_mesh_draw_multiview(state: &State) -> Result<(), RenderPassErrorInner> {
-    if let Some(mv) = state.info.multiview_mask {
-        let highest_bit = 31 - mv.leading_zeros();
-
-        let features = state.pass.base.device.features;
-
-        if !features.contains(wgt::Features::EXPERIMENTAL_MESH_SHADER_MULTIVIEW)
-            || highest_bit > state.pass.base.device.limits.max_mesh_multiview_view_count
-        {
-            return Err(RenderPassErrorInner::Draw(
-                DrawError::MeshPipelineMultiviewLimitsViolated {
-                    highest_view_index: highest_bit,
-                    max_multiviews: state.pass.base.device.limits.max_mesh_multiview_view_count,
-                },
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn draw(
     state: &mut State,
     vertex_count: u32,
@@ -3219,7 +3209,7 @@ fn draw_mesh_tasks(
 
     state.flush_bindings()?;
     state.flush_immediates();
-    validate_mesh_draw_multiview(state)?;
+    validate_mesh_draw_multiview(state.pass.base.device, state.info.multiview_mask)?;
 
     let limits = &state.pass.base.device.limits;
     let (groups_size_limit, max_groups) = if state.pipeline.as_ref().unwrap().has_task_shader {
@@ -3277,7 +3267,7 @@ fn multi_draw_indirect(
     state.flush_immediates();
 
     if family == DrawCommandFamily::DrawMeshTasks {
-        validate_mesh_draw_multiview(state)?;
+        validate_mesh_draw_multiview(state.pass.base.device, state.info.multiview_mask)?;
     }
 
     state
@@ -3474,7 +3464,7 @@ fn multi_draw_indirect_count(
     state.flush_immediates();
 
     if family == DrawCommandFamily::DrawMeshTasks {
-        validate_mesh_draw_multiview(state)?;
+        validate_mesh_draw_multiview(state.pass.base.device, state.info.multiview_mask)?;
     }
 
     let stride = get_src_stride_of_indirect_args(family);
@@ -3654,9 +3644,6 @@ fn execute_bundle(
         }
         ExecutionError::InvalidResource(e) => {
             RenderPassErrorInner::RenderCommand(RenderCommandError::InvalidResource(e))
-        }
-        ExecutionError::Unimplemented(what) => {
-            RenderPassErrorInner::RenderCommand(RenderCommandError::Unimplemented(what))
         }
     })?;
 

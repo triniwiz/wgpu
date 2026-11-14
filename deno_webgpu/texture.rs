@@ -40,6 +40,7 @@ pub(crate) struct GPUTextureDescriptor {
   pub usage: u32,
   #[webidl(default = vec![])]
   pub view_formats: Vec<GPUTextureFormat>,
+  pub texture_binding_view_dimension: Option<GPUTextureViewDimension>,
 }
 
 pub struct GPUTexture {
@@ -193,7 +194,7 @@ struct GPUTextureViewDescriptor {
   swizzle: String,
 }
 
-#[derive(WebIDL)]
+#[derive(WebIDL, Copy, Clone)]
 #[webidl(enum)]
 pub(crate) enum GPUTextureViewDimension {
   #[webidl(rename = "1d")]
@@ -297,7 +298,7 @@ impl From<GPUTextureDimension> for TextureDimension {
   }
 }
 
-#[derive(WebIDL, Clone)]
+#[derive(WebIDL, Clone, Copy)]
 #[webidl(enum)]
 pub(crate) enum GPUTextureFormat {
   #[webidl(rename = "r8unorm")]

@@ -46,6 +46,7 @@ fn setup() -> Fixture {
         format: wgpu::TextureFormat::Rgba8Unorm,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
+        texture_binding_view_dimension: None,
     });
     let view = texture.create_view(&Default::default());
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
